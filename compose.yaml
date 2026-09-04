@@ -1,0 +1,9 @@
+services:
+  bullseye:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    command: ["config/bullseye-docker.properties"]
+    volumes:
+      - ./build/docker-state:/run/bullseye
