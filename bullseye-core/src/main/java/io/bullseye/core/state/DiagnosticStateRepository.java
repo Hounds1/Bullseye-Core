@@ -1,6 +1,6 @@
 package io.bullseye.core.state;
 
-import io.bullseye.common.DiagnosticSnapshot;
+import io.bullseye.common.diagnostic.DiagnosticSnapshot;
 
 public interface DiagnosticStateRepository {
 

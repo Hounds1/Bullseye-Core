@@ -1,6 +1,6 @@
 package io.bullseye.core.state;
 
-import io.bullseye.common.DiagnosticSnapshot;
+import io.bullseye.common.diagnostic.DiagnosticSnapshot;
 
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
@@ -21,11 +21,12 @@ public final class InMemoryDiagnosticStateRepository implements DiagnosticStateR
     @Override
     public void update(DiagnosticSnapshot snapshot) {
         Objects.requireNonNull(snapshot, "snapshot");
-        current.updateAndGet(previous -> {
-            if (snapshot.version() <= previous.version()) {
-                throw new IllegalArgumentException("State version must increase");
-            }
-            return snapshot;
-        });
+        current.updateAndGet(
+                previous -> {
+                    if (snapshot.version() <= previous.version()) {
+                        throw new IllegalArgumentException("State version must increase");
+                    }
+                    return snapshot;
+                });
     }
 }

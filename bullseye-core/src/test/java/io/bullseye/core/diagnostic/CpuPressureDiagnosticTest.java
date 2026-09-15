@@ -1,23 +1,25 @@
 package io.bullseye.core.diagnostic;
 
-import io.bullseye.common.DiagnosticSnapshot;
-import io.bullseye.common.MetricSample;
-import io.bullseye.common.MetricType;
-import io.bullseye.common.ResourceState;
-import io.bullseye.common.ResourceType;
-import io.bullseye.common.Severity;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import io.bullseye.common.diagnostic.DiagnosticSnapshot;
+import io.bullseye.common.diagnostic.ResourceState;
+import io.bullseye.common.diagnostic.ResourceType;
+import io.bullseye.common.diagnostic.Severity;
+import io.bullseye.common.metric.MetricSample;
+import io.bullseye.common.metric.MetricType;
 import io.bullseye.core.config.BullseyeConfiguration;
+import io.bullseye.core.diagnostic.rule.CpuPressureRule;
+import io.bullseye.core.metric.InMemoryRollingMetricWindow;
 import io.bullseye.core.state.InMemoryDiagnosticStateRepository;
-import io.bullseye.core.store.InMemoryRollingMetricWindow;
+
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
-
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class CpuPressureDiagnosticTest {
 
@@ -28,9 +30,9 @@ class CpuPressureDiagnosticTest {
     @BeforeEach
     void setUp() {
         window = new InMemoryRollingMetricWindow(Duration.ofMinutes(2), Duration.ofSeconds(5));
-        repository = new InMemoryDiagnosticStateRepository(
-                DiagnosticSnapshot.initial("was-01", "orders", 0)
-        );
+        repository =
+                new InMemoryDiagnosticStateRepository(
+                        DiagnosticSnapshot.initial("was-01", "orders", 0));
         BullseyeConfiguration.CpuDiagnostics configuration =
                 new BullseyeConfiguration.CpuDiagnostics(
                         70,
@@ -41,18 +43,17 @@ class CpuPressureDiagnosticTest {
                         90,
                         Duration.ofSeconds(5),
                         65,
-                        Duration.ofSeconds(30)
-                );
+                        Duration.ofSeconds(30));
         AtomicInteger eventSequence = new AtomicInteger();
-        coordinator = new DiagnosticCoordinator(
-                window,
-                new DiagnosticEngine(List.of(
-                        new CpuPressureRule(configuration, Duration.ofSeconds(10))
-                )),
-                new SeverityEvaluator(),
-                repository,
-                () -> "event-" + eventSequence.incrementAndGet()
-        );
+        coordinator =
+                new DiagnosticCoordinator(
+                        window,
+                        new DiagnosticEngine(
+                                List.of(
+                                        new CpuPressureRule(
+                                                configuration, Duration.ofSeconds(10)))),
+                        repository,
+                        () -> "event-" + eventSequence.incrementAndGet());
     }
 
     @Test
@@ -65,10 +66,7 @@ class CpuPressureDiagnosticTest {
         assertEquals(Severity.ELEVATED, elevated.current().severity());
         assertEquals(ResourceState.PRESSURE, elevated.current().state());
         assertEquals(2, elevated.current().version());
-        assertEquals(
-                "CPU pressure detected. usage=74.0% sustained=10s",
-                elevated.event().reason()
-        );
+        assertEquals("CPU pressure detected. usage=74.0% sustained=10s", elevated.event().reason());
 
         append(15_000, 81);
         append(20_000, 83);
@@ -80,8 +78,7 @@ class CpuPressureDiagnosticTest {
         assertEquals(3, high.current().version());
         assertEquals(
                 "Warning. CPU saturation risk detected. usage=85.0% rise=+4.0pp/10s",
-                high.event().reason()
-        );
+                high.event().reason());
 
         append(30_000, 75);
         assertTrue(coordinator.evaluate(30_000).isEmpty());
@@ -97,8 +94,7 @@ class CpuPressureDiagnosticTest {
         assertEquals(4, critical.current().version());
         assertEquals(
                 "Critical CPU saturation detected. usage=93.0% sustained=5s",
-                critical.event().reason()
-        );
+                critical.event().reason());
 
         for (long timestamp = 45_000; timestamp <= 75_000; timestamp += 5_000) {
             append(timestamp, 60);
@@ -108,10 +104,7 @@ class CpuPressureDiagnosticTest {
         assertEquals(Severity.NORMAL, recovered.current().severity());
         assertEquals(ResourceType.UNKNOWN, recovered.current().resource());
         assertEquals(5, recovered.current().version());
-        assertEquals(
-                "CPU pressure cleared. usage=60.0% sustained=30s",
-                recovered.event().reason()
-        );
+        assertEquals("CPU pressure cleared. usage=60.0% sustained=30s", recovered.event().reason());
     }
 
     @Test

@@ -1,14 +1,14 @@
 package io.bullseye.core.runtime;
 
-import io.bullseye.common.DiagnosticSnapshot;
-import io.bullseye.common.MetricSample;
-import io.bullseye.core.collection.MetricCollector;
-import io.bullseye.core.collection.MetricNormalizer;
+import io.bullseye.common.metric.MetricSample;
 import io.bullseye.core.diagnostic.DiagnosticCoordinator;
+import io.bullseye.core.linux.cgroup.CgroupMonitor;
 import io.bullseye.core.logging.BullseyeLogger;
-import io.bullseye.core.publish.AsyncStatePublisher;
+import io.bullseye.core.metric.MetricCollector;
+import io.bullseye.core.metric.MetricNormalizer;
+import io.bullseye.core.metric.MetricWindow;
 import io.bullseye.core.state.DiagnosticStateRepository;
-import io.bullseye.core.store.MetricWindow;
+import io.bullseye.core.state.publish.AsyncStatePublisher;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -36,7 +36,10 @@ public final class BullseyeRuntime implements AutoCloseable {
     private final Clock clock;
     private final Duration samplingInterval;
     private final Duration windowDuration;
+    private final CgroupMonitor cgroupMonitor;
+    private final Duration cgroupSamplingInterval;
     private final ScheduledExecutorService collectorExecutor;
+    private final ScheduledExecutorService cgroupExecutor;
     private final ExecutorService diagnosticExecutor;
     private final AtomicBoolean running = new AtomicBoolean();
     private final AtomicBoolean diagnosticPending = new AtomicBoolean();
@@ -51,27 +54,59 @@ public final class BullseyeRuntime implements AutoCloseable {
             BullseyeLogger logger,
             Clock clock,
             Duration samplingInterval,
-            Duration windowDuration
-    ) {
+            Duration windowDuration) {
+        this(
+                collectors,
+                normalizer,
+                metricWindow,
+                diagnosticCoordinator,
+                stateRepository,
+                publisher,
+                logger,
+                clock,
+                samplingInterval,
+                windowDuration,
+                null,
+                samplingInterval);
+    }
+
+    public BullseyeRuntime(
+            List<MetricCollector> collectors,
+            MetricNormalizer normalizer,
+            MetricWindow metricWindow,
+            DiagnosticCoordinator diagnosticCoordinator,
+            DiagnosticStateRepository stateRepository,
+            AsyncStatePublisher publisher,
+            BullseyeLogger logger,
+            Clock clock,
+            Duration samplingInterval,
+            Duration windowDuration,
+            CgroupMonitor cgroupMonitor,
+            Duration cgroupSamplingInterval) {
         this.collectors = List.copyOf(Objects.requireNonNull(collectors, "collectors"));
         this.normalizer = Objects.requireNonNull(normalizer, "normalizer");
         this.metricWindow = Objects.requireNonNull(metricWindow, "metricWindow");
-        this.diagnosticCoordinator = Objects.requireNonNull(
-                diagnosticCoordinator,
-                "diagnosticCoordinator"
-        );
+        this.diagnosticCoordinator =
+                Objects.requireNonNull(diagnosticCoordinator, "diagnosticCoordinator");
         this.stateRepository = Objects.requireNonNull(stateRepository, "stateRepository");
         this.publisher = Objects.requireNonNull(publisher, "publisher");
         this.logger = Objects.requireNonNull(logger, "logger");
         this.clock = Objects.requireNonNull(clock, "clock");
         this.samplingInterval = Objects.requireNonNull(samplingInterval, "samplingInterval");
         this.windowDuration = Objects.requireNonNull(windowDuration, "windowDuration");
-        this.collectorExecutor = Executors.newSingleThreadScheduledExecutor(
-                new NamedThreadFactory("bullseye-collector")
-        );
-        this.diagnosticExecutor = Executors.newSingleThreadExecutor(
-                new NamedThreadFactory("bullseye-diagnostic")
-        );
+        this.cgroupMonitor = cgroupMonitor;
+        this.cgroupSamplingInterval =
+                Objects.requireNonNull(cgroupSamplingInterval, "cgroupSamplingInterval");
+        this.collectorExecutor =
+                Executors.newSingleThreadScheduledExecutor(
+                        new NamedThreadFactory("bullseye-collector"));
+        this.diagnosticExecutor =
+                Executors.newSingleThreadExecutor(new NamedThreadFactory("bullseye-diagnostic"));
+        this.cgroupExecutor =
+                cgroupMonitor == null
+                        ? null
+                        : Executors.newSingleThreadScheduledExecutor(
+                                new NamedThreadFactory("bullseye-cgroup"));
     }
 
     public void start() {
@@ -86,11 +121,15 @@ public final class BullseyeRuntime implements AutoCloseable {
 
         long intervalMillis = samplingInterval.toMillis();
         collectorExecutor.scheduleWithFixedDelay(
-                this::collectSafely,
-                0,
-                intervalMillis,
-                TimeUnit.MILLISECONDS
-        );
+                this::collectSafely, 0, intervalMillis, TimeUnit.MILLISECONDS);
+        if (cgroupMonitor != null) {
+            cgroupMonitor.initialize();
+            cgroupExecutor.scheduleWithFixedDelay(
+                    this::sampleCgroupsSafely,
+                    0,
+                    cgroupSamplingInterval.toMillis(),
+                    TimeUnit.MILLISECONDS);
+        }
     }
 
     @Override
@@ -102,6 +141,10 @@ public final class BullseyeRuntime implements AutoCloseable {
         logger.status("Shutdown sequence initiated.");
         collectorExecutor.shutdown();
         await(collectorExecutor);
+        if (cgroupExecutor != null) {
+            cgroupExecutor.shutdown();
+            await(cgroupExecutor);
+        }
         diagnosticExecutor.shutdown();
         await(diagnosticExecutor);
         publisher.close(SHUTDOWN_TIMEOUT);
@@ -115,9 +158,7 @@ public final class BullseyeRuntime implements AutoCloseable {
                 normalized.forEach(metricWindow::append);
             } catch (Exception failure) {
                 logger.interrupted(
-                        "Host telemetry interrupted. collector=" + collector.name(),
-                        failure
-                );
+                        "Host telemetry interrupted. collector=" + collector.name(), failure);
             }
         }
         requestDiagnostics();
@@ -128,13 +169,14 @@ public final class BullseyeRuntime implements AutoCloseable {
             return;
         }
         try {
-            diagnosticExecutor.execute(() -> {
-                try {
-                    diagnoseSafely();
-                } finally {
-                    diagnosticPending.set(false);
-                }
-            });
+            diagnosticExecutor.execute(
+                    () -> {
+                        try {
+                            diagnoseSafely();
+                        } finally {
+                            diagnosticPending.set(false);
+                        }
+                    });
         } catch (RejectedExecutionException failure) {
             diagnosticPending.set(false);
             if (running.get()) {
@@ -143,12 +185,23 @@ public final class BullseyeRuntime implements AutoCloseable {
         }
     }
 
+    private void sampleCgroupsSafely() {
+        try {
+            cgroupMonitor.sample();
+        } catch (Exception failure) {
+            logger.componentInterrupted("cgroup-monitor", failure);
+        }
+    }
+
     private void diagnoseSafely() {
         try {
-            diagnosticCoordinator.evaluate(clock.millis()).ifPresent(transition -> {
-                logger.transition(transition);
-                publisher.publish(transition.current());
-            });
+            diagnosticCoordinator
+                    .evaluate(clock.millis())
+                    .ifPresent(
+                            transition -> {
+                                logger.transition(transition);
+                                publisher.publish(transition.current());
+                            });
         } catch (Exception failure) {
             logger.interrupted("Diagnostic evaluation interrupted.", failure);
         }
