@@ -1,16 +1,17 @@
 # Bullseye
 
-Bullseye Core is a standalone Linux host diagnostics agent. It reads host metrics from
-`/proc`, keeps a bounded in-memory time window, evaluates sustained CPU pressure, and
-publishes the current state as an atomically replaced JSON file.
+Bullseye Core is a standalone Linux host diagnostics agent. It reads host metrics and
+Linux PSI from `/proc`, evaluates sustained CPU, memory, and IO pressure, and uses bounded
+cgroup v2 sampling to locate a likely workload source. Current state is published as an
+atomically replaced JSON file.
 
 Bullseye observes and publishes state. It does not throttle traffic, modify application
 behavior, or depend on an external database.
 
 ## Modules
 
-- `bullseye-common`: metrics and diagnostic domain models
-- `bullseye-core`: collection, rolling window, diagnostics, state, publication, runtime
+- `bullseye-common`: metric, diagnostic, and workload domain models
+- `bullseye-core`: Linux collectors, rolling window, diagnostics, state publication, runtime
 - `bullseye-native`: native runtime abstraction and Java fallback
 
 ## Requirements
@@ -60,8 +61,9 @@ cat build/docker-state/state.json
 docker compose down
 ```
 
-The container reads the Linux `/proc` filesystem supplied by Docker. The state snapshot is bind
-mounted to `build/docker-state/state.json` on the host.
+The container reads the Linux `/proc` and cgroup filesystems supplied by Docker. The state
+snapshot is bind mounted to `build/docker-state/state.json` on the host. Docker Desktop is useful
+for a smoke test, but it is not a substitute for the real Linux host validation checklist below.
 
 ## State output
 
@@ -70,15 +72,33 @@ mounted to `build/docker-state/state.json` on the host.
   "host": "was-01",
   "application": "host",
   "severity": "HIGH",
-  "resource": "HOST_CPU",
+  "resource": "HOST_MEMORY",
   "state": "SATURATION_RISK",
+  "primaryWorkload": "order-api.service",
+  "workloadType": "SYSTEMD_SERVICE",
+  "cgroupPath": "/system.slice/order-api.service",
+  "attributionConfidence": "HIGH",
+  "evidence": [
+    {"metric": "usage", "value": 88.1, "unit": "%"},
+    {"metric": "psi.some.avg10", "value": 24.3, "unit": "%"}
+  ],
   "since": 1788526800000,
-  "version": 182
+  "version": 12
 }
 ```
 
 State is written to a temporary sibling file, flushed, and atomically moved over the current
-snapshot. Publisher failures are isolated from metric collection and diagnostics.
+snapshot. The version changes only when severity, primary resource, resource state, or primary
+workload changes. Publisher, PSI, and individual cgroup failures are isolated from host telemetry.
+
+## Diagnostic policy
+
+- CPU keeps the usage-based hysteresis policy and uses PSI as corroborating evidence when present.
+- Memory requires both high usage and memory PSI; high page-cache usage alone is observation only.
+- IO is based on sustained PSI stalls rather than throughput.
+- The highest active resource severity becomes host severity. Similar attribution candidates remain
+  `UNKNOWN` instead of forcing a cause.
+- cgroup discovery is cached and bounded. Sampling uses the cached targets on a separate executor.
 
 ## Log style
 
@@ -87,7 +107,15 @@ Operational messages use short state announcements:
 ```text
 [BULLSEYE] Bullseye diagnostic system activated.
 [BULLSEYE] Host telemetry online.
-[BULLSEYE] CPU pressure detected. usage=74.2% sustained=10s previous=NORMAL current=ELEVATED resource=HOST_CPU
-[BULLSEYE] Warning. CPU saturation risk detected. usage=84.1% rise=+5.2pp/10s previous=ELEVATED current=HIGH resource=HOST_CPU
-[BULLSEYE] CPU pressure cleared. usage=60.3% sustained=30s previous=HIGH current=NORMAL resource=HOST_CPU
+[BULLSEYE] cgroup v2 detected.
+[BULLSEYE] Memory pressure detected. usage=82.4% psi.some=13.1% sustained=10s previous=NORMAL current=ELEVATED resource=HOST_MEMORY
+[BULLSEYE] Warning. Memory saturation risk detected. usage=88.1% psi.some=24.3% rise=+6.1pp/10s previous=ELEVATED current=HIGH resource=HOST_MEMORY
+[BULLSEYE] Pressure source identified. resource=HOST_MEMORY workload=order-api.service confidence=HIGH
 ```
+
+## Real Linux validation
+
+Before release, run the agent on a disposable Linux VM or server and verify CPU, memory, and IO
+stress transitions, cgroup attribution, recovery, SIGTERM shutdown, and idle/stress overhead. Do
+not run stress tools on production hosts. Docker Desktop smoke results alone do not complete this
+check.

@@ -1,6 +1,6 @@
 package io.bullseye.nativehost;
 
-import io.bullseye.common.MetricType;
+import io.bullseye.common.metric.MetricType;
 
 import java.util.Map;
 import java.util.Objects;

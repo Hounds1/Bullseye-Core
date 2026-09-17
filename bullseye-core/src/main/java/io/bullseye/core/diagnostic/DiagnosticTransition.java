@@ -1,15 +1,12 @@
 package io.bullseye.core.diagnostic;
 
-import io.bullseye.common.DiagnosticEvent;
-import io.bullseye.common.DiagnosticSnapshot;
+import io.bullseye.common.diagnostic.DiagnosticEvent;
+import io.bullseye.common.diagnostic.DiagnosticSnapshot;
 
 import java.util.Objects;
 
 public record DiagnosticTransition(
-        DiagnosticSnapshot previous,
-        DiagnosticSnapshot current,
-        DiagnosticEvent event
-) {
+        DiagnosticSnapshot previous, DiagnosticSnapshot current, DiagnosticEvent event) {
 
     public DiagnosticTransition {
         Objects.requireNonNull(previous, "previous");
