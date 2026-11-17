@@ -73,8 +73,9 @@ class AtomicFileStatePublisherTest {
                         Severity.HIGH,
                         ResourceType.HOST_MEMORY,
                         ResourceState.SATURATION_RISK,
-                        new WorkloadAttribution(
+                        WorkloadAttribution.identified(
                                 WorkloadIdentity.fromCgroupPath("/system.slice/order-api.service"),
+                                91,
                                 WorkloadAttribution.Confidence.HIGH),
                         List.of(
                                 new DiagnosticEvidence("usage", 88.1, "%"),
@@ -86,6 +87,8 @@ class AtomicFileStatePublisherTest {
 
         assertTrue(json.contains("\"primaryWorkload\": \"order-api.service\""));
         assertTrue(json.contains("\"attributionConfidence\": \"HIGH\""));
+        assertTrue(json.contains("\"attributionStatus\": \"IDENTIFIED\""));
+        assertTrue(json.contains("\"attributionScore\": 91.0"));
         assertTrue(json.contains("\"metric\": \"psi.some.avg10\""));
     }
 }

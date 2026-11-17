@@ -7,18 +7,45 @@ import io.bullseye.core.logging.BullseyeLogger;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 public final class CgroupMonitor {
+
+    public enum Status {
+        AVAILABLE,
+        CGROUP_V2_NOT_AVAILABLE,
+        ACCESS_DENIED
+    }
+
+    public record CollectionResult(
+            Status status,
+            List<CgroupMemorySnapshot> snapshots,
+            Map<String, CgroupMemorySnapshot> previousSnapshots) {
+
+        public CollectionResult {
+            Objects.requireNonNull(status, "status");
+            snapshots = List.copyOf(Objects.requireNonNull(snapshots, "snapshots"));
+            previousSnapshots =
+                    Map.copyOf(Objects.requireNonNull(previousSnapshots, "previousSnapshots"));
+        }
+
+        public static CollectionResult unavailable(Status status) {
+            return new CollectionResult(status, List.of(), Map.of());
+        }
+    }
 
     public interface FileAccess {
         boolean exists(Path path);
@@ -32,14 +59,12 @@ public final class CgroupMonitor {
     private final FileAccess files;
     private final Clock clock;
     private final BullseyeLogger logger;
-    private final Map<Path, CpuPoint> cpuPoints = new HashMap<>();
-    private final Map<Path, CgroupResourceSnapshot> previousSnapshots = new HashMap<>();
+    private final Map<String, CgroupMemorySnapshot> previousSnapshots = new HashMap<>();
     private List<Path> cachedGroups = List.of();
-    private volatile List<CgroupResourceSnapshot> snapshots = List.of();
     private long nextDiscoveryAt;
     private boolean discoveryComplete;
     private boolean initialized;
-    private boolean supported;
+    private Status status = Status.CGROUP_V2_NOT_AVAILABLE;
 
     public CgroupMonitor(
             BullseyeConfiguration.Cgroup configuration,
@@ -78,54 +103,81 @@ public final class CgroupMonitor {
             return;
         }
         initialized = true;
-        supported =
-                configuration.enabled()
-                        && files.exists(configuration.root().resolve("cgroup.controllers"));
-        if (supported) {
-            logger.status("cgroup v2 detected.");
-        } else {
+        Path controllers = configuration.root().resolve("cgroup.controllers");
+        if (!configuration.enabled()) {
+            status = Status.CGROUP_V2_NOT_AVAILABLE;
             logger.status("cgroup v2 unavailable. Workload attribution disabled.");
-        }
-    }
-
-    public synchronized void sample() {
-        initialize();
-        if (!supported) {
             return;
         }
-        long now = clock.millis();
-        if (!discoveryComplete || now >= nextDiscoveryAt) {
-            discover(now);
+        try {
+            files.read(controllers);
+            status = Status.AVAILABLE;
+            logger.status("cgroup v2 detected.");
+        } catch (AccessDeniedException failure) {
+            status = Status.ACCESS_DENIED;
+            logger.componentInterrupted("cgroup-v2", failure);
+        } catch (NoSuchFileException failure) {
+            status = Status.CGROUP_V2_NOT_AVAILABLE;
+            logger.status("cgroup v2 unavailable. Workload attribution disabled.");
+        } catch (IOException failure) {
+            status = Status.CGROUP_V2_NOT_AVAILABLE;
+            logger.componentInterrupted("cgroup-v2", failure);
+        }
+    }
+
+    public synchronized CollectionResult collectMemory() {
+        initialize();
+        if (status != Status.AVAILABLE) {
+            return CollectionResult.unavailable(status);
         }
 
-        List<CgroupResourceSnapshot> collected = new ArrayList<>(cachedGroups.size());
-        Map<Path, CgroupResourceSnapshot> currentByPath = new LinkedHashMap<>();
+        long now = clock.millis();
+        boolean accessDenied = false;
+        if (!discoveryComplete || now >= nextDiscoveryAt) {
+            accessDenied = discover(now);
+        }
+
+        List<CgroupMemorySnapshot> collected = new ArrayList<>(cachedGroups.size());
+        Map<String, CgroupMemorySnapshot> currentByPath = new LinkedHashMap<>();
         for (Path group : cachedGroups) {
-            CgroupResourceSnapshot snapshot = sampleGroup(group, now);
-            if (snapshot != null) {
+            String component = "cgroup:" + cgroupPath(group);
+            try {
+                CgroupMemorySnapshot snapshot = collectGroup(group, now);
                 collected.add(snapshot);
-                currentByPath.put(group, snapshot);
+                currentByPath.put(snapshot.workload().cgroupPath(), snapshot);
+                logger.componentRestored(component);
+            } catch (AccessDeniedException failure) {
+                accessDenied = true;
+                logger.componentInterrupted(component, failure);
+            } catch (Exception failure) {
+                logger.componentInterrupted(component, failure);
             }
         }
+
+        Map<String, CgroupMemorySnapshot> previous = Map.copyOf(previousSnapshots);
         previousSnapshots.clear();
         previousSnapshots.putAll(currentByPath);
-        snapshots = List.copyOf(collected);
+        if (collected.isEmpty() && accessDenied) {
+            return new CollectionResult(Status.ACCESS_DENIED, List.of(), previous);
+        }
+        return new CollectionResult(Status.AVAILABLE, collected, previous);
     }
 
-    public List<CgroupResourceSnapshot> snapshots() {
-        return snapshots;
-    }
-
-    public synchronized boolean isSupported() {
+    public synchronized Status status() {
         initialize();
-        return supported;
+        return status;
     }
 
-    private void discover(long now) {
+    public synchronized void clearHistory() {
+        previousSnapshots.clear();
+    }
+
+    private boolean discover(long now) {
         ArrayDeque<Node> pending = new ArrayDeque<>();
         List<Path> discovered = new ArrayList<>(Math.min(configuration.maximumGroups(), 64));
-        Map<Path, Boolean> parents = new HashMap<>();
+        Set<Path> parents = new HashSet<>();
         boolean failed = false;
+        boolean accessDenied = false;
         pending.add(new Node(configuration.root(), 0));
         while (!pending.isEmpty() && discovered.size() < configuration.maximumGroups()) {
             Node node = pending.removeFirst();
@@ -135,113 +187,79 @@ public final class CgroupMonitor {
             try {
                 for (Path child : files.directories(node.path())) {
                     discovered.add(child);
-                    parents.put(node.path(), true);
+                    parents.add(node.path());
                     if (discovered.size() >= configuration.maximumGroups()) {
                         break;
                     }
                     pending.addLast(new Node(child, node.depth() + 1));
                 }
                 logger.componentRestored("cgroup-discovery");
+            } catch (AccessDeniedException failure) {
+                failed = true;
+                accessDenied = true;
+                logger.componentInterrupted("cgroup-discovery", failure);
             } catch (Exception failure) {
                 failed = true;
                 logger.componentInterrupted("cgroup-discovery", failure);
             }
         }
+
         if (!(failed && discovered.isEmpty() && !cachedGroups.isEmpty())) {
             List<Path> leaves =
-                    discovered.stream().filter(path -> !parents.containsKey(path)).toList();
+                    discovered.stream().filter(path -> !parents.contains(path)).toList();
             cachedGroups = List.copyOf(leaves);
-            cpuPoints.keySet().retainAll(leaves);
-            previousSnapshots.keySet().retainAll(leaves);
+            Set<String> active = new HashSet<>();
+            leaves.forEach(path -> active.add(cgroupPath(path)));
+            previousSnapshots.keySet().retainAll(active);
         }
         discoveryComplete = true;
         nextDiscoveryAt = now + configuration.discoveryInterval().toMillis();
+        return accessDenied;
     }
 
-    private CgroupResourceSnapshot sampleGroup(Path group, long now) {
-        String relative = cgroupPath(group);
-        String component = "cgroup:" + relative;
-        try {
-            Long usageMicros = cpuUsageMicros(group.resolve("cpu.stat"));
-            double cpuUsage = cpuUsage(group, usageMicros, now);
-            long memoryCurrent = wholeOrUnavailable(group.resolve("memory.current"), false);
-            long memoryMax = wholeOrUnavailable(group.resolve("memory.max"), true);
-            PsiParser.Snapshot cpu = pressure(group.resolve("cpu.pressure"));
-            PsiParser.Snapshot memory = pressure(group.resolve("memory.pressure"));
-            PsiParser.Snapshot io = pressure(group.resolve("io.pressure"));
+    private CgroupMemorySnapshot collectGroup(Path group, long now) throws IOException {
+        long currentBytes = Long.parseLong(files.read(group.resolve("memory.current")).trim());
+        Long maxBytes = memoryMax(group.resolve("memory.max"));
+        PsiParser.Snapshot pressure = pressure(group.resolve("memory.pressure"));
+        MemoryEvents events = memoryEvents(group.resolve("memory.events"));
+        return new CgroupMemorySnapshot(
+                WorkloadIdentity.fromCgroupPath(cgroupPath(group)),
+                currentBytes,
+                maxBytes,
+                some(pressure),
+                full(pressure),
+                events.high(),
+                events.max(),
+                events.oom(),
+                events.oomKill(),
+                now);
+    }
 
-            double cpuSome = some(cpu);
-            double memorySome = some(memory);
-            double memoryFull = full(memory);
-            double ioSome = some(io);
-            double ioFull = full(io);
-            CgroupResourceSnapshot previous = previousSnapshots.get(group);
-            CgroupResourceSnapshot result =
-                    new CgroupResourceSnapshot(
-                            WorkloadIdentity.fromCgroupPath(relative),
-                            cpuUsage,
-                            memoryCurrent,
-                            memoryMax,
-                            cpuSome,
-                            memorySome,
-                            memoryFull,
-                            ioSome,
-                            ioFull,
-                            trend(cpuSome, previous == null ? Double.NaN : previous.cpuPsiSome()),
-                            trend(
-                                    memorySome,
-                                    previous == null ? Double.NaN : previous.memoryPsiSome()),
-                            trend(ioSome, previous == null ? Double.NaN : previous.ioPsiSome()),
-                            now);
-            if (usageMicros == null && memoryCurrent < 0 && !result.hasAnyPressureMetric()) {
-                return null;
-            }
-            logger.componentRestored(component);
-            return result;
-        } catch (Exception failure) {
-            logger.componentInterrupted(component, failure);
+    private Long memoryMax(Path path) throws IOException {
+        String raw = optionalRead(path);
+        if (raw == null || "max".equals(raw.trim())) {
             return null;
         }
+        return Long.parseLong(raw.trim());
     }
 
-    private Long cpuUsageMicros(Path path) throws IOException {
+    private MemoryEvents memoryEvents(Path path) throws IOException {
         String raw = optionalRead(path);
         if (raw == null) {
-            return null;
+            return MemoryEvents.EMPTY;
         }
+        Map<String, Long> counters = new HashMap<>();
         for (String line : raw.lines().toList()) {
             String[] parts = line.trim().split("\\s+");
-            if (parts.length == 2 && "usage_usec".equals(parts[0])) {
-                return Long.parseLong(parts[1]);
+            if (parts.length == 2) {
+                counters.put(parts[0], Long.parseLong(parts[1]));
             }
         }
-        throw new IllegalArgumentException("cpu.stat usage_usec missing");
-    }
-
-    private double cpuUsage(Path group, Long usageMicros, long now) {
-        if (usageMicros == null) {
-            return Double.NaN;
-        }
-        CpuPoint previous = cpuPoints.put(group, new CpuPoint(usageMicros, now));
-        if (previous == null
-                || now <= previous.timestamp()
-                || usageMicros < previous.usageMicros()) {
-            return Double.NaN;
-        }
-        double elapsedMicros = (now - previous.timestamp()) * 1_000.0;
-        return (usageMicros - previous.usageMicros()) / elapsedMicros * 100.0;
-    }
-
-    private long wholeOrUnavailable(Path path, boolean allowsMax) throws IOException {
-        String raw = optionalRead(path);
-        if (raw == null) {
-            return -1;
-        }
-        String value = raw.trim();
-        if (allowsMax && "max".equals(value)) {
-            return -1;
-        }
-        return Long.parseLong(value);
+        return new MemoryEvents(
+                counters.getOrDefault("high", 0L),
+                counters.getOrDefault("max", 0L),
+                counters.getOrDefault("oom", 0L),
+                counters.getOrDefault("oom_kill", 0L));
     }
 
     private PsiParser.Snapshot pressure(Path path) throws IOException {
@@ -268,11 +286,9 @@ public final class CgroupMonitor {
                 : pressure.full().orElseThrow().avg10();
     }
 
-    private static double trend(double current, double previous) {
-        return Double.isFinite(current) && Double.isFinite(previous) ? current - previous : 0;
-    }
-
     private record Node(Path path, int depth) {}
 
-    private record CpuPoint(long usageMicros, long timestamp) {}
+    private record MemoryEvents(long high, long max, long oom, long oomKill) {
+        private static final MemoryEvents EMPTY = new MemoryEvents(0, 0, 0, 0);
+    }
 }

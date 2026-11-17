@@ -3,6 +3,7 @@ package io.bullseye.common.metric;
 public enum MetricType {
     HOST_CPU_USAGE,
     HOST_MEMORY_USAGE,
+    HOST_MEMORY_TOTAL_BYTES,
     HOST_LOAD_AVERAGE,
     HOST_CPU_PSI_SOME_AVG10,
     HOST_MEMORY_PSI_SOME_AVG10,

@@ -225,7 +225,6 @@ public record BullseyeConfiguration(
             boolean enabled,
             Path root,
             Duration discoveryInterval,
-            Duration samplingInterval,
             int maximumDepth,
             int maximumGroups,
             double attributionMinimumScore,
@@ -234,7 +233,6 @@ public record BullseyeConfiguration(
         public Cgroup {
             Objects.requireNonNull(root, "root");
             requirePositive(discoveryInterval, "discoveryInterval");
-            requirePositive(samplingInterval, "samplingInterval");
             if (maximumDepth < 1 || maximumGroups < 1) {
                 throw new IllegalArgumentException("cgroup bounds must be positive");
             }
@@ -247,14 +245,7 @@ public record BullseyeConfiguration(
 
         public static Cgroup defaults() {
             return new Cgroup(
-                    true,
-                    Path.of("/sys/fs/cgroup"),
-                    Duration.ofSeconds(60),
-                    Duration.ofSeconds(5),
-                    8,
-                    512,
-                    5,
-                    1.2);
+                    true, Path.of("/sys/fs/cgroup"), Duration.ofSeconds(60), 8, 512, 5, 1.2);
         }
     }
 

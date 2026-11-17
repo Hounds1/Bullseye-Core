@@ -66,7 +66,9 @@ class CpuPressureDiagnosticTest {
         assertEquals(Severity.ELEVATED, elevated.current().severity());
         assertEquals(ResourceState.PRESSURE, elevated.current().state());
         assertEquals(2, elevated.current().version());
-        assertEquals("CPU pressure detected. usage=74.0% sustained=10s", elevated.event().reason());
+        assertEquals(
+                "Heavily loaded CPU detected. usage=74.0% sustained=10s",
+                elevated.event().reason());
 
         append(15_000, 81);
         append(20_000, 83);
@@ -77,8 +79,7 @@ class CpuPressureDiagnosticTest {
         assertEquals(ResourceState.SATURATION_RISK, high.current().state());
         assertEquals(3, high.current().version());
         assertEquals(
-                "Warning. CPU saturation risk detected. usage=85.0% rise=+4.0pp/10s",
-                high.event().reason());
+                "Resource saturation detected. usage=85.0% rise=+4.0pp/10s", high.event().reason());
 
         append(30_000, 75);
         assertTrue(coordinator.evaluate(30_000).isEmpty());
@@ -93,7 +94,7 @@ class CpuPressureDiagnosticTest {
         assertEquals(ResourceState.SATURATED, critical.current().state());
         assertEquals(4, critical.current().version());
         assertEquals(
-                "Critical CPU saturation detected. usage=93.0% sustained=5s",
+                "Host resource capacity compromised. usage=93.0% sustained=5s",
                 critical.event().reason());
 
         for (long timestamp = 45_000; timestamp <= 75_000; timestamp += 5_000) {
@@ -104,7 +105,7 @@ class CpuPressureDiagnosticTest {
         assertEquals(Severity.NORMAL, recovered.current().severity());
         assertEquals(ResourceType.UNKNOWN, recovered.current().resource());
         assertEquals(5, recovered.current().version());
-        assertEquals("CPU pressure cleared. usage=60.0% sustained=30s", recovered.event().reason());
+        assertEquals("CPU load normalized. usage=60.0% sustained=30s", recovered.event().reason());
     }
 
     @Test

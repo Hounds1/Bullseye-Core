@@ -47,7 +47,7 @@ public final class IoPressureRule implements DiagnosticRule {
                     decision(
                             Severity.NORMAL,
                             ResourceState.NORMAL,
-                            "IO pressure cleared.",
+                            "I/O pressure normalized.",
                             some.orElseThrow().value(),
                             full.map(MetricSample::value).orElse(null),
                             configuration.recoveryDuration()));
@@ -80,7 +80,7 @@ public final class IoPressureRule implements DiagnosticRule {
                     decision(
                             Severity.CRITICAL,
                             ResourceState.SATURATED,
-                            "Critical IO saturation detected.",
+                            "Resource saturation detected.",
                             some,
                             full,
                             configuration.criticalDuration()));
@@ -103,7 +103,7 @@ public final class IoPressureRule implements DiagnosticRule {
                     decision(
                             Severity.HIGH,
                             ResourceState.SATURATION_RISK,
-                            "Warning. IO saturation risk detected.",
+                            "Severe resource contention detected.",
                             some,
                             full,
                             configuration.highDuration()));
@@ -118,7 +118,7 @@ public final class IoPressureRule implements DiagnosticRule {
                     decision(
                             Severity.ELEVATED,
                             ResourceState.PRESSURE,
-                            "IO pressure detected.",
+                            "I/O pressure detected.",
                             some,
                             full,
                             configuration.elevatedDuration()));

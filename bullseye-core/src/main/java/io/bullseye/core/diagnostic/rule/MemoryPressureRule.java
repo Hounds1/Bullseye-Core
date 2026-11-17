@@ -48,7 +48,7 @@ public final class MemoryPressureRule implements DiagnosticRule {
                     decision(
                             Severity.NORMAL,
                             ResourceState.NORMAL,
-                            "Memory pressure cleared.",
+                            "Memory pressure normalized.",
                             usage.orElseThrow().value(),
                             some.orElseThrow().value(),
                             full.map(MetricSample::value).orElse(null),
@@ -98,7 +98,7 @@ public final class MemoryPressureRule implements DiagnosticRule {
                     decision(
                             Severity.CRITICAL,
                             ResourceState.SATURATED,
-                            "Critical memory saturation detected.",
+                            "Host resource capacity compromised.",
                             usage,
                             some,
                             full,
@@ -126,7 +126,7 @@ public final class MemoryPressureRule implements DiagnosticRule {
                     decision(
                             Severity.HIGH,
                             ResourceState.SATURATION_RISK,
-                            "Warning. Memory saturation risk detected.",
+                            "Critical memory pressure detected.",
                             usage,
                             some,
                             full,

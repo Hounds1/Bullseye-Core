@@ -8,17 +8,7 @@ public final class MemInfoParser {
     private MemInfoParser() {}
 
     public static double parseUsagePercentage(String content) {
-        Map<String, Long> values = new HashMap<>();
-        content.lines()
-                .forEach(
-                        line -> {
-                            String[] fields = line.trim().split("\\s+");
-                            if (fields.length >= 2 && fields[0].endsWith(":")) {
-                                String key = fields[0].substring(0, fields[0].length() - 1);
-                                values.put(key, Long.parseLong(fields[1]));
-                            }
-                        });
-
+        Map<String, Long> values = parseValues(content);
         long total = required(values, "MemTotal");
         long available =
                 values.getOrDefault(
@@ -30,6 +20,28 @@ public final class MemInfoParser {
             throw new IllegalArgumentException("Invalid memory counters");
         }
         return (double) (total - Math.min(total, available)) * 100.0 / total;
+    }
+
+    public static long parseTotalBytes(String content) {
+        long totalKilobytes = required(parseValues(content), "MemTotal");
+        if (totalKilobytes <= 0) {
+            throw new IllegalArgumentException("Invalid total memory counter");
+        }
+        return Math.multiplyExact(totalKilobytes, 1_024);
+    }
+
+    private static Map<String, Long> parseValues(String content) {
+        Map<String, Long> values = new HashMap<>();
+        content.lines()
+                .forEach(
+                        line -> {
+                            String[] fields = line.trim().split("\\s+");
+                            if (fields.length >= 2 && fields[0].endsWith(":")) {
+                                String key = fields[0].substring(0, fields[0].length() - 1);
+                                values.put(key, Long.parseLong(fields[1]));
+                            }
+                        });
+        return values;
     }
 
     private static long required(Map<String, Long> values, String key) {

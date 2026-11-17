@@ -37,9 +37,7 @@ public final class BullseyeRuntime implements AutoCloseable {
     private final Duration samplingInterval;
     private final Duration windowDuration;
     private final CgroupMonitor cgroupMonitor;
-    private final Duration cgroupSamplingInterval;
     private final ScheduledExecutorService collectorExecutor;
-    private final ScheduledExecutorService cgroupExecutor;
     private final ExecutorService diagnosticExecutor;
     private final AtomicBoolean running = new AtomicBoolean();
     private final AtomicBoolean diagnosticPending = new AtomicBoolean();
@@ -66,8 +64,7 @@ public final class BullseyeRuntime implements AutoCloseable {
                 clock,
                 samplingInterval,
                 windowDuration,
-                null,
-                samplingInterval);
+                null);
     }
 
     public BullseyeRuntime(
@@ -81,8 +78,7 @@ public final class BullseyeRuntime implements AutoCloseable {
             Clock clock,
             Duration samplingInterval,
             Duration windowDuration,
-            CgroupMonitor cgroupMonitor,
-            Duration cgroupSamplingInterval) {
+            CgroupMonitor cgroupMonitor) {
         this.collectors = List.copyOf(Objects.requireNonNull(collectors, "collectors"));
         this.normalizer = Objects.requireNonNull(normalizer, "normalizer");
         this.metricWindow = Objects.requireNonNull(metricWindow, "metricWindow");
@@ -95,18 +91,11 @@ public final class BullseyeRuntime implements AutoCloseable {
         this.samplingInterval = Objects.requireNonNull(samplingInterval, "samplingInterval");
         this.windowDuration = Objects.requireNonNull(windowDuration, "windowDuration");
         this.cgroupMonitor = cgroupMonitor;
-        this.cgroupSamplingInterval =
-                Objects.requireNonNull(cgroupSamplingInterval, "cgroupSamplingInterval");
         this.collectorExecutor =
                 Executors.newSingleThreadScheduledExecutor(
                         new NamedThreadFactory("bullseye-collector"));
         this.diagnosticExecutor =
                 Executors.newSingleThreadExecutor(new NamedThreadFactory("bullseye-diagnostic"));
-        this.cgroupExecutor =
-                cgroupMonitor == null
-                        ? null
-                        : Executors.newSingleThreadScheduledExecutor(
-                                new NamedThreadFactory("bullseye-cgroup"));
     }
 
     public void start() {
@@ -124,11 +113,6 @@ public final class BullseyeRuntime implements AutoCloseable {
                 this::collectSafely, 0, intervalMillis, TimeUnit.MILLISECONDS);
         if (cgroupMonitor != null) {
             cgroupMonitor.initialize();
-            cgroupExecutor.scheduleWithFixedDelay(
-                    this::sampleCgroupsSafely,
-                    0,
-                    cgroupSamplingInterval.toMillis(),
-                    TimeUnit.MILLISECONDS);
         }
     }
 
@@ -141,10 +125,6 @@ public final class BullseyeRuntime implements AutoCloseable {
         logger.status("Shutdown sequence initiated.");
         collectorExecutor.shutdown();
         await(collectorExecutor);
-        if (cgroupExecutor != null) {
-            cgroupExecutor.shutdown();
-            await(cgroupExecutor);
-        }
         diagnosticExecutor.shutdown();
         await(diagnosticExecutor);
         publisher.close(SHUTDOWN_TIMEOUT);
@@ -182,14 +162,6 @@ public final class BullseyeRuntime implements AutoCloseable {
             if (running.get()) {
                 logger.interrupted("Diagnostic evaluation interrupted.", failure);
             }
-        }
-    }
-
-    private void sampleCgroupsSafely() {
-        try {
-            cgroupMonitor.sample();
-        } catch (Exception failure) {
-            logger.componentInterrupted("cgroup-monitor", failure);
         }
     }
 

@@ -58,7 +58,7 @@ public final class CpuPressureRule implements DiagnosticRule {
                     decision(
                             Severity.NORMAL,
                             ResourceState.NORMAL,
-                            "CPU pressure cleared.",
+                            "CPU load normalized.",
                             usage.orElseThrow().value(),
                             psi.map(MetricSample::value).orElse(null),
                             null,
@@ -93,7 +93,7 @@ public final class CpuPressureRule implements DiagnosticRule {
                 value -> value >= configuration.criticalThreshold())) {
             severity = Severity.CRITICAL;
             state = ResourceState.SATURATED;
-            announcement = "Critical CPU saturation detected.";
+            announcement = "Host resource capacity compromised.";
             duration = configuration.criticalDuration();
         } else {
             List<MetricSample> highRun =
@@ -108,7 +108,7 @@ public final class CpuPressureRule implements DiagnosticRule {
                     && MetricConditions.rise(highRun) > configuration.highMinimumRise()) {
                 severity = Severity.HIGH;
                 state = ResourceState.SATURATION_RISK;
-                announcement = "Warning. CPU saturation risk detected.";
+                announcement = "Resource saturation detected.";
                 duration = configuration.highDuration();
                 rise = MetricConditions.rise(highRun);
             } else if (MetricConditions.sustained(
@@ -120,7 +120,7 @@ public final class CpuPressureRule implements DiagnosticRule {
                     value -> value >= configuration.elevatedThreshold())) {
                 severity = Severity.ELEVATED;
                 state = ResourceState.PRESSURE;
-                announcement = "CPU pressure detected.";
+                announcement = "Heavily loaded CPU detected.";
                 duration = configuration.elevatedDuration();
             } else {
                 return Optional.empty();
@@ -135,7 +135,7 @@ public final class CpuPressureRule implements DiagnosticRule {
                     severity == Severity.HIGH
                             ? ResourceState.SATURATION_RISK
                             : ResourceState.PRESSURE;
-            announcement = "CPU utilization elevated without PSI corroboration.";
+            announcement = "CPU load detected without pressure corroboration.";
         }
         return Optional.of(
                 decision(

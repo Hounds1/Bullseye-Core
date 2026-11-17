@@ -38,6 +38,12 @@ public final class DiagnosticSnapshotJsonEncoder {
                         .append("  \"attributionConfidence\": \"")
                         .append(snapshot.attribution().confidence())
                         .append("\",\n")
+                        .append("  \"attributionStatus\": \"")
+                        .append(snapshot.attribution().status())
+                        .append("\",\n")
+                        .append("  \"attributionScore\": ")
+                        .append(snapshot.attribution().score())
+                        .append(",\n")
                         .append("  \"evidence\": [");
         for (int index = 0; index < snapshot.evidence().size(); index++) {
             var evidence = snapshot.evidence().get(index);

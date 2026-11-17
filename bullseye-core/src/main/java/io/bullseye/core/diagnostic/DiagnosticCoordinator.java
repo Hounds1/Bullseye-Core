@@ -5,8 +5,9 @@ import io.bullseye.common.diagnostic.DiagnosticSnapshot;
 import io.bullseye.common.diagnostic.ResourceState;
 import io.bullseye.common.diagnostic.ResourceType;
 import io.bullseye.common.diagnostic.Severity;
+import io.bullseye.common.metric.MetricSample;
+import io.bullseye.common.metric.MetricType;
 import io.bullseye.common.workload.WorkloadAttribution;
-import io.bullseye.core.linux.cgroup.CgroupResourceSnapshot;
 import io.bullseye.core.metric.MetricWindow;
 import io.bullseye.core.state.DiagnosticStateRepository;
 
@@ -23,17 +24,17 @@ public final class DiagnosticCoordinator {
     private final DiagnosticEngine engine;
     private final DiagnosticStateRepository stateRepository;
     private final Supplier<String> eventIdSupplier;
-    private final Supplier<List<CgroupResourceSnapshot>> cgroupSnapshots;
-    private final PressureAttributor attributor;
+    private final MemoryPressureAttributor memoryAttributor;
     private final EnumMap<ResourceType, DiagnosticDecision> resourceStates =
             new EnumMap<>(ResourceType.class);
+    private WorkloadAttribution memoryAttribution = WorkloadAttribution.unresolved();
 
     public DiagnosticCoordinator(
             MetricWindow metricWindow,
             DiagnosticEngine engine,
             DiagnosticStateRepository stateRepository,
             Supplier<String> eventIdSupplier) {
-        this(metricWindow, engine, stateRepository, eventIdSupplier, List::of, null);
+        this(metricWindow, engine, stateRepository, eventIdSupplier, null);
     }
 
     public DiagnosticCoordinator(
@@ -41,14 +42,12 @@ public final class DiagnosticCoordinator {
             DiagnosticEngine engine,
             DiagnosticStateRepository stateRepository,
             Supplier<String> eventIdSupplier,
-            Supplier<List<CgroupResourceSnapshot>> cgroupSnapshots,
-            PressureAttributor attributor) {
+            MemoryPressureAttributor memoryAttributor) {
         this.metricWindow = Objects.requireNonNull(metricWindow, "metricWindow");
         this.engine = Objects.requireNonNull(engine, "engine");
         this.stateRepository = Objects.requireNonNull(stateRepository, "stateRepository");
         this.eventIdSupplier = Objects.requireNonNull(eventIdSupplier, "eventIdSupplier");
-        this.cgroupSnapshots = Objects.requireNonNull(cgroupSnapshots, "cgroupSnapshots");
-        this.attributor = attributor;
+        this.memoryAttributor = memoryAttributor;
         DiagnosticSnapshot current = stateRepository.current();
         if (current.resource() != ResourceType.UNKNOWN) {
             resourceStates.put(
@@ -61,14 +60,19 @@ public final class DiagnosticCoordinator {
                             current.evidence(),
                             0));
         }
+        if (current.resource() == ResourceType.HOST_MEMORY) {
+            memoryAttribution = current.attribution();
+        }
     }
 
     public synchronized Optional<DiagnosticTransition> evaluate(long evaluatedAt) {
         DiagnosticSnapshot previous = stateRepository.current();
+        DiagnosticDecision previousMemory = memoryState(resourceStates);
         DiagnosticEngine.Evaluation evaluation =
                 engine.evaluate(
                         new DiagnosticContext(
                                 metricWindow, previous, Map.copyOf(resourceStates), evaluatedAt));
+        DiagnosticDecision currentMemory = memoryState(evaluation.resourceStates());
         resourceStates.clear();
         resourceStates.putAll(evaluation.resourceStates());
 
@@ -77,11 +81,7 @@ public final class DiagnosticCoordinator {
                 primary.severity() == Severity.NORMAL ? ResourceType.UNKNOWN : primary.resource();
         ResourceState snapshotState =
                 primary.severity() == Severity.NORMAL ? ResourceState.NORMAL : primary.state();
-        WorkloadAttribution attribution =
-                primary.severity().ordinal() >= Severity.HIGH.ordinal() && attributor != null
-                        ? attributor.attribute(
-                                primary.resource(), cgroupSnapshots.get(), evaluatedAt)
-                        : WorkloadAttribution.unresolved();
+        WorkloadAttribution attribution = attribution(previousMemory, currentMemory, primary);
 
         if (sameState(previous, primary, snapshotResource, snapshotState, attribution)) {
             return Optional.empty();
@@ -116,6 +116,43 @@ public final class DiagnosticCoordinator {
         return Map.copyOf(resourceStates);
     }
 
+    private WorkloadAttribution attribution(
+            DiagnosticDecision previousMemory,
+            DiagnosticDecision currentMemory,
+            DiagnosticDecision primary) {
+        if (memoryAttributor == null
+                || currentMemory.severity().ordinal() < Severity.HIGH.ordinal()) {
+            if (memoryAttributor != null
+                    && previousMemory.severity().ordinal() >= Severity.HIGH.ordinal()) {
+                memoryAttributor.reset();
+            }
+            memoryAttribution = WorkloadAttribution.unresolved();
+            return WorkloadAttribution.unresolved();
+        }
+
+        boolean highEntry =
+                currentMemory.severity() == Severity.HIGH
+                        && previousMemory.severity() != Severity.HIGH;
+        boolean critical = currentMemory.severity() == Severity.CRITICAL;
+        if (highEntry || critical) {
+            memoryAttribution = memoryAttributor.attribute(latestHostMemoryTotal());
+        }
+        return primary.resource() == ResourceType.HOST_MEMORY
+                ? memoryAttribution
+                : WorkloadAttribution.unresolved();
+    }
+
+    private long latestHostMemoryTotal() {
+        List<MetricSample> samples = metricWindow.get(MetricType.HOST_MEMORY_TOTAL_BYTES);
+        return samples.isEmpty() ? -1 : (long) samples.getLast().value();
+    }
+
+    private static DiagnosticDecision memoryState(Map<ResourceType, DiagnosticDecision> states) {
+        return states.getOrDefault(
+                ResourceType.HOST_MEMORY,
+                DiagnosticDecision.normal(ResourceType.HOST_MEMORY, "Memory condition nominal."));
+    }
+
     private static boolean sameState(
             DiagnosticSnapshot previous,
             DiagnosticDecision primary,
@@ -125,6 +162,8 @@ public final class DiagnosticCoordinator {
         return previous.severity() == primary.severity()
                 && previous.resource() == resource
                 && previous.state() == state
-                && previous.attribution().workload().equals(attribution.workload());
+                && previous.attribution().workload().equals(attribution.workload())
+                && previous.attribution().confidence() == attribution.confidence()
+                && previous.attribution().status() == attribution.status();
     }
 }

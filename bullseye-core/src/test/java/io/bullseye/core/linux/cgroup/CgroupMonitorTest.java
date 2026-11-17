@@ -1,7 +1,7 @@
 package io.bullseye.core.linux.cgroup;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.bullseye.core.config.BullseyeConfiguration;
@@ -43,106 +43,122 @@ class CgroupMonitorTest {
         files.content.put(root.resolve("cgroup.controllers"), "cpu memory io");
         files.directories.put(root, List.of(group));
         clock = new MutableClock();
-        fixtureGroup("1000000", "800", "1000");
+        fixtureGroup("800", "1000", 20, 3, "high 4\nmax 2\noom 1\noom_kill 0\n");
     }
 
     @Test
-    void parsesCpuStatMemoryAndPressureFiles() {
-        CgroupMonitor monitor = monitor(512);
-        monitor.sample();
-        files.content.put(group.resolve("cpu.stat"), "usage_usec 1500000\nuser_usec 1\n");
-        clock.millis = 1_000;
+    void collectsMemoryPressureAndEventCounters() {
+        CgroupMemorySnapshot snapshot = monitor(512).collectMemory().snapshots().getFirst();
 
-        monitor.sample();
-        CgroupResourceSnapshot snapshot = monitor.snapshots().getFirst();
-
-        assertEquals(50, snapshot.cpuUsage(), 0.0001);
-        assertEquals(800, snapshot.memoryCurrent());
-        assertEquals(1_000, snapshot.memoryMax());
-        assertEquals(12, snapshot.cpuPsiSome());
-        assertEquals(20, snapshot.memoryPsiSome());
-        assertEquals(3, snapshot.memoryPsiFull());
-        assertEquals(30, snapshot.ioPsiSome());
-        assertEquals(4, snapshot.ioPsiFull());
+        assertEquals(800, snapshot.currentBytes());
+        assertEquals(1_000, snapshot.maxBytes());
+        assertEquals(20, snapshot.psiSome());
+        assertEquals(3, snapshot.psiFull());
+        assertEquals(4, snapshot.highEvents());
+        assertEquals(2, snapshot.maxEvents());
+        assertEquals(1, snapshot.oomEvents());
+        assertEquals(0, snapshot.oomKillEvents());
     }
 
     @Test
-    void mapsUnlimitedMemoryMaxToUnavailableSentinel() {
+    void mapsUnlimitedMemoryMaxToNull() {
         files.content.put(group.resolve("memory.max"), "max\n");
+
+        CgroupMemorySnapshot snapshot = monitor(512).collectMemory().snapshots().getFirst();
+
+        assertNull(snapshot.maxBytes());
+    }
+
+    @Test
+    void retainsPreviousTriggerSnapshotForGrowthCalculation() {
         CgroupMonitor monitor = monitor(512);
+        monitor.collectMemory();
+        files.content.put(group.resolve("memory.current"), "1200\n");
+        clock.millis = 5_000;
 
-        monitor.sample();
+        CgroupMonitor.CollectionResult second = monitor.collectMemory();
 
-        assertEquals(-1, monitor.snapshots().getFirst().memoryMax());
+        assertEquals(
+                800,
+                second.previousSnapshots().get("/system.slice/order-api.service").currentBytes());
+        assertEquals(1_200, second.snapshots().getFirst().currentBytes());
     }
 
     @Test
     void cachesDiscoveryUntilRefreshInterval() {
         CgroupMonitor monitor = monitor(512);
 
-        monitor.sample();
-        int initialDiscoveryReads = files.directoryReads;
+        monitor.collectMemory();
+        int initialReads = files.directoryReads;
         clock.millis = 30_000;
-        monitor.sample();
-        assertEquals(initialDiscoveryReads, files.directoryReads);
+        monitor.collectMemory();
+        assertEquals(initialReads, files.directoryReads);
 
         clock.millis = 60_000;
-        monitor.sample();
-        assertTrue(files.directoryReads > initialDiscoveryReads);
+        monitor.collectMemory();
+        assertTrue(files.directoryReads > initialReads);
     }
 
     @Test
     void skipsCgroupThatDisappearsDuringCollection() {
         files.missingDuringRead.add(group.resolve("memory.current"));
-        CgroupMonitor monitor = monitor(512);
 
-        monitor.sample();
+        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
 
-        assertTrue(monitor.snapshots().isEmpty());
+        assertEquals(CgroupMonitor.Status.AVAILABLE, result.status());
+        assertTrue(result.snapshots().isEmpty());
     }
 
     @Test
-    void isolatesPermissionFailureToAffectedCgroup() {
+    void returnsAccessDeniedWithoutThrowing() {
         files.denied.add(group.resolve("memory.pressure"));
-        CgroupMonitor monitor = monitor(512);
 
-        monitor.sample();
+        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
 
-        assertTrue(monitor.snapshots().isEmpty());
-        assertTrue(monitor.isSupported());
+        assertEquals(CgroupMonitor.Status.ACCESS_DENIED, result.status());
+        assertTrue(result.snapshots().isEmpty());
     }
 
     @Test
     void boundsNumberOfDiscoveredCgroups() {
         Path second = root.resolve("system.slice/batch.service");
         files.directories.put(root, List.of(group, second));
-        CgroupMonitor monitor = monitor(1);
+        fixtureGroup(second, "400", "max", 2, 0, "high 0\n");
 
-        monitor.sample();
+        CgroupMonitor.CollectionResult result = monitor(1).collectMemory();
 
-        assertEquals(1, monitor.snapshots().size());
-        assertEquals("order-api.service", monitor.snapshots().getFirst().workload().name());
+        assertEquals(1, result.snapshots().size());
+        assertEquals("order-api.service", result.snapshots().getFirst().workload().name());
     }
 
     @Test
-    void unsupportedCgroupV2DisablesAttributionWithoutFailure() {
+    void unsupportedCgroupV2ReturnsExplicitStatus() {
         files.content.remove(root.resolve("cgroup.controllers"));
-        CgroupMonitor monitor = monitor(512);
 
-        monitor.sample();
+        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
 
-        assertFalse(monitor.isSupported());
-        assertTrue(monitor.snapshots().isEmpty());
+        assertEquals(CgroupMonitor.Status.CGROUP_V2_NOT_AVAILABLE, result.status());
+        assertTrue(result.snapshots().isEmpty());
     }
 
     @Test
-    void cachesAnEmptyTopologyInsteadOfRediscoveringEverySample() {
+    void deniedCgroupControllerReturnsAccessDeniedStatus() {
+        files.denied.add(root.resolve("cgroup.controllers"));
+
+        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+
+        assertEquals(CgroupMonitor.Status.ACCESS_DENIED, result.status());
+        assertTrue(result.snapshots().isEmpty());
+    }
+
+    @Test
+    void cachesAnEmptyTopologyInsteadOfRediscoveringEveryTrigger() {
         files.directories.put(root, List.of());
         CgroupMonitor monitor = monitor(512);
 
-        monitor.sample();
+        monitor.collectMemory();
         clock.millis = 5_000;
-        monitor.sample();
+        monitor.collectMemory();
 
         assertEquals(1, files.directoryReads);
     }
@@ -150,14 +166,7 @@ class CgroupMonitorTest {
     private CgroupMonitor monitor(int maximumGroups) {
         return new CgroupMonitor(
                 new BullseyeConfiguration.Cgroup(
-                        true,
-                        root,
-                        Duration.ofSeconds(60),
-                        Duration.ofSeconds(5),
-                        8,
-                        maximumGroups,
-                        5,
-                        1.2),
+                        true, root, Duration.ofSeconds(60), 8, maximumGroups, 5, 1.2),
                 files,
                 clock,
                 new BullseyeLogger(
@@ -165,18 +174,30 @@ class CgroupMonitorTest {
                         new PrintStream(OutputStream.nullOutputStream())));
     }
 
-    private void fixtureGroup(String usageMicros, String memoryCurrent, String memoryMax) {
-        files.content.put(group.resolve("cpu.stat"), "usage_usec " + usageMicros + "\n");
-        files.content.put(group.resolve("memory.current"), memoryCurrent + "\n");
-        files.content.put(group.resolve("memory.max"), memoryMax + "\n");
-        files.content.put(group.resolve("cpu.pressure"), psi(12, null));
-        files.content.put(group.resolve("memory.pressure"), psi(20, 3.0));
-        files.content.put(group.resolve("io.pressure"), psi(30, 4.0));
+    private void fixtureGroup(
+            String memoryCurrent, String memoryMax, double psiSome, double psiFull, String events) {
+        fixtureGroup(group, memoryCurrent, memoryMax, psiSome, psiFull, events);
     }
 
-    private static String psi(double some, Double full) {
-        String value = "some avg10=" + some + " avg60=1 avg300=1 total=10\n";
-        return full == null ? value : value + "full avg10=" + full + " avg60=1 avg300=1 total=2\n";
+    private void fixtureGroup(
+            Path target,
+            String memoryCurrent,
+            String memoryMax,
+            double psiSome,
+            double psiFull,
+            String events) {
+        files.content.put(target.resolve("memory.current"), memoryCurrent + "\n");
+        files.content.put(target.resolve("memory.max"), memoryMax + "\n");
+        files.content.put(target.resolve("memory.pressure"), psi(psiSome, psiFull));
+        files.content.put(target.resolve("memory.events"), events);
+    }
+
+    private static String psi(double some, double full) {
+        return "some avg10="
+                + some
+                + " avg60=1 avg300=1 total=10\nfull avg10="
+                + full
+                + " avg60=1 avg300=1 total=2\n";
     }
 
     private static final class FakeFiles implements CgroupMonitor.FileAccess {

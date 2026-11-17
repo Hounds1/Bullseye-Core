@@ -36,6 +36,7 @@ class LinuxProcParserTest {
                 """;
 
         assertEquals(75, MemInfoParser.parseUsagePercentage(memory));
+        assertEquals(1_024_000, MemInfoParser.parseTotalBytes(memory));
         assertEquals(1.25, LoadAverageParser.parseOneMinuteLoad("1.25 0.80 0.50 1/200 10\n"));
     }
 
@@ -53,6 +54,9 @@ class LinuxProcParserTest {
         assertTrue(second.stream().anyMatch(sample -> sample.type() == MetricType.HOST_CPU_USAGE));
         assertTrue(
                 second.stream().anyMatch(sample -> sample.type() == MetricType.HOST_MEMORY_USAGE));
+        assertTrue(
+                second.stream()
+                        .anyMatch(sample -> sample.type() == MetricType.HOST_MEMORY_TOTAL_BYTES));
         assertTrue(
                 second.stream().anyMatch(sample -> sample.type() == MetricType.HOST_LOAD_AVERAGE));
     }
