@@ -1,6 +1,7 @@
 package io.bullseye.core.state.publish;
 
 import io.bullseye.common.diagnostic.DiagnosticSnapshot;
+import io.bullseye.common.diagnostic.ResourceType;
 
 import java.util.Objects;
 
@@ -62,6 +63,15 @@ public final class DiagnosticSnapshotJsonEncoder {
             json.append('\n').append("  ");
         }
         return json.append("],\n")
+                .append("  \"evaluatedAt\": ")
+                .append(snapshot.evaluatedAt())
+                .append(",\n")
+                .append("  \"observationStatus\": \"")
+                .append(snapshot.observationStatus())
+                .append("\",\n")
+                .append("  \"observations\": ")
+                .append(observations(snapshot))
+                .append(",\n")
                 .append("  \"since\": ")
                 .append(snapshot.since())
                 .append(",\n")
@@ -70,6 +80,43 @@ public final class DiagnosticSnapshotJsonEncoder {
                 .append('\n')
                 .append("}\n")
                 .toString();
+    }
+
+    private static String observations(DiagnosticSnapshot snapshot) {
+        StringBuilder json = new StringBuilder("{");
+        boolean first = true;
+        for (ResourceType resource : ResourceType.values()) {
+            var observation = snapshot.observations().get(resource);
+            if (observation == null) {
+                continue;
+            }
+            if (!first) {
+                json.append(',');
+            }
+            first = false;
+            json.append("\n    \"").append(resource).append("\": {\n")
+                    .append("      \"status\": \"").append(observation.status()).append("\",\n")
+                    .append("      \"lastSampleAt\": ")
+                    .append(observation.lastSampleAt()).append(",\n")
+                    .append("      \"metrics\": [");
+            for (int index = 0; index < observation.metrics().size(); index++) {
+                var metric = observation.metrics().get(index);
+                if (index > 0) {
+                    json.append(',');
+                }
+                json.append("\n        {\"metric\": \"").append(escape(metric.metric()))
+                        .append("\", \"value\": ").append(metric.value())
+                        .append(", \"unit\": \"").append(escape(metric.unit())).append("\"}");
+            }
+            if (!observation.metrics().isEmpty()) {
+                json.append('\n').append("      ");
+            }
+            json.append("]\n    }");
+        }
+        if (!first) {
+            json.append('\n').append("  ");
+        }
+        return json.append('}').toString();
     }
 
     private static String escape(String value) {

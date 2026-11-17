@@ -18,6 +18,10 @@ public final class DiagnosticEngine {
         this.rules = List.copyOf(Objects.requireNonNull(rules, "rules"));
     }
 
+    public List<ResourceType> resources() {
+        return rules.stream().map(DiagnosticRule::resource).distinct().toList();
+    }
+
     public Evaluation evaluate(DiagnosticContext context) {
         EnumMap<ResourceType, DiagnosticDecision> states = new EnumMap<>(ResourceType.class);
         states.putAll(context.resourceStates());

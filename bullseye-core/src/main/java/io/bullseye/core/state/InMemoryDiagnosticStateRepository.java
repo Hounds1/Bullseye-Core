@@ -23,10 +23,28 @@ public final class InMemoryDiagnosticStateRepository implements DiagnosticStateR
         Objects.requireNonNull(snapshot, "snapshot");
         current.updateAndGet(
                 previous -> {
-                    if (snapshot.version() <= previous.version()) {
-                        throw new IllegalArgumentException("State version must increase");
+                    if (snapshot.version() < previous.version()
+                            || snapshot.evaluatedAt() < previous.evaluatedAt()) {
+                        throw new IllegalArgumentException("Snapshot must not move backwards");
+                    }
+                    if (snapshot.version() == previous.version()
+                            && !sameDiagnosis(previous, snapshot)) {
+                        throw new IllegalArgumentException(
+                                "Diagnostic changes require a new version");
                     }
                     return snapshot;
                 });
+    }
+
+    private static boolean sameDiagnosis(DiagnosticSnapshot previous, DiagnosticSnapshot current) {
+        return previous.host().equals(current.host())
+                && previous.application().equals(current.application())
+                && previous.severity() == current.severity()
+                && previous.resource() == current.resource()
+                && previous.state() == current.state()
+                && previous.since() == current.since()
+                && previous.attribution().workload().equals(current.attribution().workload())
+                && previous.attribution().confidence() == current.attribution().confidence()
+                && previous.attribution().status() == current.attribution().status();
     }
 }

@@ -169,11 +169,8 @@ public final class BullseyeRuntime implements AutoCloseable {
         try {
             diagnosticCoordinator
                     .evaluate(clock.millis())
-                    .ifPresent(
-                            transition -> {
-                                logger.transition(transition);
-                                publisher.publish(transition.current());
-                            });
+                    .ifPresent(logger::transition);
+            publisher.publish(stateRepository.current());
         } catch (Exception failure) {
             logger.interrupted("Diagnostic evaluation interrupted.", failure);
         }

@@ -1,0 +1,288 @@
+package io.bullseye.core.runtime;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTimeout;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+
+import io.bullseye.common.diagnostic.DiagnosticSnapshot;
+import io.bullseye.common.diagnostic.DiagnosticSnapshot.ObservationStatus;
+import io.bullseye.common.diagnostic.ResourceType;
+import io.bullseye.common.diagnostic.Severity;
+import io.bullseye.common.metric.MetricSample;
+import io.bullseye.common.metric.MetricType;
+import io.bullseye.core.config.BullseyeConfiguration;
+import io.bullseye.core.diagnostic.DiagnosticCoordinator;
+import io.bullseye.core.diagnostic.DiagnosticEngine;
+import io.bullseye.core.diagnostic.rule.CpuPressureRule;
+import io.bullseye.core.logging.BullseyeLogger;
+import io.bullseye.core.metric.HostMetricNormalizer;
+import io.bullseye.core.metric.InMemoryRollingMetricWindow;
+import io.bullseye.core.metric.MetricCollector;
+import io.bullseye.core.state.InMemoryDiagnosticStateRepository;
+import io.bullseye.core.state.publish.AsyncStatePublisher;
+
+import org.junit.jupiter.api.Test;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.util.Collection;
+import java.util.List;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
+
+class BullseyeRuntimeTest {
+
+    @Test
+    void publishesFreshTelemetryWithoutRepeatingStateTransitionLogs() throws Exception {
+        try (Harness harness = new Harness()) {
+            harness.collector.observe(1_000, 20);
+            harness.runtime.start();
+            DiagnosticSnapshot first = harness.awaitObserved(1_000, 20);
+
+            harness.collector.observe(1_500, 30);
+            DiagnosticSnapshot second = harness.awaitObserved(1_500, 30);
+
+            assertEquals(Severity.NORMAL, second.severity());
+            assertEquals(ObservationStatus.FRESH, second.observationStatus());
+            assertEquals(first.version(), second.version());
+            assertEquals(first.since(), second.since());
+            assertEquals(1_000, first.evaluatedAt());
+            assertEquals(1_500, second.evaluatedAt());
+            assertFalse(harness.output().contains(" previous="));
+            assertTrue(harness.errors().isEmpty());
+
+            assertTimeout(Duration.ofSeconds(3), harness.runtime::close);
+            assertTrue(harness.output().contains("Bullseye diagnostic system offline."));
+        }
+    }
+
+    @Test
+    void publishesStaleOutageAndObservedRecoveryWithoutFalseNormalization() throws Exception {
+        try (Harness harness = new Harness()) {
+            harness.collector.observe(1_000, 95);
+            harness.runtime.start();
+            harness.awaitObserved(1_000, 95);
+
+            harness.collector.observe(2_000, 96);
+            DiagnosticSnapshot critical =
+                    harness.await(snapshot -> snapshot.severity() == Severity.CRITICAL);
+
+            harness.collector.observe(2_500, 97);
+            harness.awaitObserved(2_500, 97);
+
+            harness.collector.failAt(6_000);
+            DiagnosticSnapshot stale =
+                    harness.await(
+                            snapshot -> snapshot.observationStatus() == ObservationStatus.STALE);
+
+            assertEquals(6_000, stale.evaluatedAt());
+            assertEquals(Severity.CRITICAL, stale.severity());
+            assertEquals(critical.version(), stale.version());
+            assertEquals(critical.since(), stale.since());
+            assertEquals(
+                    2_500L,
+                    stale.observations().get(ResourceType.HOST_CPU).lastSampleAt().longValue());
+            assertTrue(stale.observations().get(ResourceType.HOST_CPU).metrics().isEmpty());
+
+            harness.collector.observe(7_000, 20);
+            DiagnosticSnapshot fresh = harness.awaitObserved(7_000, 20);
+            assertEquals(ObservationStatus.FRESH, fresh.observationStatus());
+            assertEquals(Severity.CRITICAL, fresh.severity());
+            assertEquals(critical.version(), fresh.version());
+
+            harness.collector.observe(8_000, 20);
+            DiagnosticSnapshot recovered =
+                    harness.await(
+                            snapshot ->
+                                    snapshot.evaluatedAt() == 8_000
+                                            && snapshot.severity() == Severity.NORMAL);
+
+            assertEquals(ObservationStatus.FRESH, recovered.observationStatus());
+            assertEquals(critical.version() + 1, recovered.version());
+            assertEquals(8_000, recovered.since());
+            assertTimeout(Duration.ofSeconds(3), harness.runtime::close);
+            assertEquals(
+                    2,
+                    harness.output().lines().filter(line -> line.contains(" previous=")).count());
+            assertTrue(harness.errors().contains("runtime-test"));
+        }
+    }
+
+    private static final class Harness implements AutoCloseable {
+
+        private static final Duration FRESHNESS = Duration.ofSeconds(2);
+        private static final Duration INTERVAL = Duration.ofMillis(20);
+        private final MutableClock clock = new MutableClock();
+        private final ControlledCollector collector = new ControlledCollector(clock);
+        private final BlockingQueue<DiagnosticSnapshot> published = new LinkedBlockingQueue<>();
+        private final ByteArrayOutputStream output = new ByteArrayOutputStream();
+        private final ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        private final BullseyeRuntime runtime;
+
+        private Harness() {
+            BullseyeLogger logger =
+                    new BullseyeLogger(
+                            new PrintStream(output, true, StandardCharsets.UTF_8),
+                            new PrintStream(errors, true, StandardCharsets.UTF_8));
+            Duration windowDuration = Duration.ofMinutes(1);
+            InMemoryRollingMetricWindow window =
+                    new InMemoryRollingMetricWindow(windowDuration, INTERVAL);
+            InMemoryDiagnosticStateRepository repository =
+                    new InMemoryDiagnosticStateRepository(
+                            DiagnosticSnapshot.initial("test-host", "runtime-test", 0));
+            BullseyeConfiguration.CpuDiagnostics configuration =
+                    new BullseyeConfiguration.CpuDiagnostics(
+                            70,
+                            Duration.ofSeconds(1),
+                            80,
+                            Duration.ofSeconds(1),
+                            0,
+                            90,
+                            Duration.ofSeconds(1),
+                            65,
+                            Duration.ofSeconds(1));
+            DiagnosticCoordinator coordinator =
+                    new DiagnosticCoordinator(
+                            window,
+                            new DiagnosticEngine(
+                                    List.of(new CpuPressureRule(configuration, FRESHNESS))),
+                            repository,
+                            () -> "test-event",
+                            null,
+                            FRESHNESS);
+            AsyncStatePublisher publisher = new AsyncStatePublisher(published::add, logger);
+            runtime =
+                    new BullseyeRuntime(
+                            List.of(collector),
+                            new HostMetricNormalizer(),
+                            window,
+                            coordinator,
+                            repository,
+                            publisher,
+                            logger,
+                            clock,
+                            INTERVAL,
+                            windowDuration);
+        }
+
+        private DiagnosticSnapshot awaitObserved(long timestamp, double usage) throws Exception {
+            return await(
+                    snapshot ->
+                            snapshot.evaluatedAt() == timestamp
+                                    && snapshot.observationStatus() == ObservationStatus.FRESH
+                                    && snapshot.observations()
+                                            .get(ResourceType.HOST_CPU)
+                                            .metrics()
+                                            .stream()
+                                            .anyMatch(
+                                                    metric ->
+                                                            metric.metric().equals("HOST_CPU_USAGE")
+                                                                    && metric.value() == usage));
+        }
+
+        private DiagnosticSnapshot await(Predicate<DiagnosticSnapshot> condition) throws Exception {
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+            long remaining;
+            while ((remaining = deadline - System.nanoTime()) > 0) {
+                DiagnosticSnapshot snapshot = published.poll(remaining, TimeUnit.NANOSECONDS);
+                if (snapshot == null) {
+                    break;
+                }
+                if (condition.test(snapshot)) {
+                    return snapshot;
+                }
+            }
+            return fail("Expected runtime snapshot was not published. Errors: " + errors());
+        }
+
+        private String output() {
+            return output.toString(StandardCharsets.UTF_8);
+        }
+
+        private String errors() {
+            return errors.toString(StandardCharsets.UTF_8);
+        }
+
+        @Override
+        public void close() {
+            runtime.close();
+        }
+    }
+
+    private static final class ControlledCollector implements MetricCollector {
+
+        private final MutableClock clock;
+        private final AtomicReference<Step> next = new AtomicReference<>(new Step(0, 0, false));
+
+        private ControlledCollector(MutableClock clock) {
+            this.clock = clock;
+        }
+
+        private void observe(long timestamp, double usage) {
+            next.set(new Step(timestamp, usage, false));
+        }
+
+        private void failAt(long timestamp) {
+            next.set(new Step(timestamp, 0, true));
+        }
+
+        @Override
+        public String name() {
+            return "runtime-test";
+        }
+
+        @Override
+        public Collection<MetricSample> collect() throws IOException {
+            Step step = next.get();
+            clock.now.set(step.timestamp());
+            if (step.failing()) {
+                throw new IOException("Simulated collection outage");
+            }
+            return List.of(
+                    new MetricSample(MetricType.HOST_CPU_USAGE, step.usage(), step.timestamp()));
+        }
+
+        private record Step(long timestamp, double usage, boolean failing) {}
+    }
+
+    private static final class MutableClock extends Clock {
+
+        private final AtomicLong now = new AtomicLong();
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            if (!ZoneOffset.UTC.equals(zone)) {
+                throw new IllegalArgumentException("Only UTC is supported by this test clock");
+            }
+            return this;
+        }
+
+        @Override
+        public long millis() {
+            return now.get();
+        }
+
+        @Override
+        public Instant instant() {
+            return Instant.ofEpochMilli(millis());
+        }
+    }
+}

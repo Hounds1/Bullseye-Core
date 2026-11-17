@@ -45,7 +45,7 @@ class DiagnosticAttributionStateTest {
                         1.2);
         InMemoryRollingMetricWindow window =
                 new InMemoryRollingMetricWindow(Duration.ofMinutes(1), Duration.ofSeconds(5));
-        window.append(new MetricSample(MetricType.HOST_MEMORY_TOTAL_BYTES, 16 * GIB, 1_000));
+        appendHostMemory(window, 1_000);
         InMemoryDiagnosticStateRepository repository =
                 new InMemoryDiagnosticStateRepository(
                         DiagnosticSnapshot.initial("host", "test", 0));
@@ -82,7 +82,7 @@ class DiagnosticAttributionStateTest {
                         1.2);
         InMemoryRollingMetricWindow window =
                 new InMemoryRollingMetricWindow(Duration.ofMinutes(1), Duration.ofSeconds(5));
-        window.append(new MetricSample(MetricType.HOST_MEMORY_TOTAL_BYTES, 16 * GIB, 1_000));
+        appendHostMemory(window, 1_000);
         InMemoryDiagnosticStateRepository repository =
                 new InMemoryDiagnosticStateRepository(
                         DiagnosticSnapshot.initial("host", "test", 0));
@@ -105,6 +105,23 @@ class DiagnosticAttributionStateTest {
 
         assertTrue(coordinator.evaluate(3_000).isEmpty());
         assertEquals(3, collections.get());
+
+        double previousScore = repository.current().attribution().score();
+        snapshots.set(List.of(memorySnapshot("second.service", 8, 46)));
+        assertTrue(coordinator.evaluate(4_000).isEmpty());
+        assertTrue(repository.current().attribution().score() > previousScore);
+        long version = repository.current().version();
+
+        snapshots.set(List.of(memorySnapshot("third.service", 9, 48)));
+        assertTrue(coordinator.evaluate(12_000).isEmpty());
+        assertEquals(4, collections.get());
+        assertEquals(version, repository.current().version());
+        assertEquals("second.service", repository.current().attribution().workload().name());
+
+        appendHostMemory(window, 13_000);
+        assertEquals("third.service", coordinator.evaluate(13_000).orElseThrow()
+                .current().attribution().workload().name());
+        assertEquals(5, collections.get());
     }
 
     @Test
@@ -123,7 +140,7 @@ class DiagnosticAttributionStateTest {
                         1.2);
         InMemoryRollingMetricWindow window =
                 new InMemoryRollingMetricWindow(Duration.ofMinutes(1), Duration.ofSeconds(5));
-        window.append(new MetricSample(MetricType.HOST_MEMORY_TOTAL_BYTES, 16 * GIB, 1_000));
+        appendHostMemory(window, 1_000);
         InMemoryDiagnosticStateRepository repository =
                 new InMemoryDiagnosticStateRepository(
                         DiagnosticSnapshot.initial("host", "test", 0));
@@ -140,6 +157,12 @@ class DiagnosticAttributionStateTest {
 
         assertEquals(ResourceType.HOST_CPU, transition.current().resource());
         assertEquals(1, collections.get());
+    }
+
+    private static void appendHostMemory(InMemoryRollingMetricWindow window, long timestamp) {
+        window.append(new MetricSample(MetricType.HOST_MEMORY_TOTAL_BYTES, 16 * GIB, timestamp));
+        window.append(new MetricSample(MetricType.HOST_MEMORY_USAGE, 95, timestamp));
+        window.append(new MetricSample(MetricType.HOST_MEMORY_PSI_SOME_AVG10, 45, timestamp));
     }
 
     private static CgroupMemorySnapshot memorySnapshot(
