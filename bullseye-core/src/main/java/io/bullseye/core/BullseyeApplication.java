@@ -85,7 +85,8 @@ public final class BullseyeApplication {
                         new MemoryPressureAttributor(
                                 cgroupMonitor,
                                 configuration.cgroup().attributionMinimumScore(),
-                                configuration.cgroup().attributionDominanceRatio()));
+                                configuration.cgroup().attributionDominanceRatio()),
+                        sampleFreshness);
         AsyncStatePublisher publisher =
                 new AsyncStatePublisher(
                         new AtomicFileStatePublisher(

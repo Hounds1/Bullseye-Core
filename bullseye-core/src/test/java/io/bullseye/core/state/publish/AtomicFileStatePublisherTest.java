@@ -19,6 +19,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Stream;
 
 class AtomicFileStatePublisherTest {
@@ -62,6 +63,24 @@ class AtomicFileStatePublisherTest {
 
         assertTrue(json.contains("host\\\"one"));
         assertTrue(json.contains("line\\nbreak"));
+    }
+
+    @Test
+    void publishesObservationFreshnessAndNullableSampleTimestamp() {
+        DiagnosticSnapshot snapshot = new DiagnosticSnapshot(
+                "host", "test", Severity.NORMAL, ResourceType.UNKNOWN, ResourceState.NORMAL,
+                WorkloadAttribution.unresolved(), List.of(), 0, 1, 15_000,
+                DiagnosticSnapshot.ObservationStatus.STALE,
+                Map.of(ResourceType.HOST_MEMORY, new DiagnosticSnapshot.Observation(
+                        DiagnosticSnapshot.ObservationStatus.STALE, null,
+                        List.of(new DiagnosticEvidence("HOST_MEMORY_USAGE", 30, "%")))));
+
+        String json = new DiagnosticSnapshotJsonEncoder().encode(snapshot);
+
+        assertTrue(json.contains("\"evaluatedAt\": 15000"));
+        assertTrue(json.contains("\"observationStatus\": \"STALE\""));
+        assertTrue(json.contains("\"lastSampleAt\": null"));
+        assertTrue(json.contains("\"metric\": \"HOST_MEMORY_USAGE\", \"value\": 30.0"));
     }
 
     @Test

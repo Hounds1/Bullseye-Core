@@ -84,21 +84,80 @@ for a smoke test, but it is not a substitute for the real Linux host validation 
     {"metric": "usage", "value": 88.1, "unit": "%"},
     {"metric": "psi.some.avg10", "value": 24.3, "unit": "%"}
   ],
+  "evaluatedAt": 1788526810000,
+  "observationStatus": "FRESH",
+  "observations": {
+    "HOST_CPU": {
+      "status": "FRESH",
+      "lastSampleAt": 1788526810000,
+      "metrics": [{"metric": "HOST_CPU_USAGE", "value": 15.2, "unit": "%"}]
+    },
+    "HOST_MEMORY": {
+      "status": "FRESH",
+      "lastSampleAt": 1788526810000,
+      "metrics": [
+        {"metric": "HOST_MEMORY_USAGE", "value": 88.1, "unit": "%"},
+        {"metric": "HOST_MEMORY_PSI_SOME_AVG10", "value": 24.3, "unit": "%"}
+      ]
+    },
+    "DISK_IO": {
+      "status": "FRESH",
+      "lastSampleAt": 1788526810000,
+      "metrics": [{"metric": "HOST_IO_PSI_SOME_AVG10", "value": 0.0, "unit": "%"}]
+    }
+  },
   "since": 1788526800000,
   "version": 12
 }
 ```
 
 State is written to a temporary sibling file, flushed, and atomically moved over the current
-snapshot. The version changes only when severity, primary resource, resource state, primary
-workload, confidence, or attribution status changes. Publisher, PSI, and individual cgroup failures
-are isolated from host telemetry.
+snapshot. Every completed diagnostic evaluation refreshes the snapshot, even without a state
+transition. The version and `since` change only when severity, primary resource, resource state,
+primary workload, confidence, or attribution status changes. Heartbeats, score-only changes, and
+observation-status changes do not increment the version or emit duplicate diagnostic transitions.
+
+`evaluatedAt` records the latest completed evaluation. `observations` contains current telemetry
+for each configured resource. Top-level `evidence` remains the basis of the diagnostic decision;
+it can refer to an earlier decision while hysteresis retains that diagnosis. Use
+`observations.metrics` for current values. Expired values are omitted from these metric lists.
+
+Observation freshness is separate from pressure severity:
+
+- `INITIALIZING`: required inputs have not all arrived within the startup grace period.
+- `FRESH`: required inputs and previously observed optional PSI inputs are current.
+- `STALE`: a tracked input expired, or required inputs are still missing after startup grace.
+
+Both startup grace and sample freshness use twice `bullseye.sampling.interval`. CPU requires
+usage, memory requires usage plus PSI some, and IO requires PSI some. CPU PSI and memory/IO PSI
+full are optional until first observed; if subsequently lost, their resource becomes stale.
+Aggregate status is stale if any configured resource is stale, otherwise initializing if any
+resource is initializing. `lastSampleAt` is the oldest latest timestamp across that resource's
+tracked inputs, not the most recent sample of any metric. It is null until all required inputs
+are available. A fresh CPU sample therefore cannot conceal missing memory or IO observations.
+
+Collection outages preserve the last diagnosis instead of reporting a false recovery. Memory
+attribution is not refreshed while its required host usage/PSI inputs are expired. A resumed
+sample can restore observation freshness immediately, but escalation and recovery still need
+their configured continuous observation durations.
+
+Consumers must also check the age of `evaluatedAt` against their heartbeat timeout (for example,
+a few sampling intervals). A stopped or blocked agent cannot rewrite its last `FRESH` file to
+`STALE`. The timestamp is an evaluation heartbeat, not a successful disk-write timestamp.
+
+The publisher retains only the newest pending snapshot, plus any write already in progress.
+Failed writes retry every second without requiring a new transition; newer snapshots replace
+older pending values. Failure/restoration logs are emitted once per outage. Shutdown attempts
+to flush pending state within its timeout, then interrupts the writer. Publisher, PSI, and
+individual cgroup failures are isolated from host telemetry.
 
 ## Diagnostic policy
 
 - CPU keeps the usage-based hysteresis policy and uses PSI as corroborating evidence when present.
 - Memory requires both high usage and memory PSI; high page-cache usage alone is observation only.
 - IO is based on sustained PSI stalls rather than throughput.
+- A sample gap greater than twice the sampling interval breaks a sustained run. Duration is
+  measured between observed samples; time after the newest sample does not complete the run.
 - The highest active resource severity becomes host severity.
 - Memory attribution runs when memory enters `HIGH` or remains `CRITICAL`; repeated `HIGH`
   evaluations reuse the previous result.

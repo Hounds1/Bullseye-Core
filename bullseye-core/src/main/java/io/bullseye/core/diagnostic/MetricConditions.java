@@ -47,18 +47,23 @@ public final class MetricConditions {
             return List.of();
         }
         int start = samples.size();
+        long newerTimestamp = samples.getLast().timestamp();
         for (int index = samples.size() - 1; index >= 0; index--) {
             MetricSample sample = samples.get(index);
-            if (sample.timestamp() > now || !predicate.test(sample.value())) {
+            if (sample.timestamp() > now
+                    || newerTimestamp - sample.timestamp() > maximumAge.toMillis()
+                    || !predicate.test(sample.value())) {
                 break;
             }
             start = index;
+            newerTimestamp = sample.timestamp();
         }
         if (start == samples.size()) {
             return List.of();
         }
         List<MetricSample> run = samples.subList(start, samples.size());
-        long coveredMillis = now - run.getFirst().timestamp();
+        // Only observed time counts; an outage cannot complete a sustained condition.
+        long coveredMillis = run.getLast().timestamp() - run.getFirst().timestamp();
         return run.size() >= 2 && coveredMillis >= duration.toMillis()
                 ? List.copyOf(run)
                 : List.of();
