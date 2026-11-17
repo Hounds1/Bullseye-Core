@@ -86,7 +86,8 @@ public final class BullseyeApplication {
                                 cgroupMonitor,
                                 configuration.cgroup().attributionMinimumScore(),
                                 configuration.cgroup().attributionDominanceRatio()),
-                        sampleFreshness);
+                        sampleFreshness,
+                        configuration.cgroup().attributionRefreshInterval());
         AsyncStatePublisher publisher =
                 new AsyncStatePublisher(
                         new AtomicFileStatePublisher(

@@ -30,6 +30,7 @@ class PropertiesConfigurationLoaderTest {
                 bullseye.diagnostics.io.critical.psi-full=12
                 bullseye.cgroup.discovery-interval=90s
                 bullseye.cgroup.maximum-groups=128
+                bullseye.cgroup.attribution.refresh-interval=15s
                 """);
 
         BullseyeConfiguration configuration =
@@ -44,6 +45,34 @@ class PropertiesConfigurationLoaderTest {
         assertEquals(12, configuration.ioDiagnostics().criticalPsiFull());
         assertEquals(Duration.ofSeconds(90), configuration.cgroup().discoveryInterval());
         assertEquals(128, configuration.cgroup().maximumGroups());
+        assertEquals(Duration.ofSeconds(15), configuration.cgroup().attributionRefreshInterval());
+    }
+
+    @Test
+    void defaultsAttributionRefreshToThirtySeconds() throws Exception {
+        BullseyeConfiguration configuration = new PropertiesConfigurationLoader()
+                .load(temporaryDirectory.resolve("missing.properties"));
+
+        assertEquals(Duration.ofSeconds(30), configuration.cgroup().attributionRefreshInterval());
+        assertEquals(Duration.ofSeconds(30),
+                BullseyeConfiguration.Cgroup.defaults().attributionRefreshInterval());
+    }
+
+    @Test
+    void rejectsZeroAttributionRefreshInterval() throws Exception {
+        Path configurationPath = temporaryDirectory.resolve("bullseye.properties");
+        Files.writeString(configurationPath, "bullseye.cgroup.attribution.refresh-interval=0ms");
+
+        assertThrows(IllegalArgumentException.class,
+                () -> new PropertiesConfigurationLoader().load(configurationPath));
+    }
+
+    @Test
+    void rejectsSubMillisecondAttributionRefreshInterval() {
+        assertThrows(IllegalArgumentException.class,
+                () -> new BullseyeConfiguration.Cgroup(
+                        true, Path.of("/sys/fs/cgroup"), Duration.ofSeconds(60),
+                        8, 512, 5, 1.2, Duration.ofNanos(1)));
     }
 
     @Test

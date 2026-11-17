@@ -1,6 +1,7 @@
 package io.bullseye.core.linux.cgroup;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -48,7 +49,8 @@ class CgroupMonitorTest {
 
     @Test
     void collectsMemoryPressureAndEventCounters() {
-        CgroupMemorySnapshot snapshot = monitor(512).collectMemory().snapshots().getFirst();
+        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+        CgroupMemorySnapshot snapshot = result.snapshots().getFirst();
 
         assertEquals(800, snapshot.currentBytes());
         assertEquals(1_000, snapshot.maxBytes());
@@ -58,6 +60,9 @@ class CgroupMonitorTest {
         assertEquals(2, snapshot.maxEvents());
         assertEquals(1, snapshot.oomEvents());
         assertEquals(0, snapshot.oomKillEvents());
+        assertTrue(result.coverage().complete());
+        assertEquals(1, result.coverage().collectedGroups());
+        assertEquals(0, result.collectedAt());
     }
 
     @Test
@@ -107,6 +112,8 @@ class CgroupMonitorTest {
 
         assertEquals(CgroupMonitor.Status.AVAILABLE, result.status());
         assertTrue(result.snapshots().isEmpty());
+        assertEquals(1, result.coverage().failedGroups());
+        assertFalse(result.coverage().complete());
     }
 
     @Test
@@ -129,6 +136,7 @@ class CgroupMonitorTest {
 
         assertEquals(1, result.snapshots().size());
         assertEquals("order-api.service", result.snapshots().getFirst().workload().name());
+        assertTrue(result.coverage().discoveryLimited());
     }
 
     @Test
@@ -163,10 +171,165 @@ class CgroupMonitorTest {
         assertEquals(1, files.directoryReads);
     }
 
+    @Test
+    void partialReadFailureKeepsSuccessfulWorkloadsButMarksCoverageIncomplete() {
+        Path second = root.resolve("batch.service");
+        files.directories.put(root, List.of(group, second));
+        fixtureGroup(second, "400", "max", 2, 0, "high 0\n");
+        files.denied.add(second.resolve("memory.pressure"));
+
+        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+
+        assertEquals(CgroupMonitor.Status.AVAILABLE, result.status());
+        assertEquals(1, result.coverage().collectedGroups());
+        assertEquals(1, result.coverage().failedGroups());
+        assertFalse(result.coverage().complete());
+        assertEquals("order-api.service", result.snapshots().getFirst().workload().name());
+    }
+
+    @Test
+    void optionalFilesDoNotHideAccessDeniedAsMissing() {
+        files.denied.add(group.resolve("memory.pressure"));
+        files.content.remove(group.resolve("memory.pressure"));
+
+        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+
+        assertEquals(CgroupMonitor.Status.ACCESS_DENIED, result.status());
+        assertEquals(1, result.coverage().failedGroups());
+    }
+
+    @Test
+    void malformedGroupIsIncludedInFailureCount() {
+        files.content.put(group.resolve("memory.current"), "not-a-counter");
+
+        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+
+        assertEquals(1, result.coverage().failedGroups());
+        assertTrue(result.snapshots().isEmpty());
+        assertFalse(result.coverage().complete());
+    }
+
+    @Test
+    void cachedDiscoveryRetainsFailureUntilSuccessfulRediscovery() {
+        files.deniedDirectories.add(group);
+        CgroupMonitor monitor = monitor(512);
+        CgroupMonitor.CollectionResult first = monitor.collectMemory();
+        assertTrue(first.coverage().discoveryFailed());
+        assertEquals(1, first.snapshots().size());
+        int directoryReads = files.directoryReads;
+
+        files.deniedDirectories.clear();
+        clock.millis = 5_000;
+        CgroupMonitor.CollectionResult cached = monitor.collectMemory();
+        assertEquals(directoryReads, files.directoryReads);
+        assertTrue(cached.coverage().discoveryFailed());
+
+        clock.millis = 60_000;
+        CgroupMonitor.CollectionResult recovered = monitor.collectMemory();
+        assertTrue(recovered.coverage().complete());
+        assertEquals(60_000, recovered.collectedAt());
+    }
+
+    @Test
+    void depthLimitMarksUnvisitedDescendantsAsIncomplete() {
+        Path child = group.resolve("worker");
+        files.directories.put(group, List.of(child));
+        fixtureGroup(child, "100", "max", 0, 0, "high 0\n");
+
+        CgroupMonitor.CollectionResult result = monitor(512, 1, true).collectMemory();
+
+        assertEquals(1, result.snapshots().size());
+        assertTrue(result.coverage().discoveryLimited());
+        assertFalse(result.coverage().complete());
+    }
+
+    @Test
+    void exactGroupAndDepthLimitsWithoutOmittedChildrenRemainComplete() {
+        CgroupMonitor.CollectionResult result = monitor(1, 1, true).collectMemory();
+
+        assertEquals(1, result.snapshots().size());
+        assertTrue(result.coverage().complete());
+    }
+
+    @Test
+    void retriesDetectionAfterInitialPermissionFailure() {
+        Path controllers = root.resolve("cgroup.controllers");
+        files.denied.add(controllers);
+        CgroupMonitor monitor = monitor(512);
+        assertEquals(CgroupMonitor.Status.ACCESS_DENIED, monitor.collectMemory().status());
+
+        files.denied.clear();
+        clock.millis = 5_000;
+        CgroupMonitor.CollectionResult recovered = monitor.collectMemory();
+
+        assertEquals(CgroupMonitor.Status.AVAILABLE, recovered.status());
+        assertEquals(1, recovered.snapshots().size());
+        assertTrue(recovered.coverage().complete());
+    }
+
+    @Test
+    void disabledConfigurationNeverProbesController() {
+        files.denied.add(root.resolve("cgroup.controllers"));
+        CgroupMonitor monitor = monitor(512, 8, false);
+
+        assertEquals(
+                CgroupMonitor.Status.CGROUP_V2_NOT_AVAILABLE, monitor.collectMemory().status());
+        clock.millis = 60_000;
+        assertEquals(
+                CgroupMonitor.Status.CGROUP_V2_NOT_AVAILABLE, monitor.collectMemory().status());
+        assertEquals(0, files.directoryReads);
+        assertEquals(0, files.fileReads);
+    }
+
+    @Test
+    void failedReadInvalidatesDiscoveryAndRemovesOldHistory() {
+        CgroupMonitor monitor = monitor(512);
+        monitor.collectMemory();
+        files.missingDuringRead.add(group.resolve("memory.current"));
+        clock.millis = 5_000;
+        assertEquals(1, monitor.collectMemory().coverage().failedGroups());
+
+        Path replacement = root.resolve("replacement.service");
+        files.directories.put(root, List.of(replacement));
+        fixtureGroup(replacement, "400", "max", 2, 0, "high 0\n");
+        clock.millis = 10_000;
+        CgroupMonitor.CollectionResult refreshed = monitor.collectMemory();
+
+        assertTrue(refreshed.coverage().complete());
+        assertEquals("replacement.service", refreshed.snapshots().getFirst().workload().name());
+        assertTrue(refreshed.previousSnapshots().isEmpty());
+    }
+
+    @Test
+    void historyResetRefreshesTopologyForNextPressureEpisode() {
+        CgroupMonitor monitor = monitor(512);
+        monitor.collectMemory();
+        Path replacement = root.resolve("replacement.service");
+        files.directories.put(root, List.of(replacement));
+        fixtureGroup(replacement, "400", "max", 2, 0, "high 0\n");
+
+        monitor.clearHistory();
+        clock.millis = 5_000;
+        CgroupMonitor.CollectionResult nextEpisode = monitor.collectMemory();
+
+        assertEquals("replacement.service", nextEpisode.snapshots().getFirst().workload().name());
+        assertTrue(nextEpisode.previousSnapshots().isEmpty());
+    }
+
     private CgroupMonitor monitor(int maximumGroups) {
+        return monitor(maximumGroups, 8, true);
+    }
+
+    private CgroupMonitor monitor(int maximumGroups, int maximumDepth, boolean enabled) {
         return new CgroupMonitor(
                 new BullseyeConfiguration.Cgroup(
-                        true, root, Duration.ofSeconds(60), 8, maximumGroups, 5, 1.2),
+                        enabled,
+                        root,
+                        Duration.ofSeconds(60),
+                        maximumDepth,
+                        maximumGroups,
+                        5,
+                        1.2),
                 files,
                 clock,
                 new BullseyeLogger(
@@ -175,7 +338,11 @@ class CgroupMonitorTest {
     }
 
     private void fixtureGroup(
-            String memoryCurrent, String memoryMax, double psiSome, double psiFull, String events) {
+            String memoryCurrent,
+            String memoryMax,
+            double psiSome,
+            double psiFull,
+            String events) {
         fixtureGroup(group, memoryCurrent, memoryMax, psiSome, psiFull, events);
     }
 
@@ -205,7 +372,9 @@ class CgroupMonitorTest {
         private final Map<Path, List<Path>> directories = new HashMap<>();
         private final Set<Path> denied = new HashSet<>();
         private final Set<Path> missingDuringRead = new HashSet<>();
+        private final Set<Path> deniedDirectories = new HashSet<>();
         private int directoryReads;
+        private int fileReads;
 
         @Override
         public boolean exists(Path path) {
@@ -214,6 +383,7 @@ class CgroupMonitorTest {
 
         @Override
         public String read(Path path) throws IOException {
+            fileReads++;
             if (denied.contains(path)) {
                 throw new AccessDeniedException(path.toString());
             }
@@ -228,8 +398,11 @@ class CgroupMonitorTest {
         }
 
         @Override
-        public List<Path> directories(Path path) {
+        public List<Path> directories(Path path) throws IOException {
             directoryReads++;
+            if (deniedDirectories.contains(path)) {
+                throw new AccessDeniedException(path.toString());
+            }
             return new ArrayList<>(directories.getOrDefault(path, List.of()));
         }
     }

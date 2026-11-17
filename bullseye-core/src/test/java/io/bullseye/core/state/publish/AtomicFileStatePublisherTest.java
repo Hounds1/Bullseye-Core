@@ -110,4 +110,119 @@ class AtomicFileStatePublisherTest {
         assertTrue(json.contains("\"attributionScore\": 91.0"));
         assertTrue(json.contains("\"metric\": \"psi.some.avg10\""));
     }
+
+    @Test
+    void keepsWorkloadSelectionEvidenceSeparateFromHostDecisionEvidence() {
+        WorkloadAttribution attribution =
+                WorkloadAttribution.identified(
+                        WorkloadIdentity.fromCgroupPath("/system.slice/order-api.service"),
+                        53,
+                        WorkloadAttribution.Confidence.HIGH,
+                        List.of(
+                                new DiagnosticEvidence("memory.current", 1_048_576, "B"),
+                                new DiagnosticEvidence("score.growth", 18, "points")),
+                        WorkloadAttribution.Coverage.complete(3),
+                        1_000);
+        DiagnosticSnapshot snapshot = snapshot(attribution);
+
+        String json = new DiagnosticSnapshotJsonEncoder().encode(snapshot);
+        String selectionEvidence =
+                json.substring(
+                        json.indexOf("\"attributionEvidence\""),
+                        json.indexOf("\"evidence\""));
+        String hostEvidence =
+                json.substring(json.indexOf("\"evidence\""), json.indexOf("\"evaluatedAt\""));
+
+        assertTrue(json.contains("\"attributionCollectedAt\": 1000"));
+        assertTrue(json.contains("\"complete\": true"));
+        assertTrue(json.contains("\"collectedGroups\": 3"));
+        assertTrue(json.contains("\"failedGroups\": 0"));
+        assertTrue(json.contains("\"discoveryFailed\": false"));
+        assertTrue(json.contains("\"discoveryLimited\": false"));
+        assertTrue(selectionEvidence.contains("\"metric\": \"memory.current\""));
+        assertTrue(selectionEvidence.contains("\"metric\": \"score.growth\""));
+        assertFalse(selectionEvidence.contains("\"metric\": \"usage\""));
+        assertTrue(hostEvidence.contains("\"metric\": \"usage\""));
+        assertFalse(hostEvidence.contains("\"metric\": \"memory.current\""));
+    }
+
+    @Test
+    void publishesIncompleteCoverageAlongsideAnIdentifiedCandidate() {
+        WorkloadAttribution attribution =
+                WorkloadAttribution.identified(
+                        WorkloadIdentity.fromCgroupPath("/system.slice/order-api.service"),
+                        53,
+                        WorkloadAttribution.Confidence.LOW,
+                        List.of(new DiagnosticEvidence("score.usage", 25, "points")),
+                        new WorkloadAttribution.Coverage(2, 1, true, true),
+                        1_000);
+
+        String json = new DiagnosticSnapshotJsonEncoder().encode(snapshot(attribution));
+
+        assertTrue(json.contains("\"attributionStatus\": \"IDENTIFIED\""));
+        assertTrue(json.contains("\"attributionConfidence\": \"LOW\""));
+        assertTrue(json.contains("\"complete\": false"));
+        assertTrue(json.contains("\"collectedGroups\": 2"));
+        assertTrue(json.contains("\"failedGroups\": 1"));
+        assertTrue(json.contains("\"discoveryFailed\": true"));
+        assertTrue(json.contains("\"discoveryLimited\": true"));
+    }
+
+    @Test
+    void preservesCoverageWhenCollectionProducesNoCandidate() {
+        WorkloadAttribution attribution =
+                WorkloadAttribution.unavailable(
+                        WorkloadAttribution.Status.NO_CANDIDATE,
+                        new WorkloadAttribution.Coverage(0, 1, false, false),
+                        1_000L);
+
+        String json = new DiagnosticSnapshotJsonEncoder().encode(snapshot(attribution));
+
+        assertTrue(json.contains("\"attributionStatus\": \"NO_CANDIDATE\""));
+        assertTrue(json.contains("\"attributionEvidence\": []"));
+        assertTrue(json.contains("\"attributionCollectedAt\": 1000"));
+        assertTrue(json.contains("\"complete\": false"));
+        assertTrue(json.contains("\"failedGroups\": 1"));
+    }
+
+    @Test
+    void unattemptedAttributionDoesNotClaimCollectionCoverage() {
+        String json = new DiagnosticSnapshotJsonEncoder()
+                .encode(DiagnosticSnapshot.initial("host", "test", 0));
+
+        assertTrue(json.contains("\"attributionStatus\": \"NOT_ATTEMPTED\""));
+        assertTrue(json.contains("\"attributionCollectedAt\": null"));
+        assertTrue(json.contains("\"attributionCoverage\": null"));
+        assertTrue(json.contains("\"attributionEvidence\": []"));
+    }
+
+    @Test
+    void escapesAttributionEvidenceText() {
+        WorkloadAttribution attribution =
+                WorkloadAttribution.identified(
+                        WorkloadIdentity.fromCgroupPath("/system.slice/order-api.service"),
+                        25,
+                        WorkloadAttribution.Confidence.LOW,
+                        List.of(new DiagnosticEvidence("metric\"name", 25, "point\nunit")),
+                        WorkloadAttribution.Coverage.complete(1),
+                        1_000);
+
+        String json = new DiagnosticSnapshotJsonEncoder().encode(snapshot(attribution));
+
+        assertTrue(json.contains("metric\\\"name"));
+        assertTrue(json.contains("point\\nunit"));
+    }
+
+    private static DiagnosticSnapshot snapshot(WorkloadAttribution attribution) {
+        return new DiagnosticSnapshot(
+                "host",
+                "orders",
+                Severity.HIGH,
+                ResourceType.HOST_MEMORY,
+                ResourceState.SATURATION_RISK,
+                attribution,
+                List.of(new DiagnosticEvidence("usage", 88.1, "%")),
+                2_000,
+                2);
+    }
 }

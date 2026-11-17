@@ -1,9 +1,11 @@
 package io.bullseye.core.diagnostic;
 
+import io.bullseye.common.diagnostic.DiagnosticEvidence;
 import io.bullseye.common.workload.WorkloadAttribution;
 import io.bullseye.core.linux.cgroup.CgroupMemorySnapshot;
 import io.bullseye.core.linux.cgroup.CgroupMonitor;
 
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -17,7 +19,8 @@ public final class MemoryPressureAttributor {
     private static final double PRESSURE_WEIGHT = 30;
     private static final double EVENT_WEIGHT = 10;
     private static final double HOST_SHARE_SATURATION = 0.25;
-    private static final double HOST_GROWTH_SATURATION = 0.10;
+    // Same scale as 10% of host memory gained in the original five-second sample interval.
+    private static final double HOST_GROWTH_PER_SECOND_SATURATION = 0.02;
     private static final double PSI_SOME_SATURATION = 50;
     private static final double PSI_FULL_SATURATION = 10;
 
@@ -62,13 +65,13 @@ public final class MemoryPressureAttributor {
     public WorkloadAttribution attribute(long hostTotalBytes) {
         CgroupMonitor.CollectionResult collection = collections.get();
         if (collection.status() == CgroupMonitor.Status.CGROUP_V2_NOT_AVAILABLE) {
-            return unavailable(WorkloadAttribution.Status.CGROUP_V2_NOT_AVAILABLE);
+            return unavailable(WorkloadAttribution.Status.CGROUP_V2_NOT_AVAILABLE, collection);
         }
         if (collection.status() == CgroupMonitor.Status.ACCESS_DENIED) {
-            return unavailable(WorkloadAttribution.Status.ACCESS_DENIED);
+            return unavailable(WorkloadAttribution.Status.ACCESS_DENIED, collection);
         }
         if (hostTotalBytes <= 0) {
-            return unavailable(WorkloadAttribution.Status.INSUFFICIENT_DATA);
+            return unavailable(WorkloadAttribution.Status.INSUFFICIENT_DATA, collection);
         }
 
         List<Candidate> candidates =
@@ -79,18 +82,29 @@ public final class MemoryPressureAttributor {
                                                 snapshot,
                                                 collection.previousSnapshots(),
                                                 hostTotalBytes))
-                        .sorted(Comparator.comparingDouble(Candidate::score).reversed())
+                        .sorted(
+                                Comparator.comparingDouble(Candidate::score)
+                                        .reversed()
+                                        .thenComparing(c -> c.snapshot().workload().cgroupPath()))
                         .toList();
         if (candidates.isEmpty() || candidates.getFirst().score() < minimumScore) {
-            return unavailable(WorkloadAttribution.Status.NO_CANDIDATE);
+            return unavailable(WorkloadAttribution.Status.NO_CANDIDATE, collection);
         }
 
         Candidate winner = candidates.getFirst();
         double runnerScore = candidates.size() > 1 ? candidates.get(1).score() : 0;
         double ratio = runnerScore == 0 ? Double.POSITIVE_INFINITY : winner.score() / runnerScore;
         WorkloadAttribution.Confidence confidence = confidence(winner.score(), ratio);
+        if (!collection.coverage().complete()) {
+            confidence = WorkloadAttribution.Confidence.LOW;
+        }
         return WorkloadAttribution.identified(
-                winner.snapshot().workload(), winner.score(), confidence);
+                winner.snapshot().workload(),
+                winner.score(),
+                confidence,
+                winner.evidence(),
+                collection.coverage(),
+                collection.collectedAt());
     }
 
     public void reset() {
@@ -102,15 +116,39 @@ public final class MemoryPressureAttributor {
             Map<String, CgroupMemorySnapshot> previousSnapshots,
             long hostTotalBytes) {
         CgroupMemorySnapshot previous = previousSnapshots.get(current.workload().cgroupPath());
-        Long growthBytes =
-                previous == null ? null : current.currentBytes() - previous.currentBytes();
+        boolean comparable = previous != null && current.collectedAt() > previous.collectedAt();
         double hostShare = (double) current.currentBytes() / hostTotalBytes;
-        double score =
-                usageScore(hostShare)
-                        + growthScore(growthBytes, hostTotalBytes)
-                        + pressureScore(current)
-                        + eventScore(current, previous);
-        return new Candidate(current, growthBytes, hostShare, score);
+        List<DiagnosticEvidence> evidence = new ArrayList<>();
+        evidence.add(metric("memory.current", current.currentBytes(), "bytes"));
+        if (current.maxBytes() != null) {
+            evidence.add(metric("memory.max", current.maxBytes(), "bytes"));
+        }
+        evidence.add(metric("host.share", hostShare * 100, "%"));
+        double growth = 0;
+        double events = 0;
+        if (comparable) {
+            long elapsedMillis = current.collectedAt() - previous.collectedAt();
+            long growthBytes = current.currentBytes() - previous.currentBytes();
+            double bytesPerSecond = (double) growthBytes * 1_000 / elapsedMillis;
+            evidence.add(metric("observation.duration", elapsedMillis, "ms"));
+            evidence.add(metric("growth.bytes", growthBytes, "bytes"));
+            evidence.add(metric("growth.bytes-per-second", bytesPerSecond, "bytes/s"));
+            growth = growthScore(bytesPerSecond, hostTotalBytes);
+            events = eventScore(current, previous, evidence);
+        }
+        if (Double.isFinite(current.psiSome())) {
+            evidence.add(metric("psi.some.avg10", current.psiSome(), "%"));
+        }
+        if (Double.isFinite(current.psiFull())) {
+            evidence.add(metric("psi.full.avg10", current.psiFull(), "%"));
+        }
+        double usage = usageScore(hostShare);
+        double pressure = pressureScore(current);
+        evidence.add(metric("score.usage", usage, "points"));
+        evidence.add(metric("score.growth", growth, "points"));
+        evidence.add(metric("score.pressure", pressure, "points"));
+        evidence.add(metric("score.events", events, "points"));
+        return new Candidate(current, usage + growth + pressure + events, List.copyOf(evidence));
     }
 
     private WorkloadAttribution.Confidence confidence(double score, double ratio) {
@@ -127,12 +165,10 @@ public final class MemoryPressureAttributor {
         return normalized(hostShare / HOST_SHARE_SATURATION) * USAGE_WEIGHT;
     }
 
-    private static double growthScore(Long growthBytes, long hostTotalBytes) {
-        if (growthBytes == null || growthBytes <= 0) {
-            return 0;
-        }
-        double growthShare = (double) growthBytes / hostTotalBytes;
-        return normalized(growthShare / HOST_GROWTH_SATURATION) * GROWTH_WEIGHT;
+    private static double growthScore(double bytesPerSecond, long hostTotalBytes) {
+        double growthSharePerSecond = bytesPerSecond / hostTotalBytes;
+        return normalized(growthSharePerSecond / HOST_GROWTH_PER_SECOND_SATURATION)
+                * GROWTH_WEIGHT;
     }
 
     private static double pressureScore(CgroupMemorySnapshot snapshot) {
@@ -141,14 +177,18 @@ public final class MemoryPressureAttributor {
         return normalized(Math.max(some, full)) * PRESSURE_WEIGHT;
     }
 
-    private static double eventScore(CgroupMemorySnapshot current, CgroupMemorySnapshot previous) {
-        if (previous == null) {
-            return 0;
-        }
+    private static double eventScore(
+            CgroupMemorySnapshot current,
+            CgroupMemorySnapshot previous,
+            List<DiagnosticEvidence> evidence) {
         long high = increase(current.highEvents(), previous.highEvents());
         long max = increase(current.maxEvents(), previous.maxEvents());
         long oom = increase(current.oomEvents(), previous.oomEvents());
         long oomKill = increase(current.oomKillEvents(), previous.oomKillEvents());
+        evidence.add(metric("events.high.delta", high, "count"));
+        evidence.add(metric("events.max.delta", max, "count"));
+        evidence.add(metric("events.oom.delta", oom, "count"));
+        evidence.add(metric("events.oom_kill.delta", oomKill, "count"));
         double impact = high * 0.02 + max * 0.1 + oom * 0.5 + oomKill;
         return normalized(impact) * EVENT_WEIGHT;
     }
@@ -165,21 +205,16 @@ public final class MemoryPressureAttributor {
         return Math.max(0, Math.min(1, value));
     }
 
-    private static WorkloadAttribution unavailable(WorkloadAttribution.Status status) {
-        return WorkloadAttribution.unavailable(status);
+    private static DiagnosticEvidence metric(String name, double value, String unit) {
+        return new DiagnosticEvidence(name, value, unit);
     }
 
-    public record Candidate(
-            CgroupMemorySnapshot snapshot, Long growthBytes, double hostShare, double score) {
-
-        public Candidate {
-            Objects.requireNonNull(snapshot, "snapshot");
-            if (!Double.isFinite(hostShare) || hostShare < 0) {
-                throw new IllegalArgumentException("hostShare must be finite and non-negative");
-            }
-            if (!Double.isFinite(score) || score < 0) {
-                throw new IllegalArgumentException("score must be finite and non-negative");
-            }
-        }
+    private static WorkloadAttribution unavailable(
+            WorkloadAttribution.Status status, CgroupMonitor.CollectionResult collection) {
+        return WorkloadAttribution.unavailable(
+                status, collection.coverage(), collection.collectedAt());
     }
+
+    private record Candidate(
+            CgroupMemorySnapshot snapshot, double score, List<DiagnosticEvidence> evidence) {}
 }

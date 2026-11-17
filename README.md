@@ -79,7 +79,33 @@ for a smoke test, but it is not a substitute for the real Linux host validation 
   "cgroupPath": "/system.slice/order-api.service",
   "attributionConfidence": "HIGH",
   "attributionStatus": "IDENTIFIED",
-  "attributionScore": 91.0,
+  "attributionScore": 65.775,
+  "attributionCollectedAt": 1788526800000,
+  "attributionCoverage": {
+    "complete": true,
+    "collectedGroups": 3,
+    "failedGroups": 0,
+    "discoveryFailed": false,
+    "discoveryLimited": false
+  },
+  "attributionEvidence": [
+    {"metric": "memory.current", "value": 2147483648.0, "unit": "bytes"},
+    {"metric": "memory.max", "value": 4294967296.0, "unit": "bytes"},
+    {"metric": "host.share", "value": 12.5, "unit": "%"},
+    {"metric": "observation.duration", "value": 5000.0, "unit": "ms"},
+    {"metric": "growth.bytes", "value": 1073741824.0, "unit": "bytes"},
+    {"metric": "growth.bytes-per-second", "value": 214748364.8, "unit": "bytes/s"},
+    {"metric": "events.high.delta", "value": 2.0, "unit": "count"},
+    {"metric": "events.max.delta", "value": 1.0, "unit": "count"},
+    {"metric": "events.oom.delta", "value": 0.0, "unit": "count"},
+    {"metric": "events.oom_kill.delta", "value": 0.0, "unit": "count"},
+    {"metric": "psi.some.avg10", "value": 50.0, "unit": "%"},
+    {"metric": "psi.full.avg10", "value": 2.0, "unit": "%"},
+    {"metric": "score.usage", "value": 12.5, "unit": "points"},
+    {"metric": "score.growth", "value": 21.875, "unit": "points"},
+    {"metric": "score.pressure", "value": 30.0, "unit": "points"},
+    {"metric": "score.events", "value": 1.4, "unit": "points"}
+  ],
   "evidence": [
     {"metric": "usage", "value": 88.1, "unit": "%"},
     {"metric": "psi.some.avg10", "value": 24.3, "unit": "%"}
@@ -159,12 +185,58 @@ individual cgroup failures are isolated from host telemetry.
 - A sample gap greater than twice the sampling interval breaks a sustained run. Duration is
   measured between observed samples; time after the newest sample does not complete the run.
 - The highest active resource severity becomes host severity.
-- Memory attribution runs when memory enters `HIGH` or remains `CRITICAL`; repeated `HIGH`
-  evaluations reuse the previous result.
+- Memory attribution runs immediately on `HIGH` entry, then every
+  `bullseye.cgroup.attribution.refresh-interval` (default `30s`) while HIGH persists.
+  Failed/empty attempts retry on the same interval. `CRITICAL` rechecks on every fresh evaluation.
+  Actual execution is aligned to diagnostic evaluations, so shorter settings do not increase
+  the host sampling rate. Stale host inputs defer attempts without advancing the refresh timer.
+- Recovery below HIGH clears attribution, previous cgroup samples, and the refresh timer.
 - cgroup discovery is cached and bounded. No background cgroup sampling executor is used.
-- Attribution combines host share, recent growth, memory PSI, and memory event deltas. Similar
+- Attribution combines host share, memory growth rate, memory PSI, and memory event deltas. Similar
   candidates are retained with `LOW` confidence rather than overstating certainty.
 - Unsupported, denied, empty, and insufficient-data outcomes are represented explicitly.
+
+## Memory attribution evidence
+
+`attributionEvidence` explains the selected workload; top-level `evidence` explains host severity.
+`attributionCollectedAt` is the last attribution collection/attempt time, which may be older than
+the heartbeat's `evaluatedAt` while HIGH reuses its cached result. Before any attempt, coverage
+and collection time are null and attribution evidence is empty. Failed attempts still publish
+their coverage and collection time, with no selected-workload evidence.
+
+The four score components sum to `attributionScore` (0 to 100):
+
+| Component | Maximum | Saturation point |
+| --- | ---: | --- |
+| `score.usage` | 25 | Workload uses 25% of host memory |
+| `score.growth` | 35 | Positive growth of 2% of host memory per second |
+| `score.pressure` | 30 | PSI some avg10 reaches 50%, or full avg10 reaches 10% |
+| `score.events` | 10 | `high delta * 0.02 + max delta * 0.1 + oom delta * 0.5 + oom_kill delta` reaches 1 |
+
+Growth uses byte delta divided by elapsed observation time. The same growth rate therefore
+receives the same growth score at different refresh intervals. Event impact uses counts since
+the previous valid snapshot, not events per second; `observation.duration` makes that interval
+explicit. Negative growth remains visible but contributes zero growth points. Reset event
+counters contribute zero delta. Without an earlier timestamp, growth/event deltas and interval
+are omitted and their scores are zero. Unavailable PSI or unlimited `memory.max` is omitted.
+
+Complete investigations retain the score/runner-up confidence policy: HIGH requires score >=45
+and a winner/runner ratio >=max(2, configured dominance ratio); MEDIUM requires score >=20 and
+the configured ratio; otherwise LOW. Tied scores use cgroup path order for stable selection.
+
+`attributionCoverage` reports successful and failed group reads, discovery failure, and discovery
+truncation at the depth/group bounds. Any incomplete investigation caps confidence at LOW.
+Discovery flags remain attached to cached topology until successful rediscovery. A group read
+failure invalidates that topology for the next attempt; otherwise discovery follows
+`bullseye.cgroup.discovery-interval` (default `60s`). Newly created groups can therefore remain
+unseen until the next discovery refresh, even when scoring already runs every 30s. Initial
+cgroup access failures are retried on later attribution attempts.
+
+Completeness describes the configured, visible cgroup tree. An isolated Docker cgroup namespace
+does not reveal sibling containers; use a host-visible cgroup tree for cross-container attribution.
+Score, evidence, collection-time and coverage-only updates refresh JSON without advancing the
+diagnostic version or generating repeated source announcements. Workload/confidence/status changes
+still produce transitions. Incomplete investigations include `coverage=PARTIAL` in source logs.
 
 ## Log style
 
@@ -176,7 +248,7 @@ Operational messages use short state announcements:
 [BULLSEYE] cgroup v2 detected.
 [BULLSEYE] Memory pressure detected. usage=82.4% psi.some=13.1% sustained=10s previous=NORMAL current=ELEVATED resource=HOST_MEMORY
 [BULLSEYE] Critical memory pressure detected. usage=88.1% psi.some=24.3% rise=+6.1pp/10s previous=ELEVATED current=HIGH resource=HOST_MEMORY
-[BULLSEYE] Pressure source identified. resource=HOST_MEMORY workload=order-api.service confidence=HIGH score=91.0
+[BULLSEYE] Pressure source identified. resource=HOST_MEMORY workload=order-api.service confidence=HIGH score=65.8
 ```
 
 ## Real Linux validation

@@ -31,10 +31,12 @@ public final class DiagnosticCoordinator {
     private final Supplier<String> eventIdSupplier;
     private final MemoryPressureAttributor memoryAttributor;
     private final Duration maximumSampleAge;
+    private final long attributionRefreshMillis;
     private final long startedAt;
     private final EnumMap<ResourceType, DiagnosticDecision> resourceStates =
             new EnumMap<>(ResourceType.class);
     private WorkloadAttribution memoryAttribution = WorkloadAttribution.unresolved();
+    private Long lastAttributionAt;
 
     public DiagnosticCoordinator(
             MetricWindow metricWindow,
@@ -66,6 +68,24 @@ public final class DiagnosticCoordinator {
             Supplier<String> eventIdSupplier,
             MemoryPressureAttributor memoryAttributor,
             Duration maximumSampleAge) {
+        this(
+                metricWindow,
+                engine,
+                stateRepository,
+                eventIdSupplier,
+                memoryAttributor,
+                maximumSampleAge,
+                Duration.ofSeconds(30));
+    }
+
+    public DiagnosticCoordinator(
+            MetricWindow metricWindow,
+            DiagnosticEngine engine,
+            DiagnosticStateRepository stateRepository,
+            Supplier<String> eventIdSupplier,
+            MemoryPressureAttributor memoryAttributor,
+            Duration maximumSampleAge,
+            Duration attributionRefreshInterval) {
         this.metricWindow = Objects.requireNonNull(metricWindow, "metricWindow");
         this.engine = Objects.requireNonNull(engine, "engine");
         this.stateRepository = Objects.requireNonNull(stateRepository, "stateRepository");
@@ -74,6 +94,11 @@ public final class DiagnosticCoordinator {
         this.maximumSampleAge = Objects.requireNonNull(maximumSampleAge, "maximumSampleAge");
         if (maximumSampleAge.toMillis() < 1) {
             throw new IllegalArgumentException("maximumSampleAge must be positive");
+        }
+        Objects.requireNonNull(attributionRefreshInterval, "attributionRefreshInterval");
+        this.attributionRefreshMillis = attributionRefreshInterval.toMillis();
+        if (attributionRefreshMillis < 1) {
+            throw new IllegalArgumentException("attributionRefreshInterval must be at least 1ms");
         }
         DiagnosticSnapshot current = stateRepository.current();
         this.startedAt = current.evaluatedAt();
@@ -248,6 +273,7 @@ public final class DiagnosticCoordinator {
                 memoryAttributor.reset();
             }
             memoryAttribution = WorkloadAttribution.unresolved();
+            lastAttributionAt = null;
             return WorkloadAttribution.unresolved();
         }
 
@@ -255,13 +281,17 @@ public final class DiagnosticCoordinator {
                 currentMemory.severity() == Severity.HIGH
                         && previousMemory.severity() != Severity.HIGH;
         boolean critical = currentMemory.severity() == Severity.CRITICAL;
+        boolean refreshDue =
+                lastAttributionAt == null
+                        || evaluatedAt - lastAttributionAt >= attributionRefreshMillis;
         boolean fresh =
                 requiredMetrics(ResourceType.HOST_MEMORY).stream()
                         .allMatch(
                                 type -> MetricConditions.latest(
                                                 metricWindow, type, evaluatedAt, maximumSampleAge)
                                         .isPresent());
-        if ((highEntry || critical) && fresh) {
+        if ((highEntry || critical || refreshDue) && fresh) {
+            lastAttributionAt = evaluatedAt;
             memoryAttribution = memoryAttributor.attribute(latestHostMemoryTotal(evaluatedAt));
         }
         return primary.resource() == ResourceType.HOST_MEMORY

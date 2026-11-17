@@ -104,7 +104,8 @@ public final class PropertiesConfigurationLoader {
                 integer(properties, CGROUP_PREFIX + "maximum-depth", 8),
                 integer(properties, CGROUP_PREFIX + "maximum-groups", 512),
                 decimal(properties, CGROUP_PREFIX + "attribution.minimum-score", 5),
-                decimal(properties, CGROUP_PREFIX + "attribution.dominance-ratio", 1.2));
+                decimal(properties, CGROUP_PREFIX + "attribution.dominance-ratio", 1.2),
+                duration(properties, CGROUP_PREFIX + "attribution.refresh-interval", "30s"));
     }
 
     static Duration parseDuration(String raw) {
