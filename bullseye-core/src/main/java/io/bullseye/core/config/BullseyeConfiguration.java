@@ -228,11 +228,17 @@ public record BullseyeConfiguration(
             int maximumDepth,
             int maximumGroups,
             double attributionMinimumScore,
-            double attributionDominanceRatio) {
+            double attributionDominanceRatio,
+            Duration attributionRefreshInterval) {
 
         public Cgroup {
             Objects.requireNonNull(root, "root");
             requirePositive(discoveryInterval, "discoveryInterval");
+            requirePositive(attributionRefreshInterval, "attributionRefreshInterval");
+            if (attributionRefreshInterval.toMillis() < 1) {
+                throw new IllegalArgumentException(
+                        "attributionRefreshInterval must be at least 1ms");
+            }
             if (maximumDepth < 1 || maximumGroups < 1) {
                 throw new IllegalArgumentException("cgroup bounds must be positive");
             }
@@ -241,6 +247,25 @@ public record BullseyeConfiguration(
                 throw new IllegalArgumentException(
                         "attributionDominanceRatio must be greater than 1");
             }
+        }
+
+        public Cgroup(
+                boolean enabled,
+                Path root,
+                Duration discoveryInterval,
+                int maximumDepth,
+                int maximumGroups,
+                double attributionMinimumScore,
+                double attributionDominanceRatio) {
+            this(
+                    enabled,
+                    root,
+                    discoveryInterval,
+                    maximumDepth,
+                    maximumGroups,
+                    attributionMinimumScore,
+                    attributionDominanceRatio,
+                    Duration.ofSeconds(30));
         }
 
         public static Cgroup defaults() {

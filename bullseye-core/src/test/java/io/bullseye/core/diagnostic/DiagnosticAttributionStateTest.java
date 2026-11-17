@@ -9,6 +9,7 @@ import io.bullseye.common.diagnostic.ResourceType;
 import io.bullseye.common.diagnostic.Severity;
 import io.bullseye.common.metric.MetricSample;
 import io.bullseye.common.metric.MetricType;
+import io.bullseye.common.workload.WorkloadAttribution;
 import io.bullseye.common.workload.WorkloadIdentity;
 import io.bullseye.core.diagnostic.rule.DiagnosticRule;
 import io.bullseye.core.linux.cgroup.CgroupMemorySnapshot;
@@ -64,6 +65,102 @@ class DiagnosticAttributionStateTest {
 
         assertTrue(coordinator.evaluate(2_000).isEmpty());
         assertEquals(1, collections.get());
+    }
+
+    @Test
+    void refreshesHighAtConfiguredBoundaryAndFindsReplacementWorkload() {
+        RefreshScenario scenario = new RefreshScenario();
+        scenario.observeAt(1_000);
+        long version = scenario.repository.current().version();
+        scenario.snapshots.set(List.of(memorySnapshot("replacement.service", 8, 40)));
+
+        assertTrue(scenario.observeAt(5_999).isEmpty());
+        assertEquals(1, scenario.collections.get());
+        assertEquals("first.service", scenario.workload());
+
+        var refreshed = scenario.observeAt(6_000).orElseThrow();
+        assertEquals("replacement.service", refreshed.current().attribution().workload().name());
+        assertEquals(version + 1, refreshed.current().version());
+        assertEquals(2, scenario.collections.get());
+    }
+
+    @Test
+    void retriesNoCandidateAfterRefreshIntervalWithoutSeverityChange() {
+        RefreshScenario scenario = new RefreshScenario();
+        scenario.snapshots.set(List.of());
+        scenario.observeAt(1_000);
+        assertEquals(WorkloadAttribution.Status.NO_CANDIDATE,
+                scenario.repository.current().attribution().status());
+
+        scenario.snapshots.set(List.of(memorySnapshot("new.service", 8, 40)));
+        assertTrue(scenario.observeAt(2_000).isEmpty());
+        assertEquals(1, scenario.collections.get());
+
+        var refreshed = scenario.observeAt(6_000).orElseThrow();
+        assertEquals(Severity.HIGH, refreshed.current().severity());
+        assertEquals("new.service", scenario.workload());
+        assertEquals(2, scenario.collections.get());
+    }
+
+    @Test
+    void retriesUnavailableCollectionAtTheSameBoundedInterval() {
+        RefreshScenario scenario = new RefreshScenario();
+        scenario.status.set(CgroupMonitor.Status.ACCESS_DENIED);
+        scenario.observeAt(1_000);
+        assertEquals(WorkloadAttribution.Status.ACCESS_DENIED,
+                scenario.repository.current().attribution().status());
+
+        scenario.status.set(CgroupMonitor.Status.AVAILABLE);
+        assertTrue(scenario.observeAt(5_999).isEmpty());
+        assertEquals(1, scenario.collections.get());
+
+        scenario.observeAt(6_000).orElseThrow();
+        assertEquals("first.service", scenario.workload());
+        assertEquals(2, scenario.collections.get());
+    }
+
+    @Test
+    void staleInputsDeferRefreshWithoutPostponingTheNextFreshAttempt() {
+        RefreshScenario scenario = new RefreshScenario();
+        scenario.observeAt(1_000);
+        scenario.snapshots.set(List.of(memorySnapshot("replacement.service", 8, 40)));
+
+        assertTrue(scenario.coordinator.evaluate(6_000).isEmpty());
+        assertEquals(1, scenario.collections.get());
+        assertEquals("first.service", scenario.workload());
+
+        scenario.observeAt(6_500).orElseThrow();
+        assertEquals(2, scenario.collections.get());
+        assertEquals("replacement.service", scenario.workload());
+    }
+
+    @Test
+    void skippedFirstHighAttemptRunsAsSoonAsInputsBecomeFresh() {
+        RefreshScenario scenario = new RefreshScenario();
+        scenario.coordinator.evaluate(1_000).orElseThrow();
+        assertEquals(0, scenario.collections.get());
+
+        scenario.observeAt(1_500).orElseThrow();
+
+        assertEquals(1, scenario.collections.get());
+        assertEquals("first.service", scenario.workload());
+    }
+
+    @Test
+    void recoveryClearsRefreshTimerBeforeTheNextPressureEpisode() {
+        RefreshScenario scenario = new RefreshScenario();
+        scenario.observeAt(1_000);
+        scenario.rule.severity = Severity.NORMAL;
+        scenario.coordinator.evaluate(2_000).orElseThrow();
+        assertEquals(WorkloadAttribution.Status.NOT_ATTEMPTED,
+                scenario.repository.current().attribution().status());
+
+        scenario.rule.severity = Severity.HIGH;
+        scenario.coordinator.evaluate(4_000).orElseThrow();
+        assertEquals(1, scenario.collections.get());
+
+        scenario.observeAt(4_500).orElseThrow();
+        assertEquals(2, scenario.collections.get());
     }
 
     @Test
@@ -180,6 +277,50 @@ class DiagnosticAttributionStateTest {
                 1_000);
     }
 
+    private static final class RefreshScenario {
+
+        private final AtomicInteger collections = new AtomicInteger();
+        private final AtomicReference<List<CgroupMemorySnapshot>> snapshots =
+                new AtomicReference<>(List.of(memorySnapshot("first.service", 7, 35)));
+        private final AtomicReference<CgroupMonitor.Status> status =
+                new AtomicReference<>(CgroupMonitor.Status.AVAILABLE);
+        private final InMemoryRollingMetricWindow window =
+                new InMemoryRollingMetricWindow(Duration.ofMinutes(1), Duration.ofSeconds(1));
+        private final InMemoryDiagnosticStateRepository repository =
+                new InMemoryDiagnosticStateRepository(
+                        DiagnosticSnapshot.initial("host", "test", 0));
+        private final MutableMemoryRule rule = new MutableMemoryRule();
+        private final DiagnosticCoordinator coordinator =
+                new DiagnosticCoordinator(
+                        window,
+                        new DiagnosticEngine(List.of(rule)),
+                        repository,
+                        () -> "event",
+                        new MemoryPressureAttributor(
+                                () -> {
+                                    collections.incrementAndGet();
+                                    if (status.get() != CgroupMonitor.Status.AVAILABLE) {
+                                        return CgroupMonitor.CollectionResult.unavailable(
+                                                status.get());
+                                    }
+                                    return new CgroupMonitor.CollectionResult(
+                                            status.get(), snapshots.get(), Map.of());
+                                },
+                                5,
+                                1.2),
+                        Duration.ofSeconds(2),
+                        Duration.ofSeconds(5));
+
+        private Optional<DiagnosticTransition> observeAt(long timestamp) {
+            appendHostMemory(window, timestamp);
+            return coordinator.evaluate(timestamp);
+        }
+
+        private String workload() {
+            return repository.current().attribution().workload().name();
+        }
+    }
+
     private static final class MutableMemoryRule implements DiagnosticRule {
         private Severity severity = Severity.HIGH;
 
@@ -190,10 +331,12 @@ class DiagnosticAttributionStateTest {
 
         @Override
         public Optional<DiagnosticDecision> evaluate(DiagnosticContext context) {
-            ResourceState state =
-                    severity == Severity.CRITICAL
-                            ? ResourceState.SATURATED
-                            : ResourceState.SATURATION_RISK;
+            ResourceState state = switch (severity) {
+                case NORMAL -> ResourceState.NORMAL;
+                case ELEVATED -> ResourceState.PRESSURE;
+                case HIGH -> ResourceState.SATURATION_RISK;
+                case CRITICAL -> ResourceState.SATURATED;
+            };
             return Optional.of(
                     new DiagnosticDecision(
                             ResourceType.HOST_MEMORY,

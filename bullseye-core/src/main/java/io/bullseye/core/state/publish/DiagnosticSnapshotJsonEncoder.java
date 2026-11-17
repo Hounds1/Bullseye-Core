@@ -1,8 +1,11 @@
 package io.bullseye.core.state.publish;
 
+import io.bullseye.common.diagnostic.DiagnosticEvidence;
 import io.bullseye.common.diagnostic.DiagnosticSnapshot;
 import io.bullseye.common.diagnostic.ResourceType;
+import io.bullseye.common.workload.WorkloadAttribution;
 
+import java.util.List;
 import java.util.Objects;
 
 public final class DiagnosticSnapshotJsonEncoder {
@@ -45,24 +48,18 @@ public final class DiagnosticSnapshotJsonEncoder {
                         .append("  \"attributionScore\": ")
                         .append(snapshot.attribution().score())
                         .append(",\n")
-                        .append("  \"evidence\": [");
-        for (int index = 0; index < snapshot.evidence().size(); index++) {
-            var evidence = snapshot.evidence().get(index);
-            if (index > 0) {
-                json.append(',');
-            }
-            json.append("\n    {\"metric\": \"")
-                    .append(escape(evidence.metric()))
-                    .append("\", \"value\": ")
-                    .append(evidence.value())
-                    .append(", \"unit\": \"")
-                    .append(escape(evidence.unit()))
-                    .append("\"}");
-        }
-        if (!snapshot.evidence().isEmpty()) {
-            json.append('\n').append("  ");
-        }
-        return json.append("],\n")
+                        .append("  \"attributionCollectedAt\": ")
+                        .append(snapshot.attribution().collectedAt())
+                        .append(",\n")
+                        .append("  \"attributionCoverage\": ")
+                        .append(coverage(snapshot.attribution().coverage()))
+                        .append(",\n")
+                        .append("  \"attributionEvidence\": ")
+                        .append(evidence(snapshot.attribution().evidence(), "  "))
+                        .append(",\n")
+                        .append("  \"evidence\": ")
+                        .append(evidence(snapshot.evidence(), "  "));
+        return json.append(",\n")
                 .append("  \"evaluatedAt\": ")
                 .append(snapshot.evaluatedAt())
                 .append(",\n")
@@ -82,6 +79,48 @@ public final class DiagnosticSnapshotJsonEncoder {
                 .toString();
     }
 
+    private static String coverage(WorkloadAttribution.Coverage coverage) {
+        if (coverage == null) {
+            return "null";
+        }
+        return new StringBuilder("{\n")
+                .append("    \"complete\": ")
+                .append(coverage.complete())
+                .append(",\n    \"collectedGroups\": ")
+                .append(coverage.collectedGroups())
+                .append(",\n    \"failedGroups\": ")
+                .append(coverage.failedGroups())
+                .append(",\n    \"discoveryFailed\": ")
+                .append(coverage.discoveryFailed())
+                .append(",\n    \"discoveryLimited\": ")
+                .append(coverage.discoveryLimited())
+                .append("\n  }")
+                .toString();
+    }
+
+    private static String evidence(List<DiagnosticEvidence> values, String indent) {
+        StringBuilder json = new StringBuilder("[");
+        for (int index = 0; index < values.size(); index++) {
+            DiagnosticEvidence value = values.get(index);
+            if (index > 0) {
+                json.append(',');
+            }
+            json.append('\n')
+                    .append(indent)
+                    .append("  {\"metric\": \"")
+                    .append(escape(value.metric()))
+                    .append("\", \"value\": ")
+                    .append(value.value())
+                    .append(", \"unit\": \"")
+                    .append(escape(value.unit()))
+                    .append("\"}");
+        }
+        if (!values.isEmpty()) {
+            json.append('\n').append(indent);
+        }
+        return json.append(']').toString();
+    }
+
     private static String observations(DiagnosticSnapshot snapshot) {
         StringBuilder json = new StringBuilder("{");
         boolean first = true;
@@ -94,24 +133,18 @@ public final class DiagnosticSnapshotJsonEncoder {
                 json.append(',');
             }
             first = false;
-            json.append("\n    \"").append(resource).append("\": {\n")
-                    .append("      \"status\": \"").append(observation.status()).append("\",\n")
+            json.append("\n    \"")
+                    .append(resource)
+                    .append("\": {\n")
+                    .append("      \"status\": \"")
+                    .append(observation.status())
+                    .append("\",\n")
                     .append("      \"lastSampleAt\": ")
-                    .append(observation.lastSampleAt()).append(",\n")
-                    .append("      \"metrics\": [");
-            for (int index = 0; index < observation.metrics().size(); index++) {
-                var metric = observation.metrics().get(index);
-                if (index > 0) {
-                    json.append(',');
-                }
-                json.append("\n        {\"metric\": \"").append(escape(metric.metric()))
-                        .append("\", \"value\": ").append(metric.value())
-                        .append(", \"unit\": \"").append(escape(metric.unit())).append("\"}");
-            }
-            if (!observation.metrics().isEmpty()) {
-                json.append('\n').append("      ");
-            }
-            json.append("]\n    }");
+                    .append(observation.lastSampleAt())
+                    .append(",\n")
+                    .append("      \"metrics\": ")
+                    .append(evidence(observation.metrics(), "      "))
+                    .append("\n    }");
         }
         if (!first) {
             json.append('\n').append("  ");

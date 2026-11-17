@@ -1,5 +1,6 @@
 package io.bullseye.core.linux.cgroup;
 
+import io.bullseye.common.workload.WorkloadAttribution.Coverage;
 import io.bullseye.common.workload.WorkloadIdentity;
 import io.bullseye.core.config.BullseyeConfiguration;
 import io.bullseye.core.linux.psi.PsiParser;
@@ -11,6 +12,7 @@ import java.nio.file.AccessDeniedException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Clock;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -33,17 +35,39 @@ public final class CgroupMonitor {
     public record CollectionResult(
             Status status,
             List<CgroupMemorySnapshot> snapshots,
-            Map<String, CgroupMemorySnapshot> previousSnapshots) {
+            Map<String, CgroupMemorySnapshot> previousSnapshots,
+            Coverage coverage,
+            long collectedAt) {
 
         public CollectionResult {
             Objects.requireNonNull(status, "status");
             snapshots = List.copyOf(Objects.requireNonNull(snapshots, "snapshots"));
             previousSnapshots =
                     Map.copyOf(Objects.requireNonNull(previousSnapshots, "previousSnapshots"));
+            Objects.requireNonNull(coverage, "coverage");
+            if (collectedAt < 0) {
+                throw new IllegalArgumentException("collectedAt must not be negative");
+            }
+        }
+
+        public CollectionResult(
+                Status status,
+                List<CgroupMemorySnapshot> snapshots,
+                Map<String, CgroupMemorySnapshot> previousSnapshots) {
+            this(
+                    status,
+                    snapshots,
+                    previousSnapshots,
+                    Coverage.complete(snapshots.size()),
+                    snapshots.stream()
+                            .mapToLong(CgroupMemorySnapshot::collectedAt)
+                            .max()
+                            .orElse(0));
         }
 
         public static CollectionResult unavailable(Status status) {
-            return new CollectionResult(status, List.of(), Map.of());
+            return new CollectionResult(
+                    status, List.of(), Map.of(), new Coverage(0, 0, true, false), 0);
         }
     }
 
@@ -63,6 +87,9 @@ public final class CgroupMonitor {
     private List<Path> cachedGroups = List.of();
     private long nextDiscoveryAt;
     private boolean discoveryComplete;
+    private boolean discoveryFailed;
+    private boolean discoveryLimited;
+    private boolean discoveryDenied;
     private boolean initialized;
     private Status status = Status.CGROUP_V2_NOT_AVAILABLE;
 
@@ -92,16 +119,26 @@ public final class CgroupMonitor {
             @Override
             public List<Path> directories(Path path) throws IOException {
                 try (var entries = Files.list(path)) {
-                    return entries.filter(Files::isDirectory).toList();
+                    List<Path> directories = new ArrayList<>();
+                    var iterator = entries.iterator();
+                    while (iterator.hasNext()) {
+                        Path entry = iterator.next();
+                        if (Files.readAttributes(entry, BasicFileAttributes.class).isDirectory()) {
+                            directories.add(entry);
+                        }
+                    }
+                    return directories;
                 }
             }
         };
     }
 
     public synchronized void initialize() {
-        if (initialized) {
+        if (initialized && (!configuration.enabled() || status == Status.AVAILABLE)) {
             return;
         }
+        boolean firstAttempt = !initialized;
+        Status previousStatus = status;
         initialized = true;
         Path controllers = configuration.root().resolve("cgroup.controllers");
         if (!configuration.enabled()) {
@@ -112,13 +149,16 @@ public final class CgroupMonitor {
         try {
             files.read(controllers);
             status = Status.AVAILABLE;
+            logger.componentRestored("cgroup-v2");
             logger.status("cgroup v2 detected.");
         } catch (AccessDeniedException failure) {
             status = Status.ACCESS_DENIED;
             logger.componentInterrupted("cgroup-v2", failure);
         } catch (NoSuchFileException failure) {
             status = Status.CGROUP_V2_NOT_AVAILABLE;
-            logger.status("cgroup v2 unavailable. Workload attribution disabled.");
+            if (firstAttempt || previousStatus != status) {
+                logger.status("cgroup v2 unavailable. Workload attribution suspended.");
+            }
         } catch (IOException failure) {
             status = Status.CGROUP_V2_NOT_AVAILABLE;
             logger.componentInterrupted("cgroup-v2", failure);
@@ -127,15 +167,17 @@ public final class CgroupMonitor {
 
     public synchronized CollectionResult collectMemory() {
         initialize();
+        long now = clock.millis();
         if (status != Status.AVAILABLE) {
-            return CollectionResult.unavailable(status);
+            return new CollectionResult(
+                    status, List.of(), Map.of(), new Coverage(0, 0, true, false), now);
         }
 
-        long now = clock.millis();
-        boolean accessDenied = false;
         if (!discoveryComplete || now >= nextDiscoveryAt) {
-            accessDenied = discover(now);
+            discover(now);
         }
+        boolean accessDenied = discoveryDenied;
+        int failedGroups = 0;
 
         List<CgroupMemorySnapshot> collected = new ArrayList<>(cachedGroups.size());
         Map<String, CgroupMemorySnapshot> currentByPath = new LinkedHashMap<>();
@@ -148,8 +190,10 @@ public final class CgroupMonitor {
                 logger.componentRestored(component);
             } catch (AccessDeniedException failure) {
                 accessDenied = true;
+                failedGroups++;
                 logger.componentInterrupted(component, failure);
             } catch (Exception failure) {
+                failedGroups++;
                 logger.componentInterrupted(component, failure);
             }
         }
@@ -157,10 +201,15 @@ public final class CgroupMonitor {
         Map<String, CgroupMemorySnapshot> previous = Map.copyOf(previousSnapshots);
         previousSnapshots.clear();
         previousSnapshots.putAll(currentByPath);
-        if (collected.isEmpty() && accessDenied) {
-            return new CollectionResult(Status.ACCESS_DENIED, List.of(), previous);
+        Coverage coverage =
+                new Coverage(collected.size(), failedGroups, discoveryFailed, discoveryLimited);
+        if (failedGroups > 0) {
+            discoveryComplete = false;
         }
-        return new CollectionResult(Status.AVAILABLE, collected, previous);
+        if (collected.isEmpty() && accessDenied) {
+            return new CollectionResult(Status.ACCESS_DENIED, List.of(), previous, coverage, now);
+        }
+        return new CollectionResult(Status.AVAILABLE, collected, previous, coverage, now);
     }
 
     public synchronized Status status() {
@@ -170,30 +219,34 @@ public final class CgroupMonitor {
 
     public synchronized void clearHistory() {
         previousSnapshots.clear();
+        discoveryComplete = false;
     }
 
-    private boolean discover(long now) {
+    private void discover(long now) {
         ArrayDeque<Node> pending = new ArrayDeque<>();
         List<Path> discovered = new ArrayList<>(Math.min(configuration.maximumGroups(), 64));
         Set<Path> parents = new HashSet<>();
         boolean failed = false;
         boolean accessDenied = false;
+        boolean limited = false;
         pending.add(new Node(configuration.root(), 0));
-        while (!pending.isEmpty() && discovered.size() < configuration.maximumGroups()) {
+        while (!pending.isEmpty()) {
             Node node = pending.removeFirst();
-            if (node.depth() >= configuration.maximumDepth()) {
-                continue;
-            }
             try {
-                for (Path child : files.directories(node.path())) {
-                    discovered.add(child);
-                    parents.add(node.path());
+                List<Path> children = files.directories(node.path());
+                if (node.depth() >= configuration.maximumDepth()) {
+                    limited |= !children.isEmpty();
+                    continue;
+                }
+                for (Path child : children) {
                     if (discovered.size() >= configuration.maximumGroups()) {
+                        limited = true;
                         break;
                     }
+                    discovered.add(child);
+                    parents.add(node.path());
                     pending.addLast(new Node(child, node.depth() + 1));
                 }
-                logger.componentRestored("cgroup-discovery");
             } catch (AccessDeniedException failure) {
                 failed = true;
                 accessDenied = true;
@@ -202,6 +255,9 @@ public final class CgroupMonitor {
                 failed = true;
                 logger.componentInterrupted("cgroup-discovery", failure);
             }
+        }
+        if (!failed) {
+            logger.componentRestored("cgroup-discovery");
         }
 
         if (!(failed && discovered.isEmpty() && !cachedGroups.isEmpty())) {
@@ -213,8 +269,10 @@ public final class CgroupMonitor {
             previousSnapshots.keySet().retainAll(active);
         }
         discoveryComplete = true;
+        discoveryFailed = failed;
+        discoveryLimited = limited;
+        discoveryDenied = accessDenied;
         nextDiscoveryAt = now + configuration.discoveryInterval().toMillis();
-        return accessDenied;
     }
 
     private CgroupMemorySnapshot collectGroup(Path group, long now) throws IOException {
@@ -268,7 +326,11 @@ public final class CgroupMonitor {
     }
 
     private String optionalRead(Path path) throws IOException {
-        return files.exists(path) ? files.read(path) : null;
+        try {
+            return files.read(path);
+        } catch (NoSuchFileException missing) {
+            return null;
+        }
     }
 
     private String cgroupPath(Path group) {

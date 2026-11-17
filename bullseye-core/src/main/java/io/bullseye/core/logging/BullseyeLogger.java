@@ -60,14 +60,16 @@ public final class BullseyeLogger {
                                 + String.format(
                                         Locale.ROOT,
                                         "%.1f",
-                                        transition.current().attribution().score()));
+                                        transition.current().attribution().score())
+                                + coverageSuffix(transition.current().attribution().coverage()));
             } else if (transition.current().attribution().status()
                     != WorkloadAttribution.Status.NOT_ATTEMPTED) {
                 status(
                         "Pressure source attribution unavailable. resource="
                                 + transition.current().resource()
                                 + " reason="
-                                + transition.current().attribution().status());
+                                + transition.current().attribution().status()
+                                + coverageSuffix(transition.current().attribution().coverage()));
             }
         }
     }
@@ -117,5 +119,19 @@ public final class BullseyeLogger {
 
     private static String sanitize(String value) {
         return value.replace('\r', ' ').replace('\n', ' ');
+    }
+
+    private static String coverageSuffix(WorkloadAttribution.Coverage coverage) {
+        if (coverage == null || coverage.complete()) {
+            return "";
+        }
+        return " coverage=PARTIAL collected="
+                + coverage.collectedGroups()
+                + " failed="
+                + coverage.failedGroups()
+                + " discoveryFailed="
+                + coverage.discoveryFailed()
+                + " discoveryLimited="
+                + coverage.discoveryLimited();
     }
 }
