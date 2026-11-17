@@ -85,7 +85,7 @@ class PressureRulesTest {
         DiagnosticDecision recovered = evaluate(memoryRule, 30_000);
 
         assertEquals(Severity.NORMAL, recovered.severity());
-        assertTrue(recovered.reason().startsWith("Memory pressure cleared."));
+        assertTrue(recovered.reason().startsWith("Memory pressure normalized."));
     }
 
     @Test

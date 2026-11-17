@@ -5,7 +5,7 @@ import io.bullseye.core.config.BullseyeConfiguration;
 import io.bullseye.core.config.PropertiesConfigurationLoader;
 import io.bullseye.core.diagnostic.DiagnosticCoordinator;
 import io.bullseye.core.diagnostic.DiagnosticEngine;
-import io.bullseye.core.diagnostic.PressureAttributor;
+import io.bullseye.core.diagnostic.MemoryPressureAttributor;
 import io.bullseye.core.diagnostic.rule.CpuPressureRule;
 import io.bullseye.core.diagnostic.rule.IoPressureRule;
 import io.bullseye.core.diagnostic.rule.MemoryPressureRule;
@@ -82,11 +82,10 @@ public final class BullseyeApplication {
                         engine,
                         stateRepository,
                         () -> UUID.randomUUID().toString(),
-                        cgroupMonitor::snapshots,
-                        new PressureAttributor(
+                        new MemoryPressureAttributor(
+                                cgroupMonitor,
                                 configuration.cgroup().attributionMinimumScore(),
-                                configuration.cgroup().attributionDominanceRatio(),
-                                configuration.cgroup().samplingInterval().multipliedBy(3)));
+                                configuration.cgroup().attributionDominanceRatio()));
         AsyncStatePublisher publisher =
                 new AsyncStatePublisher(
                         new AtomicFileStatePublisher(
@@ -106,8 +105,7 @@ public final class BullseyeApplication {
                 clock,
                 configuration.samplingInterval(),
                 configuration.windowDuration(),
-                cgroupMonitor,
-                configuration.cgroup().samplingInterval());
+                cgroupMonitor);
     }
 
     private static boolean isLinux() {

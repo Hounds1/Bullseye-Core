@@ -2,7 +2,7 @@
 
 Bullseye Core is a standalone Linux host diagnostics agent. It reads host metrics and
 Linux PSI from `/proc`, evaluates sustained CPU, memory, and IO pressure, and uses bounded
-cgroup v2 sampling to locate a likely workload source. Current state is published as an
+cgroup v2 memory collection to locate a likely workload source. Current state is published as an
 atomically replaced JSON file.
 
 Bullseye observes and publishes state. It does not throttle traffic, modify application
@@ -78,6 +78,8 @@ for a smoke test, but it is not a substitute for the real Linux host validation 
   "workloadType": "SYSTEMD_SERVICE",
   "cgroupPath": "/system.slice/order-api.service",
   "attributionConfidence": "HIGH",
+  "attributionStatus": "IDENTIFIED",
+  "attributionScore": 91.0,
   "evidence": [
     {"metric": "usage", "value": 88.1, "unit": "%"},
     {"metric": "psi.some.avg10", "value": 24.3, "unit": "%"}
@@ -88,17 +90,22 @@ for a smoke test, but it is not a substitute for the real Linux host validation 
 ```
 
 State is written to a temporary sibling file, flushed, and atomically moved over the current
-snapshot. The version changes only when severity, primary resource, resource state, or primary
-workload changes. Publisher, PSI, and individual cgroup failures are isolated from host telemetry.
+snapshot. The version changes only when severity, primary resource, resource state, primary
+workload, confidence, or attribution status changes. Publisher, PSI, and individual cgroup failures
+are isolated from host telemetry.
 
 ## Diagnostic policy
 
 - CPU keeps the usage-based hysteresis policy and uses PSI as corroborating evidence when present.
 - Memory requires both high usage and memory PSI; high page-cache usage alone is observation only.
 - IO is based on sustained PSI stalls rather than throughput.
-- The highest active resource severity becomes host severity. Similar attribution candidates remain
-  `UNKNOWN` instead of forcing a cause.
-- cgroup discovery is cached and bounded. Sampling uses the cached targets on a separate executor.
+- The highest active resource severity becomes host severity.
+- Memory attribution runs when memory enters `HIGH` or remains `CRITICAL`; repeated `HIGH`
+  evaluations reuse the previous result.
+- cgroup discovery is cached and bounded. No background cgroup sampling executor is used.
+- Attribution combines host share, recent growth, memory PSI, and memory event deltas. Similar
+  candidates are retained with `LOW` confidence rather than overstating certainty.
+- Unsupported, denied, empty, and insufficient-data outcomes are represented explicitly.
 
 ## Log style
 
@@ -109,8 +116,8 @@ Operational messages use short state announcements:
 [BULLSEYE] Host telemetry online.
 [BULLSEYE] cgroup v2 detected.
 [BULLSEYE] Memory pressure detected. usage=82.4% psi.some=13.1% sustained=10s previous=NORMAL current=ELEVATED resource=HOST_MEMORY
-[BULLSEYE] Warning. Memory saturation risk detected. usage=88.1% psi.some=24.3% rise=+6.1pp/10s previous=ELEVATED current=HIGH resource=HOST_MEMORY
-[BULLSEYE] Pressure source identified. resource=HOST_MEMORY workload=order-api.service confidence=HIGH
+[BULLSEYE] Critical memory pressure detected. usage=88.1% psi.some=24.3% rise=+6.1pp/10s previous=ELEVATED current=HIGH resource=HOST_MEMORY
+[BULLSEYE] Pressure source identified. resource=HOST_MEMORY workload=order-api.service confidence=HIGH score=91.0
 ```
 
 ## Real Linux validation

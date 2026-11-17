@@ -101,7 +101,6 @@ public final class PropertiesConfigurationLoader {
                 bool(properties, CGROUP_PREFIX + "enabled", true),
                 Path.of(text(properties, CGROUP_PREFIX + "root", "/sys/fs/cgroup")),
                 duration(properties, CGROUP_PREFIX + "discovery-interval", "60s"),
-                duration(properties, CGROUP_PREFIX + "sampling-interval", "5s"),
                 integer(properties, CGROUP_PREFIX + "maximum-depth", 8),
                 integer(properties, CGROUP_PREFIX + "maximum-groups", 512),
                 decimal(properties, CGROUP_PREFIX + "attribution.minimum-score", 5),

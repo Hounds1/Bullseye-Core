@@ -43,8 +43,7 @@ class CpuPsiRuleTest {
 
         assertEquals(Severity.ELEVATED, decision.severity());
         assertTrue(
-                decision.reason()
-                        .startsWith("CPU utilization elevated without PSI corroboration."));
+                decision.reason().startsWith("CPU load detected without pressure corroboration."));
     }
 
     @Test

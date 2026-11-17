@@ -35,10 +35,12 @@ public final class LinuxHostMetricCollector implements MetricCollector {
     public synchronized Collection<MetricSample> collect() throws Exception {
         long timestamp = clock.millis();
         CpuTicks currentCpuTicks = ProcStatParser.parseCpuTicks(source.read(PROC_STAT));
-        double memoryUsage = MemInfoParser.parseUsagePercentage(source.read(PROC_MEMINFO));
+        String memoryInfo = source.read(PROC_MEMINFO);
+        double memoryUsage = MemInfoParser.parseUsagePercentage(memoryInfo);
+        long totalMemoryBytes = MemInfoParser.parseTotalBytes(memoryInfo);
         double loadAverage = LoadAverageParser.parseOneMinuteLoad(source.read(PROC_LOADAVG));
 
-        List<MetricSample> samples = new ArrayList<>(3);
+        List<MetricSample> samples = new ArrayList<>(4);
         if (previousCpuTicks != null) {
             samples.add(
                     new MetricSample(
@@ -48,6 +50,8 @@ public final class LinuxHostMetricCollector implements MetricCollector {
         }
         previousCpuTicks = currentCpuTicks;
         samples.add(new MetricSample(MetricType.HOST_MEMORY_USAGE, memoryUsage, timestamp));
+        samples.add(
+                new MetricSample(MetricType.HOST_MEMORY_TOTAL_BYTES, totalMemoryBytes, timestamp));
         samples.add(new MetricSample(MetricType.HOST_LOAD_AVERAGE, loadAverage, timestamp));
         return List.copyOf(samples);
     }
