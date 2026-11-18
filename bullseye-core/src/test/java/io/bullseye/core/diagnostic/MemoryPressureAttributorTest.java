@@ -69,12 +69,139 @@ class MemoryPressureAttributorTest {
     }
 
     @Test
-    void attributesWithoutPreviousSnapshotUsingUsageAndPsi() {
+    void attributesWithoutPreviousSnapshotUsingHostShareOnly() {
         WorkloadAttribution result =
                 attribute(List.of(snapshot("order-api.service", 7, 40, 6)), Map.of());
 
         assertEquals("order-api.service", result.workload().name());
+        assertEquals(28.4375, result.score(), 0.000001);
+        assertEquals(WorkloadAttribution.Confidence.MEDIUM, result.confidence());
+        assertEquals(0, value(result, "score.pressure"));
+        assertEquals(0, value(result, "score.events"));
+    }
+
+    @Test
+    void tinyLocallyLimitedGroupDoesNotOutrankLargeHostConsumer() {
+        var large = snapshot("database.service", 12, 0, 0);
+        var tinyBefore = limitedSnapshot("limited.service", 0.0625, 0, 0, 0);
+        var tiny = limitedSnapshot("limited.service", 0.0625, 50, 500, 5_000);
+
+        var result = attribute(
+                List.of(tiny, large),
+                Map.of(path("limited.service"), tinyBefore,
+                        path("database.service"), snapshotAt("database.service", 12, 0, 0, 0)));
+
+        assertEquals("database.service", result.workload().name());
+        assertEquals(48.75, result.score(), 0.000001);
         assertEquals(WorkloadAttribution.Confidence.HIGH, result.confidence());
+    }
+
+    @Test
+    void localPressureAloneCannotProduceAHostSourceCandidate() {
+        var before = limitedSnapshot("limited.service", 0.0625, 0, 0, 0);
+        var current = limitedSnapshot("limited.service", 0.0625, 100, 10_000, 5_000);
+
+        var result = attribute(List.of(current), Map.of(path("limited.service"), before));
+
+        assertEquals(WorkloadAttribution.Status.NO_CANDIDATE, result.status());
+        assertFalse(result.resolved());
+        assertTrue(result.coverage().complete());
+    }
+
+    @Test
+    void localLimitsPressureAndEventsDoNotChangeContributionScoreOrConfidence() {
+        var before = snapshotAt("api.service", 2, 0, 0, 0);
+        var quiet = snapshot("api.service", 7, 0, 0);
+        var pressured = new CgroupMemorySnapshot(
+                quiet.workload(), 7 * GIB, 6 * GIB, 8 * GIB,
+                100, 80, 1_000, 500, 2, 1, 5_000);
+        var previous = Map.of(path("api.service"), before);
+
+        var quietResult = attribute(List.of(quiet), previous);
+        var pressuredResult = attribute(List.of(pressured), previous);
+
+        assertEquals(quietResult.score(), pressuredResult.score());
+        assertEquals(quietResult.confidence(), pressuredResult.confidence());
+        assertEquals(0, value(pressuredResult, "score.pressure"));
+        assertEquals(0, value(pressuredResult, "score.events"));
+        assertEquals(100, value(pressuredResult, "psi.some.avg10"));
+        assertEquals(1_000, value(pressuredResult, "events.high.delta"));
+        assertEquals(500, value(pressuredResult, "events.max.delta"));
+        assertEquals(2, value(pressuredResult, "events.oom.delta"));
+        assertEquals(1, value(pressuredResult, "events.oom_kill.delta"));
+    }
+
+    @Test
+    void limitedLargeConsumerRemainsEligibleBasedOnHostContribution() {
+        var current = new CgroupMemorySnapshot(
+                WorkloadIdentity.fromCgroupPath(path("limited-large.service")),
+                12 * GIB, 10 * GIB, 14 * GIB, 50, 5, 500, 2, 0, 0, 5_000);
+
+        var result = attribute(List.of(current), Map.of());
+
+        assertEquals("limited-large.service", result.workload().name());
+        assertEquals(48.75, result.score(), 0.000001);
+        assertEquals(WorkloadAttribution.Confidence.HIGH, result.confidence());
+        assertEquals(120, value(result, "limit.high.usage"), 0.000001);
+        assertEquals(12.0 / 14 * 100, value(result, "limit.max.usage"), 0.000001);
+    }
+
+    @Test
+    void stableConsumersAboveQuarterOfHostCapacityDoNotArtificiallyTie() {
+        var smaller = snapshot("a-small.service", 4, 0, 0);
+        var larger = snapshot("z-large.service", 12, 0, 0);
+
+        var result = attribute(List.of(smaller, larger), Map.of());
+
+        assertEquals("z-large.service", result.workload().name());
+        assertEquals(48.75, result.score(), 0.000001);
+        assertEquals(3 * attribute(List.of(smaller), Map.of()).score(), result.score(), 0.000001);
+    }
+
+    @Test
+    void zeroOrUnavailableLimitsNeverProduceInfiniteUtilization() {
+        var zeroLimits = new CgroupMemorySnapshot(
+                WorkloadIdentity.fromCgroupPath(path("api.service")),
+                7 * GIB, 0L, 0L, 20, 2, 0, 0, 0, 0, 5_000);
+        var zeroResult = attribute(List.of(zeroLimits), Map.of());
+
+        assertEquals(0, value(zeroResult, "memory.high"));
+        assertEquals(0, value(zeroResult, "memory.max"));
+        assertFalse(hasEvidence(zeroResult, "limit.high.usage"));
+        assertFalse(hasEvidence(zeroResult, "limit.max.usage"));
+
+        var unlimited = attribute(List.of(snapshot("api.service", 7, 20, 2)), Map.of());
+        assertFalse(hasEvidence(unlimited, "memory.high"));
+        assertFalse(hasEvidence(unlimited, "memory.max"));
+        assertFalse(hasEvidence(unlimited, "limit.high.usage"));
+        assertFalse(hasEvidence(unlimited, "limit.max.usage"));
+        assertEquals(unlimited.score(), zeroResult.score());
+    }
+
+    @Test
+    void missingPressureDoesNotPreventContributionMeasurement() {
+        var current = snapshot("api.service", 12, Double.NaN, Double.NaN);
+
+        var result = attribute(List.of(current), Map.of());
+
+        assertTrue(result.resolved());
+        assertEquals(48.75, result.score(), 0.000001);
+        assertFalse(hasEvidence(result, "psi.some.avg10"));
+        assertFalse(hasEvidence(result, "psi.full.avg10"));
+    }
+
+    @Test
+    void zeroMinimumScoreDoesNotIdentifyAnEmptyGroupWithPressure() {
+        var collection = new CgroupMonitor.CollectionResult(
+                CgroupMonitor.Status.AVAILABLE,
+                List.of(snapshot("empty.service", 0, 100, 100)),
+                Map.of());
+
+        var result = new MemoryPressureAttributor(() -> collection, 0, 1.2)
+                .attribute(HOST_TOTAL);
+
+        assertEquals(WorkloadAttribution.Status.NO_CANDIDATE, result.status());
+        assertFalse(result.resolved());
     }
 
     @Test
@@ -115,13 +242,16 @@ class MemoryPressureAttributorTest {
     void exposesMeasuredInputsAndScoreBreakdown() {
         var before = snapshotAt("api.service", 1, 10, 1, 0);
         var current = new CgroupMemorySnapshot(
-                before.workload(), 2 * GIB, 4 * GIB, 20, 2, 2, 1, 0, 0, 5_000);
+                before.workload(), 2 * GIB, GIB, 4 * GIB, 20, 2, 2, 1, 0, 0, 5_000);
 
         WorkloadAttribution result =
                 attribute(List.of(current), Map.of(path("api.service"), before));
 
         assertEquals(2 * GIB, value(result, "memory.current"));
+        assertEquals(GIB, value(result, "memory.high"));
         assertEquals(4 * GIB, value(result, "memory.max"));
+        assertEquals(200, value(result, "limit.high.usage"));
+        assertEquals(50, value(result, "limit.max.usage"));
         assertEquals(12.5, value(result, "host.share"));
         assertEquals(GIB, value(result, "growth.bytes"));
         assertEquals(5_000, value(result, "observation.duration"));
@@ -129,7 +259,10 @@ class MemoryPressureAttributorTest {
         assertEquals(20, value(result, "psi.some.avg10"));
         assertEquals(2, value(result, "events.high.delta"));
         assertEquals(1, value(result, "events.max.delta"));
-        assertEquals(1.4, value(result, "score.events"), 0.000001);
+        assertEquals(8.125, value(result, "score.usage"), 0.000001);
+        assertEquals(21.875, value(result, "score.growth"), 0.000001);
+        assertEquals(0, value(result, "score.pressure"));
+        assertEquals(0, value(result, "score.events"));
         double components = result.evidence().stream()
                 .filter(e -> e.metric().startsWith("score."))
                 .mapToDouble(e -> e.value()).sum();
@@ -167,12 +300,17 @@ class MemoryPressureAttributorTest {
     }
 
     @Test
-    void missingOrNonIncreasingObservationTimeDoesNotInventDeltas() {
+    void incomparableObservationDoesNotInventDeltas() {
         var current = snapshotAt("api.service", 7, 40, 6, 5_000);
+        var differentIdentity = new CgroupMemorySnapshot(
+                new WorkloadIdentity("previous-id", "previous-name", path("api.service"),
+                        WorkloadIdentity.Type.GENERIC_CGROUP),
+                GIB, null, 0, 0, 0, 0, 0, 0, 0);
         for (var previous : List.of(
                 Map.<String, CgroupMemorySnapshot>of(),
                 Map.of(path("api.service"), current),
-                Map.of(path("api.service"), snapshotAt("api.service", 1, 0, 0, 6_000)))) {
+                Map.of(path("api.service"), snapshotAt("api.service", 1, 0, 0, 6_000)),
+                Map.of(path("api.service"), differentIdentity))) {
             var result = attribute(List.of(current), previous);
             assertEquals(0, value(result, "score.growth"));
             assertEquals(0, value(result, "score.events"));
@@ -199,7 +337,7 @@ class MemoryPressureAttributorTest {
 
     @Test
     void incompleteCollectionCapsConfidenceAndRetainsCoverage() {
-        var current = snapshotAt("api.service", 7, 40, 6, 5_000);
+        var current = snapshotAt("api.service", 12, 40, 6, 5_000);
         assertEquals(WorkloadAttribution.Confidence.HIGH,
                 attribute(List.of(current), Map.of()).confidence());
 
@@ -243,6 +381,18 @@ class MemoryPressureAttributorTest {
     private static double value(WorkloadAttribution result, String name) {
         return result.evidence().stream().filter(e -> e.metric().equals(name))
                 .findFirst().orElseThrow().value();
+    }
+
+    private static boolean hasEvidence(WorkloadAttribution result, String name) {
+        return result.evidence().stream().anyMatch(value -> value.metric().equals(name));
+    }
+
+    private static CgroupMemorySnapshot limitedSnapshot(
+            String workload, double memoryGib, double pressure, long highEvents, long timestamp) {
+        long current = (long) (memoryGib * GIB);
+        return new CgroupMemorySnapshot(
+                WorkloadIdentity.fromCgroupPath(path(workload)),
+                current, current, current, pressure, 0, highEvents, 0, 0, 0, timestamp);
     }
 
     private static WorkloadAttribution attribute(

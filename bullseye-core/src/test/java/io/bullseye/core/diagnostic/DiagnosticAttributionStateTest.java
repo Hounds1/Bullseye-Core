@@ -16,6 +16,7 @@ import io.bullseye.core.linux.cgroup.CgroupMemorySnapshot;
 import io.bullseye.core.linux.cgroup.CgroupMonitor;
 import io.bullseye.core.metric.InMemoryRollingMetricWindow;
 import io.bullseye.core.state.InMemoryDiagnosticStateRepository;
+import io.bullseye.core.state.publish.DiagnosticSnapshotJsonEncoder;
 
 import org.junit.jupiter.api.Test;
 
@@ -82,6 +83,40 @@ class DiagnosticAttributionStateTest {
         assertEquals("replacement.service", refreshed.current().attribution().workload().name());
         assertEquals(version + 1, refreshed.current().version());
         assertEquals(2, scenario.collections.get());
+    }
+
+    @Test
+    void localPressureCannotReplaceHostContributorUntilActualMemoryUsageGrows() {
+        RefreshScenario scenario = new RefreshScenario();
+        var large = memorySnapshot("large.service", 12, 0);
+        var limited = new CgroupMemorySnapshot(
+                WorkloadIdentity.fromCgroupPath("/system.slice/limited.service"),
+                GIB / 16, GIB / 16, GIB / 8, 0, 0, 0, 0, 0, 0, 1_000);
+        scenario.snapshots.set(List.of(large, limited));
+        scenario.observeAt(1_000);
+        assertEquals("large.service", scenario.workload());
+        long version = scenario.repository.current().version();
+
+        var localPressure = new CgroupMemorySnapshot(
+                limited.workload(), GIB / 16, GIB / 16, GIB / 8,
+                50, 10, 500, 100, 10, 1, 6_000);
+        scenario.snapshots.set(List.of(large, localPressure));
+        assertTrue(scenario.observeAt(6_000).isEmpty());
+        assertEquals("large.service", scenario.workload());
+        assertEquals(version, scenario.repository.current().version());
+
+        var growingLimited = new CgroupMemorySnapshot(
+                limited.workload(), 8 * GIB, 4 * GIB, 8 * GIB,
+                50, 10, 500, 100, 10, 1, 11_000);
+        scenario.snapshots.set(List.of(memorySnapshot("large.service", 1, 0), growingLimited));
+        var changed = scenario.observeAt(11_000).orElseThrow();
+        assertEquals("limited.service", scenario.workload());
+        assertEquals(version + 1, changed.current().version());
+        assertEquals(32.5, changed.current().attribution().score());
+        String json = new DiagnosticSnapshotJsonEncoder().encode(changed.current());
+        assertTrue(json.contains("\"metric\": \"memory.high\""));
+        assertTrue(json.contains("\"metric\": \"limit.high.usage\", \"value\": 200.0"));
+        assertTrue(json.contains("\"metric\": \"limit.max.usage\", \"value\": 100.0"));
     }
 
     @Test
@@ -225,7 +260,10 @@ class DiagnosticAttributionStateTest {
         double previousScore = repository.current().attribution().score();
         snapshots.set(List.of(memorySnapshot("second.service", 8, 46)));
         assertTrue(coordinator.evaluate(4_000).isEmpty());
-        assertTrue(repository.current().attribution().score() > previousScore);
+        assertEquals(previousScore, repository.current().attribution().score());
+        assertEquals(46, repository.current().attribution().evidence().stream()
+                .filter(evidence -> evidence.metric().equals("psi.some.avg10"))
+                .findFirst().orElseThrow().value());
         long version = repository.current().version();
 
         snapshots.set(List.of(memorySnapshot("third.service", 9, 48)));

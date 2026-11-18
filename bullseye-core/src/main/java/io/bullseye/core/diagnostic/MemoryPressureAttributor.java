@@ -14,15 +14,10 @@ import java.util.function.Supplier;
 
 public final class MemoryPressureAttributor {
 
-    private static final double USAGE_WEIGHT = 25;
+    private static final double USAGE_WEIGHT = 65;
     private static final double GROWTH_WEIGHT = 35;
-    private static final double PRESSURE_WEIGHT = 30;
-    private static final double EVENT_WEIGHT = 10;
-    private static final double HOST_SHARE_SATURATION = 0.25;
     // Same scale as 10% of host memory gained in the original five-second sample interval.
     private static final double HOST_GROWTH_PER_SECOND_SATURATION = 0.02;
-    private static final double PSI_SOME_SATURATION = 50;
-    private static final double PSI_FULL_SATURATION = 10;
 
     private final Supplier<CgroupMonitor.CollectionResult> collections;
     private final Runnable historyReset;
@@ -87,7 +82,9 @@ public final class MemoryPressureAttributor {
                                         .reversed()
                                         .thenComparing(c -> c.snapshot().workload().cgroupPath()))
                         .toList();
-        if (candidates.isEmpty() || candidates.getFirst().score() < minimumScore) {
+        if (candidates.isEmpty()
+                || candidates.getFirst().score() <= 0
+                || candidates.getFirst().score() < minimumScore) {
             return unavailable(WorkloadAttribution.Status.NO_CANDIDATE, collection);
         }
 
@@ -116,16 +113,17 @@ public final class MemoryPressureAttributor {
             Map<String, CgroupMemorySnapshot> previousSnapshots,
             long hostTotalBytes) {
         CgroupMemorySnapshot previous = previousSnapshots.get(current.workload().cgroupPath());
-        boolean comparable = previous != null && current.collectedAt() > previous.collectedAt();
+        boolean comparable =
+                previous != null
+                        && current.workload().equals(previous.workload())
+                        && current.collectedAt() > previous.collectedAt();
         double hostShare = (double) current.currentBytes() / hostTotalBytes;
         List<DiagnosticEvidence> evidence = new ArrayList<>();
         evidence.add(metric("memory.current", current.currentBytes(), "bytes"));
-        if (current.maxBytes() != null) {
-            evidence.add(metric("memory.max", current.maxBytes(), "bytes"));
-        }
+        limitEvidence("high", current.highBytes(), current.currentBytes(), evidence);
+        limitEvidence("max", current.maxBytes(), current.currentBytes(), evidence);
         evidence.add(metric("host.share", hostShare * 100, "%"));
         double growth = 0;
-        double events = 0;
         if (comparable) {
             long elapsedMillis = current.collectedAt() - previous.collectedAt();
             long growthBytes = current.currentBytes() - previous.currentBytes();
@@ -134,7 +132,7 @@ public final class MemoryPressureAttributor {
             evidence.add(metric("growth.bytes", growthBytes, "bytes"));
             evidence.add(metric("growth.bytes-per-second", bytesPerSecond, "bytes/s"));
             growth = growthScore(bytesPerSecond, hostTotalBytes);
-            events = eventScore(current, previous, evidence);
+            eventEvidence(current, previous, evidence);
         }
         if (Double.isFinite(current.psiSome())) {
             evidence.add(metric("psi.some.avg10", current.psiSome(), "%"));
@@ -143,12 +141,12 @@ public final class MemoryPressureAttributor {
             evidence.add(metric("psi.full.avg10", current.psiFull(), "%"));
         }
         double usage = usageScore(hostShare);
-        double pressure = pressureScore(current);
         evidence.add(metric("score.usage", usage, "points"));
         evidence.add(metric("score.growth", growth, "points"));
-        evidence.add(metric("score.pressure", pressure, "points"));
-        evidence.add(metric("score.events", events, "points"));
-        return new Candidate(current, usage + growth + pressure + events, List.copyOf(evidence));
+        // Keep the existing score keys; local stalls/events do not prove host contribution.
+        evidence.add(metric("score.pressure", 0, "points"));
+        evidence.add(metric("score.events", 0, "points"));
+        return new Candidate(current, usage + growth, List.copyOf(evidence));
     }
 
     private WorkloadAttribution.Confidence confidence(double score, double ratio) {
@@ -162,7 +160,7 @@ public final class MemoryPressureAttributor {
     }
 
     private static double usageScore(double hostShare) {
-        return normalized(hostShare / HOST_SHARE_SATURATION) * USAGE_WEIGHT;
+        return normalized(hostShare) * USAGE_WEIGHT;
     }
 
     private static double growthScore(double bytesPerSecond, long hostTotalBytes) {
@@ -171,13 +169,23 @@ public final class MemoryPressureAttributor {
                 * GROWTH_WEIGHT;
     }
 
-    private static double pressureScore(CgroupMemorySnapshot snapshot) {
-        double some = available(snapshot.psiSome()) / PSI_SOME_SATURATION;
-        double full = available(snapshot.psiFull()) / PSI_FULL_SATURATION;
-        return normalized(Math.max(some, full)) * PRESSURE_WEIGHT;
+    private static void limitEvidence(
+            String boundary, Long limitBytes, long currentBytes, List<DiagnosticEvidence> evidence) {
+        if (limitBytes == null) {
+            return;
+        }
+        evidence.add(metric("memory." + boundary, limitBytes, "bytes"));
+        // These are this cgroup's limits, not effective ancestor limits or host capacity.
+        if (limitBytes > 0) {
+            evidence.add(
+                    metric(
+                            "limit." + boundary + ".usage",
+                            (double) currentBytes / limitBytes * 100,
+                            "%"));
+        }
     }
 
-    private static double eventScore(
+    private static void eventEvidence(
             CgroupMemorySnapshot current,
             CgroupMemorySnapshot previous,
             List<DiagnosticEvidence> evidence) {
@@ -189,16 +197,10 @@ public final class MemoryPressureAttributor {
         evidence.add(metric("events.max.delta", max, "count"));
         evidence.add(metric("events.oom.delta", oom, "count"));
         evidence.add(metric("events.oom_kill.delta", oomKill, "count"));
-        double impact = high * 0.02 + max * 0.1 + oom * 0.5 + oomKill;
-        return normalized(impact) * EVENT_WEIGHT;
     }
 
     private static long increase(long current, long previous) {
         return Math.max(0, current - previous);
-    }
-
-    private static double available(double value) {
-        return Double.isFinite(value) ? value : 0;
     }
 
     private static double normalized(double value) {

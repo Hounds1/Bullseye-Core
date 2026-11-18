@@ -7,6 +7,7 @@ import java.util.Objects;
 public record CgroupMemorySnapshot(
         WorkloadIdentity workload,
         long currentBytes,
+        Long highBytes,
         Long maxBytes,
         double psiSome,
         double psiFull,
@@ -18,7 +19,10 @@ public record CgroupMemorySnapshot(
 
     public CgroupMemorySnapshot {
         Objects.requireNonNull(workload, "workload");
-        if (currentBytes < 0 || (maxBytes != null && maxBytes < 0) || collectedAt < 0) {
+        if (currentBytes < 0
+                || (highBytes != null && highBytes < 0)
+                || (maxBytes != null && maxBytes < 0)
+                || collectedAt < 0) {
             throw new IllegalArgumentException(
                     "memory counters and timestamp must not be negative");
         }
@@ -29,8 +33,33 @@ public record CgroupMemorySnapshot(
         }
     }
 
+    public CgroupMemorySnapshot(
+            WorkloadIdentity workload,
+            long currentBytes,
+            Long maxBytes,
+            double psiSome,
+            double psiFull,
+            long highEvents,
+            long maxEvents,
+            long oomEvents,
+            long oomKillEvents,
+            long collectedAt) {
+        this(
+                workload,
+                currentBytes,
+                null,
+                maxBytes,
+                psiSome,
+                psiFull,
+                highEvents,
+                maxEvents,
+                oomEvents,
+                oomKillEvents,
+                collectedAt);
+    }
+
     private static void requireMetric(double value, String name) {
-        if (Double.isFinite(value) && value < 0) {
+        if (!Double.isNaN(value) && (!Double.isFinite(value) || value < 0)) {
             throw new IllegalArgumentException(name + " must be non-negative or unavailable");
         }
     }
