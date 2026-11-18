@@ -49,6 +49,18 @@ Pass a properties file as the first argument to use a different configuration:
 Defaults are defined in [`config/bullseye.properties`](config/bullseye.properties). The
 default state output is `/run/bullseye/state.json`.
 
+Configuration is validated before the runtime starts. The metric window must be at least the
+longest CPU, memory, or IO escalation/recovery duration plus twice the sampling interval:
+
+```text
+window.duration >= longest diagnostic duration + 2 * sampling.interval
+```
+
+The extra interval preserves an observed sample before the duration boundary even when sampling
+does not align with it. For example, a 30-second recovery duration with 5-second sampling requires
+a window of at least 40 seconds; a 10-second window is rejected. The bundled production and
+Docker profiles already satisfy this requirement.
+
 ## Docker smoke test
 
 The Docker configuration uses a one-second sampling interval and deliberately sensitive CPU
@@ -159,7 +171,11 @@ Observation freshness is separate from pressure severity:
 
 Both startup grace and sample freshness use twice `bullseye.sampling.interval`. CPU requires
 usage, memory requires usage plus PSI some, and IO requires PSI some. CPU PSI and memory/IO PSI
-full are optional until first observed; if subsequently lost, their resource becomes stale.
+full are optional until first observed; if subsequently lost, their resource becomes stale and
+its diagnostic rule retains the last decision. Loss of that input cannot remove a recovery
+condition or increase severity by removing pressure corroboration. A host that has never supplied
+the optional PSI input continues to use the existing fallback behavior. Other resources continue
+to evaluate their own fresh inputs independently.
 The host logical CPU count is also tracked when available. It is required for CPU attribution,
 but not for the host CPU pressure rule. Its source is the `cpuN` rows in the same `/proc/stat`
 read as CPU usage, rather than the JVM's potentially quota-limited processor count.
@@ -171,11 +187,12 @@ tracked inputs, not the most recent sample of any metric. It is null until all r
 are available. A fresh CPU sample therefore cannot conceal missing memory or IO observations.
 
 Collection outages preserve the last diagnosis instead of reporting a false recovery. Memory
-attribution is not refreshed while its required host usage/PSI inputs are expired. CPU attribution
-requires fresh host usage and CPU count; a gap discards its CPU measurement baseline while
-retaining the last explanation until a new attempt. A resumed
-sample can restore observation freshness immediately, but escalation and recovery still need
-their configured continuous observation durations.
+attribution is not refreshed while its required host usage/PSI inputs or a previously observed
+host PSI full input are expired. CPU attribution requires fresh host usage and CPU count and
+also pauses when previously observed host CPU PSI expires. It discards its CPU measurement
+baseline while retaining the last explanation until a new attempt. A resumed sample can restore
+observation freshness immediately, but each applicable recovery condition still needs its full
+continuous observation period. Samples before a collection gap cannot complete that period.
 
 Consumers must also check the age of `evaluatedAt` against their heartbeat timeout (for example,
 a few sampling intervals). A stopped or blocked agent cannot rewrite its last `FRESH` file to
@@ -194,6 +211,13 @@ individual cgroup failures are isolated from host telemetry.
 - IO is based on sustained PSI stalls rather than throughput.
 - A sample gap greater than twice the sampling interval breaks a sustained run. Duration is
   measured between observed samples; time after the newest sample does not complete the run.
+- CPU and memory trend rules still require a rise greater than the configured HIGH minimum;
+  a flat high load alone does not satisfy that trend condition. Trend calculation uses the
+  shortest trailing qualifying sample run that covers the configured HIGH duration, anchored
+  to the newest observed sample. It does not reuse the entire rolling window's rise. Without
+  interpolating samples, this run may exceed the requested duration by up to one allowed sample
+  gap. Trend logs and their `duration` evidence report that actual interval, including fractional
+  seconds such as `10.127s`; non-trend sustained logs retain the configured minimum duration.
 - The highest active resource severity becomes host severity.
 - CPU and memory attribution run on `HIGH` entry, then every
   `bullseye.cgroup.attribution.refresh-interval` (default `30s`) while HIGH persists.

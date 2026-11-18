@@ -37,7 +37,12 @@ public final class IoPressureRule implements DiagnosticRule {
     public Optional<DiagnosticDecision> evaluate(DiagnosticContext context) {
         Optional<MetricSample> some = latest(context, MetricType.HOST_IO_PSI_SOME_AVG10);
         Optional<MetricSample> full = latest(context, MetricType.HOST_IO_PSI_FULL_AVG10);
-        if (some.isEmpty()) {
+        if (some.isEmpty()
+                || MetricConditions.hasExpired(
+                        context.metrics(),
+                        MetricType.HOST_IO_PSI_FULL_AVG10,
+                        context.evaluatedAt(),
+                        maximumSampleAge)) {
             return Optional.empty();
         }
 

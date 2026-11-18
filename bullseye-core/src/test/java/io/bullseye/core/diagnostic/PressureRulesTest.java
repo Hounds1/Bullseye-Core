@@ -63,6 +63,51 @@ class PressureRulesTest {
     }
 
     @Test
+    void oldPsiRiseDoesNotEscalateRecentlyFallingMemoryPressure() {
+        for (long time = 0; time <= 60_000; time += 5_000) {
+            double psi =
+                    time == 0 ? 20 : time < 50_000 ? 35 : 30 - (time - 50_000) / 2_500.0;
+            memory(time, 88, psi, 0);
+        }
+
+        DiagnosticDecision decision = evaluate(memoryRule, 60_000);
+
+        assertEquals(Severity.ELEVATED, decision.severity());
+        assertTrue(decision.evidence().stream()
+                .noneMatch(value -> value.metric().equals("trend")));
+    }
+
+    @Test
+    void memoryUsesRecentPsiRiseEvenWhenOlderPressureWasHigher() {
+        memory(0, 88, 35, 0);
+        memory(5_000, 88, 30, 0);
+        memory(10_000, 88, 28, 0);
+        memory(15_000, 88, 21, 0);
+        memory(20_000, 88, 23, 0);
+        memory(25_000, 88, 25, 0);
+
+        DiagnosticDecision decision = evaluate(memoryRule, 25_000);
+
+        assertEquals(Severity.HIGH, decision.severity());
+        assertTrue(decision.reason().contains("rise=+4.0pp/10s"));
+    }
+
+    @Test
+    void memoryTrendReportsActualSampleInterval() {
+        memory(0, 88, 21, 0);
+        memory(6_001, 88, 23, 0);
+        memory(12_002, 88, 25, 0);
+
+        DiagnosticDecision decision = evaluate(memoryRule, 12_002);
+
+        assertEquals(Severity.HIGH, decision.severity());
+        assertTrue(decision.reason().contains("rise=+4.0pp/12.002s"));
+        assertEquals(12.002, decision.evidence().stream()
+                .filter(value -> value.metric().equals("duration"))
+                .findFirst().orElseThrow().value(), 0.000001);
+    }
+
+    @Test
     void memoryHighToCriticalAcceptsFullPressure() {
         states.put(
                 ResourceType.HOST_MEMORY,
