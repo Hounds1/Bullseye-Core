@@ -366,12 +366,14 @@ public final class CgroupMonitor {
 
     private CgroupMemorySnapshot collectGroup(Path group, long now) throws IOException {
         long currentBytes = Long.parseLong(files.read(group.resolve("memory.current")).trim());
-        Long maxBytes = memoryMax(group.resolve("memory.max"));
+        Long highBytes = memoryLimit(group.resolve("memory.high"));
+        Long maxBytes = memoryLimit(group.resolve("memory.max"));
         PsiParser.Snapshot pressure = pressure(group.resolve("memory.pressure"));
         MemoryEvents events = memoryEvents(group.resolve("memory.events"));
         return new CgroupMemorySnapshot(
                 WorkloadIdentity.fromCgroupPath(cgroupPath(group)),
                 currentBytes,
+                highBytes,
                 maxBytes,
                 some(pressure),
                 full(pressure),
@@ -436,7 +438,7 @@ public final class CgroupMonitor {
         return value;
     }
 
-    private Long memoryMax(Path path) throws IOException {
+    private Long memoryLimit(Path path) throws IOException {
         String raw = optionalRead(path);
         if (raw == null || "max".equals(raw.trim())) {
             return null;

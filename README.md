@@ -89,9 +89,9 @@ for a smoke test, but it is not a substitute for the real Linux host validation 
   "primaryWorkload": "order-api.service",
   "workloadType": "SYSTEMD_SERVICE",
   "cgroupPath": "/system.slice/order-api.service",
-  "attributionConfidence": "HIGH",
+  "attributionConfidence": "MEDIUM",
   "attributionStatus": "IDENTIFIED",
-  "attributionScore": 65.775,
+  "attributionScore": 30.0,
   "attributionCollectedAt": 1788526800000,
   "attributionCoverage": {
     "complete": true,
@@ -102,7 +102,10 @@ for a smoke test, but it is not a substitute for the real Linux host validation 
   },
   "attributionEvidence": [
     {"metric": "memory.current", "value": 2147483648.0, "unit": "bytes"},
+    {"metric": "memory.high", "value": 3221225472.0, "unit": "bytes"},
+    {"metric": "limit.high.usage", "value": 66.66666666666666, "unit": "%"},
     {"metric": "memory.max", "value": 4294967296.0, "unit": "bytes"},
+    {"metric": "limit.max.usage", "value": 50.0, "unit": "%"},
     {"metric": "host.share", "value": 12.5, "unit": "%"},
     {"metric": "observation.duration", "value": 5000.0, "unit": "ms"},
     {"metric": "growth.bytes", "value": 1073741824.0, "unit": "bytes"},
@@ -113,10 +116,10 @@ for a smoke test, but it is not a substitute for the real Linux host validation 
     {"metric": "events.oom_kill.delta", "value": 0.0, "unit": "count"},
     {"metric": "psi.some.avg10", "value": 50.0, "unit": "%"},
     {"metric": "psi.full.avg10", "value": 2.0, "unit": "%"},
-    {"metric": "score.usage", "value": 12.5, "unit": "points"},
+    {"metric": "score.usage", "value": 8.125, "unit": "points"},
     {"metric": "score.growth", "value": 21.875, "unit": "points"},
-    {"metric": "score.pressure", "value": 30.0, "unit": "points"},
-    {"metric": "score.events", "value": 1.4, "unit": "points"}
+    {"metric": "score.pressure", "value": 0.0, "unit": "points"},
+    {"metric": "score.events", "value": 0.0, "unit": "points"}
   ],
   "evidence": [
     {"metric": "usage", "value": 88.1, "unit": "%"},
@@ -231,7 +234,8 @@ individual cgroup failures are isolated from host telemetry.
   timer. CPU and memory histories/timers are independent; both remain active while their own
   severity is HIGH/CRITICAL, even if the other resource is selected as primary.
 - cgroup discovery is cached and bounded. No background cgroup sampling executor is used.
-- Memory attribution combines host share, growth rate, PSI, and memory event deltas. CPU
+- Memory attribution ranks host memory share and growth rate. Memory limits, PSI, and events
+  explain the selected workload's condition without increasing its contribution score. CPU
   attribution ranks actual CPU consumption relative to host capacity. Similar candidates are
   retained with `LOW` confidence rather than overstating certainty.
 - Unsupported, denied, empty, and insufficient-data outcomes are represented explicitly.
@@ -247,21 +251,57 @@ source-announcement format are shared by CPU and memory attribution.
 
 ### Memory evidence
 
-The four score components sum to `attributionScore` (0 to 100):
+Memory attribution separates host consumption from pressure experienced inside a cgroup.
+Only accounted memory usage and positive growth contribute to `attributionScore` (0 to 100):
+
+```text
+hostShare = memory.current / host memory total
+growthSharePerSecond = growth.bytes-per-second / host memory total
+score.usage = 65 * clamp(hostShare, 0, 1)
+score.growth = 35 * clamp(growthSharePerSecond / 0.02, 0, 1)
+attributionScore = score.usage + score.growth
+```
 
 | Component | Maximum | Saturation point |
 | --- | ---: | --- |
-| `score.usage` | 25 | Workload uses 25% of host memory |
+| `score.usage` | 65 | Workload uses 100% of host memory; linear below that point |
 | `score.growth` | 35 | Positive growth of 2% of host memory per second |
-| `score.pressure` | 30 | PSI some avg10 reaches 50%, or full avg10 reaches 10% |
-| `score.events` | 10 | `high delta * 0.02 + max delta * 0.1 + oom delta * 0.5 + oom_kill delta` reaches 1 |
+| `score.pressure` | 0 | Compatibility field; PSI does not contribute points |
+| `score.events` | 0 | Compatibility field; memory events do not contribute points |
+
+The four score keys remain present, and their sum still equals `attributionScore`. A stable
+workload using 12 GiB on a 16 GiB host scores 48.75. A stable 64 MiB workload scores about 0.254,
+even if its own tight limit causes heavy PSI or repeated limit events. A large consumer can
+still be selected while it is also limited; limits neither increase nor reduce its score.
+The shared `bullseye.cgroup.attribution.minimum-score` default of 5 requires about 7.69% of
+host memory when there is no positive growth. Growth can qualify a smaller footprint. A zero
+score never identifies a workload, including when the configured minimum is zero.
 
 Growth uses byte delta divided by elapsed observation time. The same growth rate therefore
-receives the same growth score at different refresh intervals. Event impact uses counts since
-the previous valid snapshot, not events per second; `observation.duration` makes that interval
-explicit. Negative growth remains visible but contributes zero growth points. Reset event
-counters contribute zero delta. Without an earlier timestamp, growth/event deltas and interval
-are omitted and their scores are zero. Unavailable PSI or unlimited `memory.max` is omitted.
+receives the same growth score at different refresh intervals. Negative growth remains visible
+but contributes zero growth points. Event deltas report counts since the previous comparable
+snapshot; `observation.duration` makes that interval explicit. Reset event counters contribute
+zero delta. Without an earlier timestamp for the same workload, growth/event deltas and the
+interval are omitted, and growth contributes zero points. Current usage can still qualify a
+workload on its first snapshot.
+
+| Supporting evidence | Meaning |
+| --- | --- |
+| `memory.high`, `memory.max` | Finite limits configured on the selected cgroup, in bytes |
+| `limit.high.usage`, `limit.max.usage` | Current usage divided by that positive limit, as a percentage |
+| `psi.some.avg10`, `psi.full.avg10` | Available cgroup memory PSI averages over ten seconds |
+| `events.high.delta`, `events.max.delta`, `events.oom.delta`, `events.oom_kill.delta` | Observed event counter increases |
+
+Missing or unlimited limits are omitted. A zero limit remains visible in bytes, but its usage
+percentage is omitted to avoid division by zero. Limit percentages may exceed 100%; they
+describe the currently configured local values, not effective capacity after ancestor limits.
+Unavailable PSI is also omitted. These measurements do not classify the cause of pressure.
+
+`memory.high` can force reclaim within a cgroup, while `memory.max` can trigger a cgroup OOM;
+`oom_kill` can count a process killed by any OOM killer. Their presence does not establish a
+contribution to host memory pressure. See the [kernel memory controller documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files).
+`memory.current` also includes memory that may be reclaimable, such as page cache. The ranking
+is a consumption-based diagnostic heuristic, not a measurement of unreclaimable working set.
 
 ### CPU evidence
 
@@ -310,6 +350,8 @@ not presented as host CPU utilization percentages.
 Complete investigations retain the score/runner-up confidence policy: HIGH requires score >=45
 and a winner/runner ratio >=max(2, configured dominance ratio); MEDIUM requires score >=20 and
 the configured ratio; otherwise LOW. Tied scores use cgroup path order for stable selection.
+Confidence expresses the strength of this heuristic ranking and collection coverage; it is
+not a probability that the selected workload is the root cause.
 
 `attributionCoverage` reports successful and failed group reads, discovery failure, and discovery
 truncation at the depth/group bounds. Any incomplete investigation caps confidence at LOW.
@@ -336,7 +378,7 @@ Operational messages use short state announcements:
 [BULLSEYE] cgroup v2 detected.
 [BULLSEYE] Memory pressure detected. usage=82.4% psi.some=13.1% sustained=10s previous=NORMAL current=ELEVATED resource=HOST_MEMORY
 [BULLSEYE] Critical memory pressure detected. usage=88.1% psi.some=24.3% rise=+6.1pp/10s previous=ELEVATED current=HIGH resource=HOST_MEMORY
-[BULLSEYE] Pressure source identified. resource=HOST_MEMORY workload=order-api.service confidence=HIGH score=65.8
+[BULLSEYE] Pressure source identified. resource=HOST_MEMORY workload=order-api.service confidence=MEDIUM score=30.0
 [BULLSEYE] Pressure source identified. resource=HOST_CPU workload=worker.service confidence=HIGH score=60.0
 ```
 

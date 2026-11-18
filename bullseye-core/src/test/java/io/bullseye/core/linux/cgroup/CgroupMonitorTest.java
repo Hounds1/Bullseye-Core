@@ -3,8 +3,10 @@ package io.bullseye.core.linux.cgroup;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.bullseye.common.workload.WorkloadIdentity;
 import io.bullseye.core.config.BullseyeConfiguration;
 import io.bullseye.core.logging.BullseyeLogger;
 
@@ -64,6 +66,98 @@ class CgroupMonitorTest {
         assertTrue(result.coverage().complete());
         assertEquals(1, result.coverage().collectedGroups());
         assertEquals(0, result.collectedAt());
+    }
+
+    @Test
+    void collectsMemoryHighSeparatelyFromHardLimit() {
+        files.content.put(group.resolve("memory.high"), "900\n");
+
+        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+        CgroupMemorySnapshot snapshot = result.snapshots().getFirst();
+
+        assertEquals(900, snapshot.highBytes());
+        assertEquals(1_000, snapshot.maxBytes());
+        assertTrue(result.coverage().complete());
+    }
+
+    @Test
+    void unlimitedAndMissingMemoryHighRemainUnavailableWithoutCollectionFailure() {
+        CgroupMonitor.CollectionResult missing = monitor(512).collectMemory();
+        assertNull(missing.snapshots().getFirst().highBytes());
+        assertTrue(missing.coverage().complete());
+
+        files.content.put(group.resolve("memory.high"), "max\n");
+        CgroupMonitor.CollectionResult unlimited = monitor(512).collectMemory();
+
+        assertNull(unlimited.snapshots().getFirst().highBytes());
+        assertEquals(1_000, unlimited.snapshots().getFirst().maxBytes());
+        assertTrue(unlimited.coverage().complete());
+    }
+
+    @Test
+    void zeroMemoryHighIsAValidConfiguredBoundary() {
+        files.content.put(group.resolve("memory.high"), "0\n");
+
+        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+
+        assertEquals(0, result.snapshots().getFirst().highBytes());
+        assertTrue(result.coverage().complete());
+    }
+
+    @Test
+    void malformedAndNegativeMemoryHighMarkTheGroupAsFailed() {
+        for (String high : List.of("broken", "-1", "900 extra", "")) {
+            files.content.put(group.resolve("memory.high"), high);
+
+            CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+
+            assertTrue(result.snapshots().isEmpty());
+            assertEquals(1, result.coverage().failedGroups());
+            assertFalse(result.coverage().complete());
+        }
+    }
+
+    @Test
+    void deniedMemoryHighKeepsOtherGroupsAndMarksPartialCoverage() {
+        Path second = root.resolve("batch.service");
+        files.directories.put(root, List.of(group, second));
+        fixtureGroup(second, "400", "max", 2, 0, "high 0\n");
+        files.denied.add(group.resolve("memory.high"));
+
+        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+
+        assertEquals(CgroupMonitor.Status.AVAILABLE, result.status());
+        assertEquals("batch.service", result.snapshots().getFirst().workload().name());
+        assertEquals(1, result.coverage().collectedGroups());
+        assertEquals(1, result.coverage().failedGroups());
+        assertFalse(result.coverage().complete());
+    }
+
+    @Test
+    void legacyMemorySnapshotConstructorLeavesHighUnavailable() {
+        CgroupMemorySnapshot snapshot = new CgroupMemorySnapshot(
+                WorkloadIdentity.fromCgroupPath("/test.service"),
+                800, 1_000L, 20, 3, 4, 2, 1, 0, 5_000);
+
+        assertNull(snapshot.highBytes());
+        assertEquals(1_000, snapshot.maxBytes());
+        assertEquals(5_000, snapshot.collectedAt());
+    }
+
+    @Test
+    void memorySnapshotRejectsInfinitePressureButAcceptsUnavailablePressure() {
+        WorkloadIdentity workload = WorkloadIdentity.fromCgroupPath("/test.service");
+        for (double invalid : List.of(Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY)) {
+            assertThrows(IllegalArgumentException.class, () -> new CgroupMemorySnapshot(
+                    workload, 800, null, null, invalid, 0, 0, 0, 0, 0, 0));
+            assertThrows(IllegalArgumentException.class, () -> new CgroupMemorySnapshot(
+                    workload, 800, null, null, 0, invalid, 0, 0, 0, 0, 0));
+        }
+
+        CgroupMemorySnapshot unavailable = new CgroupMemorySnapshot(
+                workload, 800, null, null, Double.NaN, Double.NaN, 0, 0, 0, 0, 0);
+        assertTrue(Double.isNaN(unavailable.psiSome()));
+        assertTrue(Double.isNaN(unavailable.psiFull()));
     }
 
     @Test
