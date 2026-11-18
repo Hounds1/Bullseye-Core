@@ -2,8 +2,8 @@
 
 Bullseye Core is a standalone Linux host diagnostics agent. It reads host metrics and
 Linux PSI from `/proc`, evaluates sustained CPU, memory, and IO pressure, and uses bounded
-cgroup v2 memory collection to locate a likely workload source. Current state is published as an
-atomically replaced JSON file.
+cgroup v2 CPU and memory collection to locate a likely workload source. Current state is
+published as an atomically replaced JSON file.
 
 Bullseye observes and publishes state. It does not throttle traffic, modify application
 behavior, or depend on an external database.
@@ -116,7 +116,10 @@ for a smoke test, but it is not a substitute for the real Linux host validation 
     "HOST_CPU": {
       "status": "FRESH",
       "lastSampleAt": 1788526810000,
-      "metrics": [{"metric": "HOST_CPU_USAGE", "value": 15.2, "unit": "%"}]
+      "metrics": [
+        {"metric": "HOST_CPU_USAGE", "value": 15.2, "unit": "%"},
+        {"metric": "HOST_CPU_LOGICAL_COUNT", "value": 8.0, "unit": "count"}
+      ]
     },
     "HOST_MEMORY": {
       "status": "FRESH",
@@ -151,19 +154,26 @@ it can refer to an earlier decision while hysteresis retains that diagnosis. Use
 Observation freshness is separate from pressure severity:
 
 - `INITIALIZING`: required inputs have not all arrived within the startup grace period.
-- `FRESH`: required inputs and previously observed optional PSI inputs are current.
+- `FRESH`: required inputs and previously observed optional inputs are current.
 - `STALE`: a tracked input expired, or required inputs are still missing after startup grace.
 
 Both startup grace and sample freshness use twice `bullseye.sampling.interval`. CPU requires
 usage, memory requires usage plus PSI some, and IO requires PSI some. CPU PSI and memory/IO PSI
 full are optional until first observed; if subsequently lost, their resource becomes stale.
+The host logical CPU count is also tracked when available. It is required for CPU attribution,
+but not for the host CPU pressure rule. Its source is the `cpuN` rows in the same `/proc/stat`
+read as CPU usage, rather than the JVM's potentially quota-limited processor count.
+Changes to that count or rollback of aggregate CPU ticks skip one host CPU usage sample to
+establish a new baseline; CPU count, memory, and load metrics continue to be published.
 Aggregate status is stale if any configured resource is stale, otherwise initializing if any
 resource is initializing. `lastSampleAt` is the oldest latest timestamp across that resource's
 tracked inputs, not the most recent sample of any metric. It is null until all required inputs
 are available. A fresh CPU sample therefore cannot conceal missing memory or IO observations.
 
 Collection outages preserve the last diagnosis instead of reporting a false recovery. Memory
-attribution is not refreshed while its required host usage/PSI inputs are expired. A resumed
+attribution is not refreshed while its required host usage/PSI inputs are expired. CPU attribution
+requires fresh host usage and CPU count; a gap discards its CPU measurement baseline while
+retaining the last explanation until a new attempt. A resumed
 sample can restore observation freshness immediately, but escalation and recovery still need
 their configured continuous observation durations.
 
@@ -185,24 +195,33 @@ individual cgroup failures are isolated from host telemetry.
 - A sample gap greater than twice the sampling interval breaks a sustained run. Duration is
   measured between observed samples; time after the newest sample does not complete the run.
 - The highest active resource severity becomes host severity.
-- Memory attribution runs immediately on `HIGH` entry, then every
+- CPU and memory attribution run on `HIGH` entry, then every
   `bullseye.cgroup.attribution.refresh-interval` (default `30s`) while HIGH persists.
   Failed/empty attempts retry on the same interval. `CRITICAL` rechecks on every fresh evaluation.
+  CPU needs two snapshots to measure usage: `INSUFFICIENT_DATA` retries on the next fresh host
+  sample instead of waiting for the refresh interval. Repeated evaluations of the same host CPU
+  sample do not collect another CPU snapshot.
   Actual execution is aligned to diagnostic evaluations, so shorter settings do not increase
   the host sampling rate. Stale host inputs defer attempts without advancing the refresh timer.
-- Recovery below HIGH clears attribution, previous cgroup samples, and the refresh timer.
+- Recovery below HIGH clears that resource's attribution, previous cgroup samples, and refresh
+  timer. CPU and memory histories/timers are independent; both remain active while their own
+  severity is HIGH/CRITICAL, even if the other resource is selected as primary.
 - cgroup discovery is cached and bounded. No background cgroup sampling executor is used.
-- Attribution combines host share, memory growth rate, memory PSI, and memory event deltas. Similar
-  candidates are retained with `LOW` confidence rather than overstating certainty.
+- Memory attribution combines host share, growth rate, PSI, and memory event deltas. CPU
+  attribution ranks actual CPU consumption relative to host capacity. Similar candidates are
+  retained with `LOW` confidence rather than overstating certainty.
 - Unsupported, denied, empty, and insufficient-data outcomes are represented explicitly.
 
-## Memory attribution evidence
+## Attribution evidence
 
 `attributionEvidence` explains the selected workload; top-level `evidence` explains host severity.
 `attributionCollectedAt` is the last attribution collection/attempt time, which may be older than
 the heartbeat's `evaluatedAt` while HIGH reuses its cached result. Before any attempt, coverage
 and collection time are null and attribution evidence is empty. Failed attempts still publish
-their coverage and collection time, with no selected-workload evidence.
+their coverage and collection time, with no selected-workload evidence. The JSON fields and
+source-announcement format are shared by CPU and memory attribution.
+
+### Memory evidence
 
 The four score components sum to `attributionScore` (0 to 100):
 
@@ -220,6 +239,50 @@ explicit. Negative growth remains visible but contributes zero growth points. Re
 counters contribute zero delta. Without an earlier timestamp, growth/event deltas and interval
 are omitted and their scores are zero. Unavailable PSI or unlimited `memory.max` is omitted.
 
+### CPU evidence
+
+CPU usage is calculated from two `cpu.stat` snapshots with increasing collection timestamps:
+
+```text
+cpu.usage.cores = delta usage_usec / elapsed microseconds
+host.share = cpu.usage.cores / host.cpu.count * 100
+score.usage = min(100, host.share)
+attributionScore = score.usage
+```
+
+For example, using two cores on an eight-core host contributes 25% of host CPU capacity and
+scores 25 points. The shared `bullseye.cgroup.attribution.minimum-score` default of 5 therefore
+requires at least 5% of host capacity for CPU attribution. `cpu.pressure`, local quota usage,
+and throttling are supporting evidence only; they do not increase the score. A workload that
+exhausts a small CPU quota is not automatically the source of host CPU saturation.
+
+| Evidence | Meaning |
+| --- | --- |
+| `cpu.usage.cores`, `host.cpu.count`, `host.share` | Used cores, host logical CPUs, and host capacity share |
+| `usage.delta`, `user.delta`, `system.delta` | CPU time consumed during the observation interval, in microseconds |
+| `observation.duration` | Time between the two cgroup snapshots, in milliseconds |
+| `quota.cores`, `quota.usage` | Local `cpu.max` quota/period and usage relative to that quota |
+| `throttling.periods.delta`, `throttling.throttled-periods.delta` | Scheduling period and throttled period counter deltas |
+| `throttling.duration.delta` | Reported throttled time delta, in microseconds |
+| `psi.some.avg10` | Current cgroup CPU PSI some average over ten seconds |
+| `score.usage` | CPU contribution score |
+| `candidates.measured`, `candidates.unmeasured` | Collected groups with and without a usable earlier CPU snapshot |
+
+First observations, CPU counter rollback, non-increasing timestamps, and observation intervals
+longer than the refresh interval plus host sample freshness cannot supply a usage delta.
+New groups, host collection gaps, CPU capacity changes, and recovery require a new baseline.
+If there is no qualifying measured candidate and any group is unmeasured, attribution is
+`INSUFFICIENT_DATA`; otherwise measurable usage below the threshold yields `NO_CANDIDATE`.
+An identified winner is capped at LOW confidence while any collected group is unmeasured.
+
+Missing optional CPU PSI, `cpu.max`, or throttling fields are omitted from evidence. Unlimited
+quota omits quota evidence; a changed quota omits `quota.usage` for that interval. Quota evidence
+describes the cgroup's own configured limit, not effective capacity after ancestor limits or
+cpuset restrictions. Throttling deltas require both endpoints and monotonic counters, and are
+not presented as host CPU utilization percentages.
+
+### Confidence and collection coverage
+
 Complete investigations retain the score/runner-up confidence policy: HIGH requires score >=45
 and a winner/runner ratio >=max(2, configured dominance ratio); MEDIUM requires score >=20 and
 the configured ratio; otherwise LOW. Tied scores use cgroup path order for stable selection.
@@ -234,6 +297,7 @@ cgroup access failures are retried on later attribution attempts.
 
 Completeness describes the configured, visible cgroup tree. An isolated Docker cgroup namespace
 does not reveal sibling containers; use a host-visible cgroup tree for cross-container attribution.
+Both resources use discovered leaf candidates so parent and child counters are not ranked twice.
 Score, evidence, collection-time and coverage-only updates refresh JSON without advancing the
 diagnostic version or generating repeated source announcements. Workload/confidence/status changes
 still produce transitions. Incomplete investigations include `coverage=PARTIAL` in source logs.
@@ -249,6 +313,7 @@ Operational messages use short state announcements:
 [BULLSEYE] Memory pressure detected. usage=82.4% psi.some=13.1% sustained=10s previous=NORMAL current=ELEVATED resource=HOST_MEMORY
 [BULLSEYE] Critical memory pressure detected. usage=88.1% psi.some=24.3% rise=+6.1pp/10s previous=ELEVATED current=HIGH resource=HOST_MEMORY
 [BULLSEYE] Pressure source identified. resource=HOST_MEMORY workload=order-api.service confidence=HIGH score=65.8
+[BULLSEYE] Pressure source identified. resource=HOST_CPU workload=worker.service confidence=HIGH score=60.0
 ```
 
 ## Real Linux validation

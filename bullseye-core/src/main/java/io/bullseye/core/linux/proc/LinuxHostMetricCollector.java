@@ -20,6 +20,7 @@ public final class LinuxHostMetricCollector implements MetricCollector {
     private final ProcFileSource source;
     private final Clock clock;
     private CpuTicks previousCpuTicks;
+    private int previousLogicalCpuCount;
 
     public LinuxHostMetricCollector(ProcFileSource source, Clock clock) {
         this.source = Objects.requireNonNull(source, "source");
@@ -34,14 +35,18 @@ public final class LinuxHostMetricCollector implements MetricCollector {
     @Override
     public synchronized Collection<MetricSample> collect() throws Exception {
         long timestamp = clock.millis();
-        CpuTicks currentCpuTicks = ProcStatParser.parseCpuTicks(source.read(PROC_STAT));
+        String cpuStat = source.read(PROC_STAT);
+        CpuTicks currentCpuTicks = ProcStatParser.parseCpuTicks(cpuStat);
+        int logicalCpuCount = ProcStatParser.parseLogicalCpuCount(cpuStat);
         String memoryInfo = source.read(PROC_MEMINFO);
         double memoryUsage = MemInfoParser.parseUsagePercentage(memoryInfo);
         long totalMemoryBytes = MemInfoParser.parseTotalBytes(memoryInfo);
         double loadAverage = LoadAverageParser.parseOneMinuteLoad(source.read(PROC_LOADAVG));
 
-        List<MetricSample> samples = new ArrayList<>(4);
-        if (previousCpuTicks != null) {
+        List<MetricSample> samples = new ArrayList<>(5);
+        if (previousCpuTicks != null
+                && logicalCpuCount == previousLogicalCpuCount
+                && comparableTicks(currentCpuTicks, previousCpuTicks)) {
             samples.add(
                     new MetricSample(
                             MetricType.HOST_CPU_USAGE,
@@ -49,10 +54,22 @@ public final class LinuxHostMetricCollector implements MetricCollector {
                             timestamp));
         }
         previousCpuTicks = currentCpuTicks;
+        previousLogicalCpuCount = logicalCpuCount;
+        if (logicalCpuCount > 0) {
+            samples.add(
+                    new MetricSample(
+                            MetricType.HOST_CPU_LOGICAL_COUNT, logicalCpuCount, timestamp));
+        }
         samples.add(new MetricSample(MetricType.HOST_MEMORY_USAGE, memoryUsage, timestamp));
         samples.add(
                 new MetricSample(MetricType.HOST_MEMORY_TOTAL_BYTES, totalMemoryBytes, timestamp));
         samples.add(new MetricSample(MetricType.HOST_LOAD_AVERAGE, loadAverage, timestamp));
         return List.copyOf(samples);
+    }
+
+    private static boolean comparableTicks(CpuTicks current, CpuTicks previous) {
+        long totalDelta = current.total() - previous.total();
+        long idleDelta = current.idle() - previous.idle();
+        return totalDelta > 0 && idleDelta >= 0 && idleDelta <= totalDelta;
     }
 }

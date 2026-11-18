@@ -30,13 +30,18 @@ public final class DiagnosticCoordinator {
     private final DiagnosticStateRepository stateRepository;
     private final Supplier<String> eventIdSupplier;
     private final MemoryPressureAttributor memoryAttributor;
+    private final CpuPressureAttributor cpuAttributor;
     private final Duration maximumSampleAge;
     private final long attributionRefreshMillis;
     private final long startedAt;
     private final EnumMap<ResourceType, DiagnosticDecision> resourceStates =
             new EnumMap<>(ResourceType.class);
     private WorkloadAttribution memoryAttribution = WorkloadAttribution.unresolved();
-    private Long lastAttributionAt;
+    private WorkloadAttribution cpuAttribution = WorkloadAttribution.unresolved();
+    private Long lastMemoryAttributionAt;
+    private Long lastCpuAttributionAt;
+    private Long lastCpuInputAt;
+    private int previousHostCpuCount;
 
     public DiagnosticCoordinator(
             MetricWindow metricWindow,
@@ -86,11 +91,32 @@ public final class DiagnosticCoordinator {
             MemoryPressureAttributor memoryAttributor,
             Duration maximumSampleAge,
             Duration attributionRefreshInterval) {
+        this(
+                metricWindow,
+                engine,
+                stateRepository,
+                eventIdSupplier,
+                memoryAttributor,
+                null,
+                maximumSampleAge,
+                attributionRefreshInterval);
+    }
+
+    public DiagnosticCoordinator(
+            MetricWindow metricWindow,
+            DiagnosticEngine engine,
+            DiagnosticStateRepository stateRepository,
+            Supplier<String> eventIdSupplier,
+            MemoryPressureAttributor memoryAttributor,
+            CpuPressureAttributor cpuAttributor,
+            Duration maximumSampleAge,
+            Duration attributionRefreshInterval) {
         this.metricWindow = Objects.requireNonNull(metricWindow, "metricWindow");
         this.engine = Objects.requireNonNull(engine, "engine");
         this.stateRepository = Objects.requireNonNull(stateRepository, "stateRepository");
         this.eventIdSupplier = Objects.requireNonNull(eventIdSupplier, "eventIdSupplier");
         this.memoryAttributor = memoryAttributor;
+        this.cpuAttributor = cpuAttributor;
         this.maximumSampleAge = Objects.requireNonNull(maximumSampleAge, "maximumSampleAge");
         if (maximumSampleAge.toMillis() < 1) {
             throw new IllegalArgumentException("maximumSampleAge must be positive");
@@ -115,6 +141,8 @@ public final class DiagnosticCoordinator {
         }
         if (current.resource() == ResourceType.HOST_MEMORY) {
             memoryAttribution = current.attribution();
+        } else if (current.resource() == ResourceType.HOST_CPU) {
+            cpuAttribution = current.attribution();
         }
     }
 
@@ -124,11 +152,13 @@ public final class DiagnosticCoordinator {
             throw new IllegalArgumentException("evaluation time must not move backwards");
         }
         DiagnosticDecision previousMemory = memoryState(resourceStates);
+        DiagnosticDecision previousCpu = cpuState(resourceStates);
         DiagnosticEngine.Evaluation evaluation =
                 engine.evaluate(
                         new DiagnosticContext(
                                 metricWindow, previous, Map.copyOf(resourceStates), evaluatedAt));
         DiagnosticDecision currentMemory = memoryState(evaluation.resourceStates());
+        DiagnosticDecision currentCpu = cpuState(evaluation.resourceStates());
         resourceStates.clear();
         resourceStates.putAll(evaluation.resourceStates());
 
@@ -137,8 +167,13 @@ public final class DiagnosticCoordinator {
                 primary.severity() == Severity.NORMAL ? ResourceType.UNKNOWN : primary.resource();
         ResourceState snapshotState =
                 primary.severity() == Severity.NORMAL ? ResourceState.NORMAL : primary.state();
-        WorkloadAttribution attribution =
-                attribution(previousMemory, currentMemory, primary, evaluatedAt);
+        updateMemoryAttribution(previousMemory, currentMemory, evaluatedAt);
+        updateCpuAttribution(previousCpu, currentCpu, evaluatedAt);
+        WorkloadAttribution attribution = switch (snapshotResource) {
+            case HOST_MEMORY -> memoryAttribution;
+            case HOST_CPU -> cpuAttribution;
+            default -> WorkloadAttribution.unresolved();
+        };
 
         boolean changed =
                 !sameState(previous, primary, snapshotResource, snapshotState, attribution);
@@ -214,7 +249,8 @@ public final class DiagnosticCoordinator {
                             : Math.min(lastSampleAt, sample.timestamp());
             // Expired values are deliberately omitted from current telemetry.
             if (fresh) {
-                metrics.add(new DiagnosticEvidence(type.name(), sample.value(), "%"));
+                String unit = type == MetricType.HOST_CPU_LOGICAL_COUNT ? "count" : "%";
+                metrics.add(new DiagnosticEvidence(type.name(), sample.value(), unit));
             }
         }
         ObservationStatus status;
@@ -240,7 +276,8 @@ public final class DiagnosticCoordinator {
 
     private static List<MetricType> optionalMetrics(ResourceType resource) {
         return switch (resource) {
-            case HOST_CPU -> List.of(MetricType.HOST_CPU_PSI_SOME_AVG10);
+            case HOST_CPU ->
+                    List.of(MetricType.HOST_CPU_PSI_SOME_AVG10, MetricType.HOST_CPU_LOGICAL_COUNT);
             case HOST_MEMORY -> List.of(MetricType.HOST_MEMORY_PSI_FULL_AVG10);
             case DISK_IO -> List.of(MetricType.HOST_IO_PSI_FULL_AVG10);
             default -> List.of();
@@ -261,10 +298,9 @@ public final class DiagnosticCoordinator {
         return ObservationStatus.FRESH;
     }
 
-    private WorkloadAttribution attribution(
+    private void updateMemoryAttribution(
             DiagnosticDecision previousMemory,
             DiagnosticDecision currentMemory,
-            DiagnosticDecision primary,
             long evaluatedAt) {
         if (memoryAttributor == null
                 || currentMemory.severity().ordinal() < Severity.HIGH.ordinal()) {
@@ -273,8 +309,8 @@ public final class DiagnosticCoordinator {
                 memoryAttributor.reset();
             }
             memoryAttribution = WorkloadAttribution.unresolved();
-            lastAttributionAt = null;
-            return WorkloadAttribution.unresolved();
+            lastMemoryAttributionAt = null;
+            return;
         }
 
         boolean highEntry =
@@ -282,8 +318,8 @@ public final class DiagnosticCoordinator {
                         && previousMemory.severity() != Severity.HIGH;
         boolean critical = currentMemory.severity() == Severity.CRITICAL;
         boolean refreshDue =
-                lastAttributionAt == null
-                        || evaluatedAt - lastAttributionAt >= attributionRefreshMillis;
+                lastMemoryAttributionAt == null
+                        || evaluatedAt - lastMemoryAttributionAt >= attributionRefreshMillis;
         boolean fresh =
                 requiredMetrics(ResourceType.HOST_MEMORY).stream()
                         .allMatch(
@@ -291,12 +327,77 @@ public final class DiagnosticCoordinator {
                                                 metricWindow, type, evaluatedAt, maximumSampleAge)
                                         .isPresent());
         if ((highEntry || critical || refreshDue) && fresh) {
-            lastAttributionAt = evaluatedAt;
+            lastMemoryAttributionAt = evaluatedAt;
             memoryAttribution = memoryAttributor.attribute(latestHostMemoryTotal(evaluatedAt));
         }
-        return primary.resource() == ResourceType.HOST_MEMORY
-                ? memoryAttribution
-                : WorkloadAttribution.unresolved();
+    }
+
+    private void updateCpuAttribution(
+            DiagnosticDecision previousCpu,
+            DiagnosticDecision currentCpu,
+            long evaluatedAt) {
+        if (cpuAttributor == null || currentCpu.severity().ordinal() < Severity.HIGH.ordinal()) {
+            if (cpuAttributor != null
+                    && previousCpu.severity().ordinal() >= Severity.HIGH.ordinal()) {
+                resetCpuHistory();
+            }
+            cpuAttribution = WorkloadAttribution.unresolved();
+            return;
+        }
+
+        Optional<MetricSample> usage = MetricConditions.latest(
+                metricWindow, MetricType.HOST_CPU_USAGE, evaluatedAt, maximumSampleAge);
+        int hostCpuCount = latestHostCpuCount(evaluatedAt);
+        if (usage.isEmpty() || hostCpuCount == 0) {
+            // Keep the last explanation while telemetry is stale, but never bridge the gap.
+            if (lastCpuInputAt != null) {
+                resetCpuHistory();
+            }
+            return;
+        }
+        long inputAt = usage.orElseThrow().timestamp();
+        boolean inputGap =
+                lastCpuInputAt != null
+                        && inputAt - lastCpuInputAt > maximumSampleAge.toMillis();
+        boolean capacityChanged = previousHostCpuCount != 0 && previousHostCpuCount != hostCpuCount;
+        if (inputGap || capacityChanged) {
+            resetCpuHistory();
+        }
+        boolean newInput = lastCpuInputAt == null || inputAt > lastCpuInputAt;
+        lastCpuInputAt = inputAt;
+        previousHostCpuCount = hostCpuCount;
+
+        boolean highEntry = currentCpu.severity() == Severity.HIGH
+                && previousCpu.severity() != Severity.HIGH;
+        boolean critical = currentCpu.severity() == Severity.CRITICAL;
+        boolean refreshDue = lastCpuAttributionAt == null
+                || evaluatedAt - lastCpuAttributionAt >= attributionRefreshMillis;
+        boolean baselineNeeded =
+                cpuAttribution.status() == WorkloadAttribution.Status.INSUFFICIENT_DATA;
+        if (newInput && (highEntry || critical || refreshDue || baselineNeeded)) {
+            lastCpuAttributionAt = evaluatedAt;
+            cpuAttribution = cpuAttributor.attribute(hostCpuCount);
+        }
+    }
+
+    private void resetCpuHistory() {
+        cpuAttributor.reset();
+        lastCpuAttributionAt = null;
+        lastCpuInputAt = null;
+        previousHostCpuCount = 0;
+    }
+
+    private int latestHostCpuCount(long evaluatedAt) {
+        return MetricConditions.latest(
+                        metricWindow,
+                        MetricType.HOST_CPU_LOGICAL_COUNT,
+                        evaluatedAt,
+                        maximumSampleAge)
+                .filter(sample -> sample.value() >= 1
+                        && sample.value() <= Integer.MAX_VALUE
+                        && sample.value() == Math.rint(sample.value()))
+                .map(sample -> (int) sample.value())
+                .orElse(0);
     }
 
     private long latestHostMemoryTotal(long evaluatedAt) {
@@ -313,6 +414,12 @@ public final class DiagnosticCoordinator {
         return states.getOrDefault(
                 ResourceType.HOST_MEMORY,
                 DiagnosticDecision.normal(ResourceType.HOST_MEMORY, "Memory condition nominal."));
+    }
+
+    private static DiagnosticDecision cpuState(Map<ResourceType, DiagnosticDecision> states) {
+        return states.getOrDefault(
+                ResourceType.HOST_CPU,
+                DiagnosticDecision.normal(ResourceType.HOST_CPU, "CPU condition nominal."));
     }
 
     private static boolean sameState(
