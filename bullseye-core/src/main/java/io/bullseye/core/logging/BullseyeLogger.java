@@ -1,5 +1,7 @@
 package io.bullseye.core.logging;
 
+import io.bullseye.common.diagnostic.DiagnosticSnapshot.ResourceDiagnosis;
+import io.bullseye.common.diagnostic.ResourceType;
 import io.bullseye.common.diagnostic.Severity;
 import io.bullseye.common.workload.WorkloadAttribution;
 import io.bullseye.core.diagnostic.DiagnosticTransition;
@@ -31,46 +33,76 @@ public final class BullseyeLogger {
     }
 
     public void transition(DiagnosticTransition transition) {
-        status(
-                transition.event().reason()
-                        + " previous="
-                        + transition.previous().severity()
-                        + " current="
-                        + transition.current().severity()
-                        + " resource="
-                        + transition.event().resource());
+        if (!transition.current().resources().isEmpty()) {
+            resourceTransitions(transition);
+            return;
+        }
 
+        announceState(
+                transition.event().reason(),
+                transition.previous().severity(),
+                transition.current().severity(),
+                transition.event().resource());
         if (attributionChanged(transition)) {
-            if (transition.current().attribution().resolved()) {
-                String announcement =
-                        transition.current().severity() == Severity.CRITICAL
-                                        && transition.current().attribution().confidence()
-                                                == WorkloadAttribution.Confidence.HIGH
-                                ? "Critical workload identified."
-                                : "Pressure source identified.";
-                status(
-                        announcement
-                                + " resource="
-                                + transition.current().resource()
-                                + " workload="
-                                + transition.current().attribution().workload().name()
-                                + " confidence="
-                                + transition.current().attribution().confidence()
-                                + " score="
-                                + String.format(
-                                        Locale.ROOT,
-                                        "%.1f",
-                                        transition.current().attribution().score())
-                                + coverageSuffix(transition.current().attribution().coverage()));
-            } else if (transition.current().attribution().status()
-                    != WorkloadAttribution.Status.NOT_ATTEMPTED) {
-                status(
-                        "Pressure source attribution unavailable. resource="
-                                + transition.current().resource()
-                                + " reason="
-                                + transition.current().attribution().status()
-                                + coverageSuffix(transition.current().attribution().coverage()));
+            announceAttribution(
+                    transition.current().resource(),
+                    transition.current().severity(),
+                    transition.current().attribution());
+        }
+    }
+
+    private void resourceTransitions(DiagnosticTransition transition) {
+        boolean primaryStateAnnounced = false;
+        for (ResourceType resource : ResourceType.values()) {
+            ResourceDiagnosis current = transition.current().resources().get(resource);
+            if (current == null) {
+                continue;
             }
+            ResourceDiagnosis previous = transition.previous().diagnosis(resource);
+            boolean stateChanged = previous.severity() != current.severity()
+                    || previous.state() != current.state();
+            if (stateChanged) {
+                announceState(current.reason(), previous.severity(), current.severity(), resource);
+                primaryStateAnnounced |= resource == transition.current().resource();
+            }
+            if (current.severity().ordinal() >= Severity.HIGH.ordinal()
+                    && (previous.severity().ordinal() < Severity.HIGH.ordinal()
+                            || !previous.attribution().sameSourceAs(current.attribution()))) {
+                announceAttribution(resource, current.severity(), current.attribution());
+            }
+        }
+
+        if (transition.previous().resource() != transition.current().resource()
+                && transition.current().resource() != ResourceType.UNKNOWN
+                && !primaryStateAnnounced) {
+            status("Primary resource reassigned. previous=" + transition.previous().resource()
+                    + " current=" + transition.current().resource()
+                    + " severity=" + transition.current().severity());
+        }
+    }
+
+    private void announceState(
+            String reason, Severity previous, Severity current, ResourceType resource) {
+        status(reason + " previous=" + previous + " current=" + current + " resource=" + resource);
+    }
+
+    private void announceAttribution(
+            ResourceType resource, Severity severity, WorkloadAttribution attribution) {
+        if (attribution.resolved()) {
+            String announcement = severity == Severity.CRITICAL
+                            && attribution.confidence() == WorkloadAttribution.Confidence.HIGH
+                    ? "Critical workload identified."
+                    : "Pressure source identified.";
+            status(announcement
+                    + " resource=" + resource
+                    + " workload=" + attribution.workload().name()
+                    + " confidence=" + attribution.confidence()
+                    + " score=" + String.format(Locale.ROOT, "%.1f", attribution.score())
+                    + coverageSuffix(attribution.coverage()));
+        } else if (attribution.status() != WorkloadAttribution.Status.NOT_ATTEMPTED) {
+            status("Pressure source attribution unavailable. resource=" + resource
+                    + " reason=" + attribution.status()
+                    + coverageSuffix(attribution.coverage()));
         }
     }
 
@@ -104,15 +136,7 @@ public final class BullseyeLogger {
         if (transition.current().severity().ordinal() < Severity.HIGH.ordinal()) {
             return false;
         }
-        return !transition
-                        .previous()
-                        .attribution()
-                        .workload()
-                        .equals(transition.current().attribution().workload())
-                || transition.previous().attribution().confidence()
-                        != transition.current().attribution().confidence()
-                || transition.previous().attribution().status()
-                        != transition.current().attribution().status()
+        return !transition.previous().attribution().sameSourceAs(transition.current().attribution())
                 || transition.previous().resource() != transition.current().resource()
                 || transition.previous().severity().ordinal() < Severity.HIGH.ordinal();
     }

@@ -79,6 +79,10 @@ for a smoke test, but it is not a substitute for the real Linux host validation 
 
 ## State output
 
+The top-level fields summarize the primary diagnosis. `resources` publishes every configured
+resource's diagnosis and workload attribution, including resources that are not primary. The
+example below abbreviates the per-resource evidence and attribution fields for readability.
+
 ```json
 {
   "host": "was-01",
@@ -150,6 +154,37 @@ for a smoke test, but it is not a substitute for the real Linux host validation 
       "metrics": [{"metric": "HOST_IO_PSI_SOME_AVG10", "value": 0.0, "unit": "%"}]
     }
   },
+  "resources": {
+    "HOST_CPU": {
+      "severity": "NORMAL",
+      "state": "NORMAL",
+      "reason": "CPU condition nominal.",
+      "since": 1788526700000,
+      "evidence": [],
+      "primaryWorkload": "UNKNOWN",
+      "attributionStatus": "NOT_ATTEMPTED"
+    },
+    "HOST_MEMORY": {
+      "severity": "HIGH",
+      "state": "SATURATION_RISK",
+      "reason": "Critical memory pressure detected.",
+      "since": 1788526800000,
+      "evidence": [{"metric": "usage", "value": 88.1, "unit": "%"}],
+      "primaryWorkload": "order-api.service",
+      "attributionStatus": "IDENTIFIED",
+      "attributionConfidence": "MEDIUM",
+      "attributionScore": 30.0
+    },
+    "DISK_IO": {
+      "severity": "NORMAL",
+      "state": "NORMAL",
+      "reason": "IO condition nominal.",
+      "since": 1788526700000,
+      "evidence": [],
+      "primaryWorkload": "UNKNOWN",
+      "attributionStatus": "NOT_ATTEMPTED"
+    }
+  },
   "since": 1788526800000,
   "version": 12
 }
@@ -157,9 +192,28 @@ for a smoke test, but it is not a substitute for the real Linux host validation 
 
 State is written to a temporary sibling file, flushed, and atomically moved over the current
 snapshot. Every completed diagnostic evaluation refreshes the snapshot, even without a state
-transition. The version and `since` change only when severity, primary resource, resource state,
-primary workload, confidence, or attribution status changes. Heartbeats, score-only changes, and
-observation-status changes do not increment the version or emit duplicate diagnostic transitions.
+transition. `version` advances once per evaluation when the primary result or any resource's
+severity, state, workload, attribution confidence, or attribution status changes. A secondary
+memory or IO transition therefore advances the version even while CPU remains primary.
+Top-level `since` changes only with the primary result; each `resources.<resource>.since` changes
+only with that resource's diagnostic result, including source/confidence/status changes. Merely
+selecting a different primary does not reset the underlying resources' `since` values.
+Heartbeats, evidence/reason text, scores, collection timestamps, coverage, and observation-status
+changes alone refresh JSON without advancing the version or emitting diagnostic transitions.
+
+Every resource entry includes `severity`, `state`, `reason`, `since`, and diagnostic `evidence`,
+plus the same flat attribution fields as the top-level summary: `primaryWorkload`, `workloadType`,
+`cgroupPath`, `attributionConfidence`, `attributionStatus`, `attributionScore`,
+`attributionCollectedAt`, `attributionCoverage`, and `attributionEvidence`. Here `primaryWorkload`
+means the leading candidate for that resource. CPU, memory, and IO can identify different
+workloads in the same snapshot. The summary continues to use the existing primary-selection
+and hysteresis policy.
+
+Read each diagnosis with the corresponding `observations.<resource>.status` and `lastSampleAt`.
+A retained diagnosis can be stale; a NORMAL entry during startup is not evidence that telemetry
+has arrived. Before the first evaluation, `resources` is empty. The first evaluation fills
+configured resource entries; materializing unchanged NORMAL entries does not advance the version
+or announce a recovery. Recovery clears attribution only for the recovered resource.
 
 `evaluatedAt` records the latest completed evaluation. `observations` contains current telemetry
 for each configured resource. Top-level `evidence` remains the basis of the diagnostic decision;
@@ -423,6 +477,12 @@ still produce transitions. Incomplete investigations include `coverage=PARTIAL` 
 
 Operational messages use short state announcements:
 
+Each configured resource announces its own state and source changes, even when another resource
+remains primary. `previous` and `current` refer to that resource's severity. A source-only change
+announces the source without repeating the pressure message. If the primary selection changes
+without a state announcement for the newly selected resource, one `Primary resource reassigned.`
+message records the selection; it does not repeat an already identified source.
+
 ```text
 [BULLSEYE] Bullseye diagnostic system activated.
 [BULLSEYE] Host telemetry online.
@@ -432,6 +492,7 @@ Operational messages use short state announcements:
 [BULLSEYE] Pressure source identified. resource=HOST_MEMORY workload=order-api.service confidence=MEDIUM score=30.0
 [BULLSEYE] Pressure source identified. resource=HOST_CPU workload=worker.service confidence=HIGH score=60.0
 [BULLSEYE] Pressure source identified. resource=DISK_IO workload=writer.service confidence=LOW score=80.0
+[BULLSEYE] Primary resource reassigned. previous=HOST_CPU current=HOST_MEMORY severity=HIGH
 ```
 
 ## Real Linux validation

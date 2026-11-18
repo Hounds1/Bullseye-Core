@@ -1,7 +1,9 @@
 package io.bullseye.core.state;
 
 import io.bullseye.common.diagnostic.DiagnosticSnapshot;
+import io.bullseye.common.diagnostic.ResourceType;
 
+import java.util.EnumSet;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -43,8 +45,22 @@ public final class InMemoryDiagnosticStateRepository implements DiagnosticStateR
                 && previous.resource() == current.resource()
                 && previous.state() == current.state()
                 && previous.since() == current.since()
-                && previous.attribution().workload().equals(current.attribution().workload())
-                && previous.attribution().confidence() == current.attribution().confidence()
-                && previous.attribution().status() == current.attribution().status();
+                && previous.attribution().sameSourceAs(current.attribution())
+                && sameResourceDiagnoses(previous, current);
+    }
+
+    private static boolean sameResourceDiagnoses(
+            DiagnosticSnapshot previous, DiagnosticSnapshot current) {
+        EnumSet<ResourceType> resources = EnumSet.noneOf(ResourceType.class);
+        resources.addAll(previous.resources().keySet());
+        resources.addAll(current.resources().keySet());
+        for (ResourceType resource : resources) {
+            var before = previous.diagnosis(resource);
+            var after = current.diagnosis(resource);
+            if (!before.sameStateAs(after) || before.since() != after.since()) {
+                return false;
+            }
+        }
+        return true;
     }
 }
