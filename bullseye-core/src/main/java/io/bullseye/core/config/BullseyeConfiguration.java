@@ -29,6 +29,30 @@ public record BullseyeConfiguration(
             throw new IllegalArgumentException(
                     "windowDuration must not be shorter than samplingInterval");
         }
+        requireObservationWindow(
+                windowDuration,
+                samplingInterval,
+                "cpu",
+                cpuDiagnostics.elevatedDuration(),
+                cpuDiagnostics.highDuration(),
+                cpuDiagnostics.criticalDuration(),
+                cpuDiagnostics.recoveryDuration());
+        requireObservationWindow(
+                windowDuration,
+                samplingInterval,
+                "memory",
+                memoryDiagnostics.elevatedDuration(),
+                memoryDiagnostics.highDuration(),
+                memoryDiagnostics.criticalDuration(),
+                memoryDiagnostics.recoveryDuration());
+        requireObservationWindow(
+                windowDuration,
+                samplingInterval,
+                "io",
+                ioDiagnostics.elevatedDuration(),
+                ioDiagnostics.highDuration(),
+                ioDiagnostics.criticalDuration(),
+                ioDiagnostics.recoveryDuration());
     }
 
     public BullseyeConfiguration(
@@ -235,10 +259,6 @@ public record BullseyeConfiguration(
             Objects.requireNonNull(root, "root");
             requirePositive(discoveryInterval, "discoveryInterval");
             requirePositive(attributionRefreshInterval, "attributionRefreshInterval");
-            if (attributionRefreshInterval.toMillis() < 1) {
-                throw new IllegalArgumentException(
-                        "attributionRefreshInterval must be at least 1ms");
-            }
             if (maximumDepth < 1 || maximumGroups < 1) {
                 throw new IllegalArgumentException("cgroup bounds must be positive");
             }
@@ -282,8 +302,39 @@ public record BullseyeConfiguration(
 
     private static void requirePositive(Duration value, String name) {
         Objects.requireNonNull(value, name);
-        if (value.isZero() || value.isNegative()) {
-            throw new IllegalArgumentException(name + " must be positive");
+        long millis;
+        try {
+            millis = value.toMillis();
+        } catch (ArithmeticException overflow) {
+            throw new IllegalArgumentException(name + " must fit in milliseconds", overflow);
+        }
+        if (millis < 1) {
+            throw new IllegalArgumentException(name + " must be at least 1ms");
+        }
+    }
+
+    private static void requireObservationWindow(
+            Duration window,
+            Duration samplingInterval,
+            String resource,
+            Duration... durations) {
+        String[] phases = {"elevated", "high", "critical", "recovery"};
+        int longest = 0;
+        for (int index = 1; index < durations.length; index++) {
+            if (durations[index].compareTo(durations[longest]) > 0) {
+                longest = index;
+            }
+        }
+        Duration maximumSampleGap = samplingInterval.multipliedBy(2);
+        // Keep the sample just before the duration boundary despite an allowed collection gap.
+        Duration minimumWindow = durations[longest].plus(maximumSampleGap);
+        if (window.compareTo(minimumWindow) < 0) {
+            throw new IllegalArgumentException(
+                    "bullseye.window.duration=" + window
+                            + " must be at least " + minimumWindow
+                            + " for bullseye.diagnostics." + resource + "." + phases[longest]
+                            + ".duration=" + durations[longest]
+                            + " plus the maximum sample gap (" + maximumSampleGap + ")");
         }
     }
 

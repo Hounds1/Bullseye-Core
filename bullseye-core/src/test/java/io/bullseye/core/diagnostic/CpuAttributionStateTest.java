@@ -147,6 +147,30 @@ class CpuAttributionStateTest {
     }
 
     @Test
+    void lostCpuPsiSuspendsAttributionAndRestartsItsBaselineAfterReturn() throws Exception {
+        Scenario scenario = new Scenario();
+        scenario.cpu.severity = Severity.CRITICAL;
+        scenario.window.append(new MetricSample(MetricType.HOST_CPU_PSI_SOME_AVG10, 10, 1_000));
+        scenario.tick(1_000, 0, 0);
+        scenario.window.append(new MetricSample(MetricType.HOST_CPU_PSI_SOME_AVG10, 10, 2_000));
+        scenario.tick(2_000, 3_000_000, 100_000);
+        long version = scenario.repository.current().version();
+
+        scenario.tick(5_000, 12_000_000, 400_000);
+        assertEquals(2_000, scenario.attribution().collectedAt());
+        assertEquals(version, scenario.repository.current().version());
+        assertEquals(DiagnosticSnapshot.ObservationStatus.STALE,
+                scenario.repository.current().observationStatus());
+
+        scenario.window.append(new MetricSample(MetricType.HOST_CPU_PSI_SOME_AVG10, 10, 6_000));
+        scenario.tick(6_000, 15_000_000, 500_000);
+        assertEquals(WorkloadAttribution.Status.INSUFFICIENT_DATA, scenario.attribution().status());
+        scenario.window.append(new MetricSample(MetricType.HOST_CPU_PSI_SOME_AVG10, 10, 7_000));
+        scenario.tick(7_000, 18_000_000, 600_000);
+        assertTrue(scenario.attribution().resolved());
+    }
+
+    @Test
     void missedDiagnosticTicksAndCapacityChangesCannotReuseOldCpuIntervals() throws Exception {
         Scenario scenario = new Scenario();
         scenario.tick(1_000, 0, 0);

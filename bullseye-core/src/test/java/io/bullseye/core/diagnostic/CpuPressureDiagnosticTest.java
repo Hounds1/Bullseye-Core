@@ -109,6 +109,67 @@ class CpuPressureDiagnosticTest {
     }
 
     @Test
+    void oldRiseCannotEscalateARecentlyFallingCpu() {
+        for (long time = 0; time <= 60_000; time += 5_000) {
+            double usage =
+                    time == 0 ? 80 : time < 50_000 ? 88 : 87 - (time - 50_000) / 5_000.0;
+            append(time, usage);
+        }
+
+        var transition = coordinator.evaluate(60_000).orElseThrow();
+
+        assertEquals(Severity.ELEVATED, transition.current().severity());
+        assertTrue(transition.current().evidence().stream()
+                .noneMatch(value -> value.metric().equals("trend")));
+    }
+
+    @Test
+    void recentRiseCanEscalateEvenWhenOlderValuesWereHigher() {
+        append(0, 88);
+        append(5_000, 87);
+        append(10_000, 86);
+        append(15_000, 82);
+        append(20_000, 83);
+        append(25_000, 85);
+
+        var transition = coordinator.evaluate(25_000).orElseThrow();
+
+        assertEquals(Severity.HIGH, transition.current().severity());
+        assertTrue(transition.event().reason().contains("rise=+3.0pp/10s"));
+    }
+
+    @Test
+    void trendLogAndEvidenceUseActualObservedInterval() {
+        append(0, 81);
+        append(4_001, 82);
+        append(8_002, 83);
+        append(12_003, 84);
+
+        var transition = coordinator.evaluate(12_003).orElseThrow();
+
+        assertEquals(Severity.HIGH, transition.current().severity());
+        assertTrue(transition.event().reason().contains("rise=+3.0pp/12.003s"));
+        assertEquals(12.003, transition.current().evidence().stream()
+                .filter(value -> value.metric().equals("duration"))
+                .findFirst().orElseThrow().value(), 0.000001);
+    }
+
+    @Test
+    void fallingRecentTrendDoesNotBypassRecoveryHysteresis() {
+        append(0, 81);
+        append(5_000, 83);
+        append(10_000, 85);
+        coordinator.evaluate(10_000);
+        long version = repository.current().version();
+
+        append(15_000, 84);
+        append(20_000, 83);
+        assertTrue(coordinator.evaluate(20_000).isEmpty());
+        assertEquals(Severity.HIGH, repository.current().severity());
+        assertEquals(version, repository.current().version());
+    }
+
+    @Test
     void staleSamplesDoNotCauseEscalation() {
         append(0, 95);
         append(5_000, 96);

@@ -135,6 +135,25 @@ class DiagnosticAttributionStateTest {
     }
 
     @Test
+    void lostMemoryFullPsiDefersAttributionWithoutAdvancingTheRefreshTimer() {
+        RefreshScenario scenario = new RefreshScenario();
+        scenario.window.append(new MetricSample(
+                MetricType.HOST_MEMORY_PSI_FULL_AVG10, 5, 1_000));
+        scenario.observeAt(1_000);
+        scenario.snapshots.set(List.of(memorySnapshot("replacement.service", 8, 40)));
+
+        assertTrue(scenario.observeAt(6_000).isEmpty());
+        assertEquals(1, scenario.collections.get());
+        assertEquals("first.service", scenario.workload());
+
+        scenario.window.append(new MetricSample(
+                MetricType.HOST_MEMORY_PSI_FULL_AVG10, 5, 6_500));
+        scenario.observeAt(6_500).orElseThrow();
+        assertEquals(2, scenario.collections.get());
+        assertEquals("replacement.service", scenario.workload());
+    }
+
+    @Test
     void skippedFirstHighAttemptRunsAsSoonAsInputsBecomeFresh() {
         RefreshScenario scenario = new RefreshScenario();
         scenario.coordinator.evaluate(1_000).orElseThrow();

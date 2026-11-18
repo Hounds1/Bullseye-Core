@@ -5,6 +5,7 @@ import io.bullseye.common.metric.MetricSample;
 import io.bullseye.common.metric.MetricType;
 import io.bullseye.core.metric.MetricWindow;
 
+import java.math.BigDecimal;
 import java.time.Duration;
 import java.util.List;
 import java.util.Locale;
@@ -23,6 +24,12 @@ public final class MetricConditions {
         }
         MetricSample sample = samples.getLast();
         return isFresh(sample, now, maximumAge) ? Optional.of(sample) : Optional.empty();
+    }
+
+    public static boolean hasExpired(
+            MetricWindow window, MetricType type, long now, Duration maximumAge) {
+        List<MetricSample> samples = window.get(type);
+        return !samples.isEmpty() && !isFresh(samples.getLast(), now, maximumAge);
     }
 
     public static boolean sustained(
@@ -69,6 +76,34 @@ public final class MetricConditions {
                 : List.of();
     }
 
+    public static List<MetricSample> recentRun(
+            MetricWindow window,
+            MetricType type,
+            long now,
+            Duration duration,
+            Duration maximumAge,
+            DoublePredicate predicate) {
+        List<MetricSample> run =
+                sustainedRun(window, type, now, duration, maximumAge, predicate);
+        if (run.isEmpty()) {
+            return List.of();
+        }
+        long newestTimestamp = run.getLast().timestamp();
+        int start = run.size() - 2;
+        // Keep the nearest observed boundary covering the interval, without interpolation.
+        while (start > 0
+                && newestTimestamp - run.get(start).timestamp() < duration.toMillis()) {
+            start--;
+        }
+        return List.copyOf(run.subList(start, run.size()));
+    }
+
+    public static Duration observedDuration(List<MetricSample> run) {
+        return run.isEmpty()
+                ? Duration.ZERO
+                : Duration.ofMillis(run.getLast().timestamp() - run.getFirst().timestamp());
+    }
+
     public static double rise(List<MetricSample> run) {
         return run.isEmpty() ? 0 : run.getLast().value() - run.getFirst().value();
     }
@@ -86,10 +121,11 @@ public final class MetricConditions {
     }
 
     public static String duration(Duration duration) {
-        if (duration.toMinutes() > 0 && duration.toSecondsPart() == 0) {
-            return duration.toMinutes() + "m";
+        long millis = duration.toMillis();
+        if (millis >= 60_000 && millis % 60_000 == 0) {
+            return millis / 60_000 + "m";
         }
-        return duration.toSeconds() + "s";
+        return BigDecimal.valueOf(millis, 3).stripTrailingZeros().toPlainString() + "s";
     }
 
     private static boolean isFresh(MetricSample sample, long now, Duration maximumAge) {

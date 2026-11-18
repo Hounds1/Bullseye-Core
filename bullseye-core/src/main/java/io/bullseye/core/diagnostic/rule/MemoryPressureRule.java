@@ -38,7 +38,13 @@ public final class MemoryPressureRule implements DiagnosticRule {
         Optional<MetricSample> usage = latest(context, MetricType.HOST_MEMORY_USAGE);
         Optional<MetricSample> some = latest(context, MetricType.HOST_MEMORY_PSI_SOME_AVG10);
         Optional<MetricSample> full = latest(context, MetricType.HOST_MEMORY_PSI_FULL_AVG10);
-        if (usage.isEmpty() || some.isEmpty()) {
+        if (usage.isEmpty()
+                || some.isEmpty()
+                || MetricConditions.hasExpired(
+                        context.metrics(),
+                        MetricType.HOST_MEMORY_PSI_FULL_AVG10,
+                        context.evaluatedAt(),
+                        maximumSampleAge)) {
             return Optional.empty();
         }
 
@@ -107,7 +113,7 @@ public final class MemoryPressureRule implements DiagnosticRule {
         }
 
         List<MetricSample> highPressure =
-                MetricConditions.sustainedRun(
+                MetricConditions.recentRun(
                         context.metrics(),
                         MetricType.HOST_MEMORY_PSI_SOME_AVG10,
                         now,
@@ -131,7 +137,7 @@ public final class MemoryPressureRule implements DiagnosticRule {
                             some,
                             full,
                             rise,
-                            configuration.highDuration()));
+                            MetricConditions.observedDuration(highPressure)));
         }
 
         boolean elevated =

@@ -41,7 +41,12 @@ public final class CpuPressureRule implements DiagnosticRule {
                         MetricType.HOST_CPU_USAGE,
                         context.evaluatedAt(),
                         maximumSampleAge);
-        if (usage.isEmpty()) {
+        if (usage.isEmpty()
+                || MetricConditions.hasExpired(
+                        context.metrics(),
+                        MetricType.HOST_CPU_PSI_SOME_AVG10,
+                        context.evaluatedAt(),
+                        maximumSampleAge)) {
             return Optional.empty();
         }
 
@@ -97,7 +102,7 @@ public final class CpuPressureRule implements DiagnosticRule {
             duration = configuration.criticalDuration();
         } else {
             List<MetricSample> highRun =
-                    MetricConditions.sustainedRun(
+                    MetricConditions.recentRun(
                             context.metrics(),
                             MetricType.HOST_CPU_USAGE,
                             now,
@@ -109,7 +114,7 @@ public final class CpuPressureRule implements DiagnosticRule {
                 severity = Severity.HIGH;
                 state = ResourceState.SATURATION_RISK;
                 announcement = "Resource saturation detected.";
-                duration = configuration.highDuration();
+                duration = MetricConditions.observedDuration(highRun);
                 rise = MetricConditions.rise(highRun);
             } else if (MetricConditions.sustained(
                     context.metrics(),

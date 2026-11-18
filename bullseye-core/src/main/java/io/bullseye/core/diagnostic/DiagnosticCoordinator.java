@@ -325,7 +325,12 @@ public final class DiagnosticCoordinator {
                         .allMatch(
                                 type -> MetricConditions.latest(
                                                 metricWindow, type, evaluatedAt, maximumSampleAge)
-                                        .isPresent());
+                                        .isPresent())
+                        && !MetricConditions.hasExpired(
+                                metricWindow,
+                                MetricType.HOST_MEMORY_PSI_FULL_AVG10,
+                                evaluatedAt,
+                                maximumSampleAge);
         if ((highEntry || critical || refreshDue) && fresh) {
             lastMemoryAttributionAt = evaluatedAt;
             memoryAttribution = memoryAttributor.attribute(latestHostMemoryTotal(evaluatedAt));
@@ -348,7 +353,13 @@ public final class DiagnosticCoordinator {
         Optional<MetricSample> usage = MetricConditions.latest(
                 metricWindow, MetricType.HOST_CPU_USAGE, evaluatedAt, maximumSampleAge);
         int hostCpuCount = latestHostCpuCount(evaluatedAt);
-        if (usage.isEmpty() || hostCpuCount == 0) {
+        if (usage.isEmpty()
+                || hostCpuCount == 0
+                || MetricConditions.hasExpired(
+                        metricWindow,
+                        MetricType.HOST_CPU_PSI_SOME_AVG10,
+                        evaluatedAt,
+                        maximumSampleAge)) {
             // Keep the last explanation while telemetry is stale, but never bridge the gap.
             if (lastCpuInputAt != null) {
                 resetCpuHistory();
