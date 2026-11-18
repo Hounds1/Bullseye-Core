@@ -628,6 +628,306 @@ class CgroupMonitorTest {
         assertTrue(output.toString().contains("cgroup-cpu:"));
     }
 
+    @Test
+    void collectsIoCountersAndLimitsForEachDeviceWithoutDependingOnFieldOrder() {
+        files.content.put(
+                group.resolve("io.stat"),
+                "8:0 wios=4 rios=3 wbytes=200 rbytes=100 dbytes=0 dios=0\n"
+                        + "259:1 rbytes=300 wbytes=400 rios=5 wios=6 extra=7\n");
+        files.content.put(
+                group.resolve("io.max"),
+                "259:1 wiops=10 rbps=max wbps=4096 riops=max\n8:0 rbps=1024\n");
+        files.content.put(group.resolve("io.pressure"), psi(20, 3));
+        clock.millis = 2_000;
+
+        CgroupMonitor.IoCollectionResult result = monitor(512).collectIo();
+        CgroupIoSnapshot snapshot = result.snapshots().getFirst();
+
+        assertEquals(new CgroupIoSnapshot.DeviceStats(100, 200, 3, 4), snapshot.devices().get("8:0"));
+        assertEquals(new CgroupIoSnapshot.DeviceStats(300, 400, 5, 6), snapshot.devices().get("259:1"));
+        assertEquals(1_024L, snapshot.limits().get("8:0").readBytesPerSecond());
+        assertNull(snapshot.limits().get("8:0").writeBytesPerSecond());
+        assertNull(snapshot.limits().get("259:1").readBytesPerSecond());
+        assertEquals(4_096L, snapshot.limits().get("259:1").writeBytesPerSecond());
+        assertEquals(10L, snapshot.limits().get("259:1").writeOperationsPerSecond());
+        assertTrue(snapshot.limitsAvailable());
+        assertEquals(20, snapshot.psiSome());
+        assertEquals(3, snapshot.psiFull());
+        assertEquals(2_000, result.collectedAt());
+        assertTrue(result.coverage().complete());
+    }
+
+    @Test
+    void emptyIoStatAndIoMaxAreValidAndDifferentFromUnavailableLimits() {
+        files.content.put(group.resolve("io.stat"), "\n");
+        files.content.put(group.resolve("io.max"), "\n");
+
+        CgroupMonitor.IoCollectionResult result = monitor(512).collectIo();
+        CgroupIoSnapshot snapshot = result.snapshots().getFirst();
+
+        assertTrue(snapshot.devices().isEmpty());
+        assertTrue(snapshot.limits().isEmpty());
+        assertTrue(snapshot.limitsAvailable());
+        assertTrue(Double.isNaN(snapshot.psiSome()));
+        assertTrue(Double.isNaN(snapshot.psiFull()));
+        assertTrue(result.coverage().complete());
+
+        files.content.remove(group.resolve("io.max"));
+        CgroupIoSnapshot missing = monitor(512).collectIo().snapshots().getFirst();
+        assertFalse(missing.limitsAvailable());
+    }
+
+    @Test
+    void ioPressureMayLackFullAndIoMaxMayBeUnavailable() {
+        fixtureIo(group, 100);
+        files.content.remove(group.resolve("io.max"));
+        files.content.put(group.resolve("io.pressure"), "some avg10=5 avg60=1 avg300=1 total=10\n");
+
+        CgroupMonitor.IoCollectionResult result = monitor(512).collectIo();
+        CgroupIoSnapshot snapshot = result.snapshots().getFirst();
+
+        assertEquals(5, snapshot.psiSome());
+        assertTrue(Double.isNaN(snapshot.psiFull()));
+        assertFalse(snapshot.limitsAvailable());
+        assertTrue(result.coverage().complete());
+    }
+
+    @Test
+    void ioStatAcceptsKernelControllerExtensionsAndOmittedZeroCounters() {
+        files.content.put(
+                group.resolve("io.stat"),
+                "8:0 rbytes=100 wbytes=200 rios=3 wios=4 use_delay=-1 cost.vrate=99.25\n"
+                        + "8:1\n"
+                        + "259:0 cost.usage=0 cost.vrate=100.00 future=text\n");
+
+        CgroupMonitor.IoCollectionResult result = monitor(512).collectIo();
+        CgroupIoSnapshot snapshot = result.snapshots().getFirst();
+
+        assertEquals(new CgroupIoSnapshot.DeviceStats(100, 200, 3, 4), snapshot.devices().get("8:0"));
+        assertEquals(new CgroupIoSnapshot.DeviceStats(0, 0, 0, 0), snapshot.devices().get("8:1"));
+        assertEquals(new CgroupIoSnapshot.DeviceStats(0, 0, 0, 0), snapshot.devices().get("259:0"));
+        assertTrue(result.coverage().complete());
+    }
+
+    @Test
+    void rejectsMalformedIoStatWithoutTreatingItAsAnIdleWorkload() {
+        String valid = "8:0 rbytes=100 wbytes=200 rios=3 wios=4";
+        for (String stat : List.of(
+                "8:0 rbytes=100 wbytes=200 rios=3",
+                "8:0 rbytes=-1 wbytes=200 rios=3 wios=4",
+                "8:0 rbytes=max wbytes=200 rios=3 wios=4",
+                valid + " rbytes=100",
+                valid + "\n" + valid,
+                "08:0 rbytes=100 wbytes=200 rios=3 wios=4",
+                "8:x rbytes=100 wbytes=200 rios=3 wios=4",
+                valid + " broken",
+                valid + " extra=",
+                valid + " extra=1=2",
+                valid + " dbytes=-1",
+                valid + " dios=broken")) {
+            files.content.put(group.resolve("io.stat"), stat);
+
+            CgroupMonitor.IoCollectionResult result = monitor(512).collectIo();
+
+            assertTrue(result.snapshots().isEmpty(), stat);
+            assertEquals(1, result.coverage().failedGroups(), stat);
+        }
+    }
+
+    @Test
+    void missingRequiredIoStatMarksCollectionAsFailed() {
+        CgroupMonitor.IoCollectionResult result = monitor(512).collectIo();
+
+        assertEquals(CgroupMonitor.Status.AVAILABLE, result.status());
+        assertTrue(result.snapshots().isEmpty());
+        assertEquals(1, result.coverage().failedGroups());
+        assertFalse(result.coverage().complete());
+    }
+
+    @Test
+    void rejectsMalformedOptionalIoLimitsAndPressureInsteadOfHidingTheFailure() {
+        fixtureIo(group, 100);
+        for (String maximum : List.of(
+                "8:0 rbps=0",
+                "8:0 wbps=-1",
+                "8:0 riops=broken",
+                "8:0 wiops=max wiops=max",
+                "8:0 rbps=max\n8:0 wbps=max",
+                "broken rbps=max",
+                "8:0")) {
+            files.content.put(group.resolve("io.max"), maximum);
+
+            CgroupMonitor.IoCollectionResult result = monitor(512).collectIo();
+
+            assertTrue(result.snapshots().isEmpty(), maximum);
+            assertEquals(1, result.coverage().failedGroups(), maximum);
+        }
+        files.content.put(group.resolve("io.max"), "");
+        files.content.put(group.resolve("io.pressure"), "broken");
+        assertEquals(1, monitor(512).collectIo().coverage().failedGroups());
+    }
+
+    @Test
+    void deniedOptionalIoFilesAreAccessFailures() {
+        fixtureIo(group, 100);
+        for (String file : List.of("io.max", "io.pressure")) {
+            files.denied.add(group.resolve(file));
+
+            CgroupMonitor.IoCollectionResult result = monitor(512).collectIo();
+
+            assertEquals(CgroupMonitor.Status.ACCESS_DENIED, result.status());
+            assertEquals(1, result.coverage().failedGroups());
+            files.denied.clear();
+        }
+    }
+
+    @Test
+    void ioFailureKeepsReadableGroupsAndDoesNotAffectOtherResources() {
+        Path second = root.resolve("batch.service");
+        files.directories.put(root, List.of(group, second));
+        fixtureIo(group, 100);
+        fixtureIo(second, 200);
+        fixtureCpu(group, 1_000);
+        fixtureCpu(second, 2_000);
+        fixtureGroup(second, "400", "max", 2, 0, "high 0\n");
+        files.denied.add(second.resolve("io.stat"));
+        CgroupMonitor monitor = monitor(512);
+
+        CgroupMonitor.IoCollectionResult result = monitor.collectIo();
+
+        assertEquals(CgroupMonitor.Status.AVAILABLE, result.status());
+        assertEquals(1, result.coverage().collectedGroups());
+        assertEquals(1, result.coverage().failedGroups());
+        assertFalse(result.coverage().complete());
+        assertTrue(monitor.collectCpu().coverage().complete());
+        assertTrue(monitor.collectMemory().coverage().complete());
+    }
+
+    @Test
+    void resetsIoHistoryIndependentlyFromCpuAndMemory() {
+        fixtureIo(group, 100);
+        fixtureCpu(group, 1_000);
+        CgroupMonitor monitor = monitor(512);
+        monitor.collectIo();
+        monitor.collectCpu();
+        monitor.collectMemory();
+        monitor.clearCpuHistory();
+        monitor.clearHistory();
+        clock.millis = 1_000;
+        fixtureIo(group, 300);
+
+        CgroupMonitor.IoCollectionResult secondIo = monitor.collectIo();
+        assertEquals(
+                100,
+                secondIo.previousSnapshots().get("/system.slice/order-api.service")
+                        .devices().get("8:0").readBytes());
+        assertEquals(300, secondIo.snapshots().getFirst().devices().get("8:0").readBytes());
+        assertTrue(monitor.collectCpu().previousSnapshots().isEmpty());
+        assertTrue(monitor.collectMemory().previousSnapshots().isEmpty());
+
+        monitor.clearIoHistory();
+        clock.millis = 2_000;
+        assertTrue(monitor.collectIo().previousSnapshots().isEmpty());
+        assertFalse(monitor.collectCpu().previousSnapshots().isEmpty());
+        assertFalse(monitor.collectMemory().previousSnapshots().isEmpty());
+    }
+
+    @Test
+    void failedIoReadClearsBaselineBeforeRecovery() {
+        fixtureIo(group, 100);
+        CgroupMonitor monitor = monitor(512);
+        monitor.collectIo();
+        files.missingDuringRead.add(group.resolve("io.stat"));
+        clock.millis = 1_000;
+        assertEquals(1, monitor.collectIo().coverage().failedGroups());
+
+        files.missingDuringRead.clear();
+        fixtureIo(group, 300);
+        clock.millis = 2_000;
+        CgroupMonitor.IoCollectionResult recovered = monitor.collectIo();
+
+        assertTrue(recovered.coverage().complete());
+        assertTrue(recovered.previousSnapshots().isEmpty());
+    }
+
+    @Test
+    void ioSharesLeafDiscoveryAndPrunesHistoryForRemovedGroups() {
+        Path child = group.resolve("worker");
+        files.directories.put(group, List.of(child));
+        fixtureIo(group, 100);
+        fixtureIo(child, 200);
+        fixtureCpu(child, 2_000);
+        CgroupMonitor monitor = monitor(512);
+
+        CgroupMonitor.IoCollectionResult initial = monitor.collectIo();
+        assertEquals(1, initial.snapshots().size());
+        assertEquals(200, initial.snapshots().getFirst().devices().get("8:0").readBytes());
+        int discoveryReads = files.directoryReads;
+        monitor.collectCpu();
+        assertEquals(discoveryReads, files.directoryReads);
+
+        files.directories.put(group, List.of());
+        clock.millis = 60_000;
+        CgroupMonitor.IoCollectionResult removed = monitor.collectIo();
+        assertTrue(removed.previousSnapshots().isEmpty());
+        assertEquals(100, removed.snapshots().getFirst().devices().get("8:0").readBytes());
+
+        files.directories.put(group, List.of(child));
+        clock.millis = 120_000;
+        assertTrue(monitor.collectIo().previousSnapshots().isEmpty());
+    }
+
+    @Test
+    void ioReportsDiscoveryLimitsAndRecoversAfterCgroupBecomesAvailable() {
+        fixtureIo(group, 100);
+        files.directories.put(group, List.of(group.resolve("worker")));
+        assertTrue(monitor(512, 1, true).collectIo().coverage().discoveryLimited());
+        files.directories.put(group, List.of());
+        files.content.remove(root.resolve("cgroup.controllers"));
+        CgroupMonitor monitor = monitor(512);
+
+        CgroupMonitor.IoCollectionResult unavailable = monitor.collectIo();
+        assertEquals(CgroupMonitor.Status.CGROUP_V2_NOT_AVAILABLE, unavailable.status());
+        assertTrue(unavailable.coverage().discoveryFailed());
+
+        files.content.put(root.resolve("cgroup.controllers"), "cpu memory io");
+        CgroupMonitor.IoCollectionResult recovered = monitor.collectIo();
+        assertEquals(CgroupMonitor.Status.AVAILABLE, recovered.status());
+        assertTrue(recovered.previousSnapshots().isEmpty());
+        assertTrue(recovered.coverage().complete());
+    }
+
+    @Test
+    void successfulMemoryReadDoesNotRestoreFailedIoComponent() {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        CgroupMonitor monitor =
+                monitor(
+                        512,
+                        8,
+                        true,
+                        new BullseyeLogger(new PrintStream(output), new PrintStream(errors)));
+        fixtureIo(group, 100);
+        files.denied.add(group.resolve("io.stat"));
+        monitor.collectIo();
+        monitor.collectMemory();
+
+        assertFalse(output.toString().contains("cgroup-io:"));
+        assertTrue(errors.toString().contains("cgroup-io:"));
+
+        files.denied.clear();
+        monitor.collectIo();
+        assertTrue(output.toString().contains("cgroup-io:"));
+    }
+
+    private void fixtureIo(Path target, long readBytes) {
+        files.content.put(
+                target.resolve("io.stat"),
+                "8:0 rbytes=" + readBytes + " wbytes=200 rios=3 wios=4\n");
+        files.content.put(target.resolve("io.max"), "8:0 rbps=max wbps=max riops=max wiops=max\n");
+        files.content.put(target.resolve("io.pressure"), psi(5, 1));
+    }
+
     private CgroupMonitor monitor(int maximumGroups) {
         return monitor(maximumGroups, 8, true);
     }

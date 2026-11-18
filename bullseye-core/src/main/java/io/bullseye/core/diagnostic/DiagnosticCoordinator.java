@@ -31,6 +31,7 @@ public final class DiagnosticCoordinator {
     private final Supplier<String> eventIdSupplier;
     private final MemoryPressureAttributor memoryAttributor;
     private final CpuPressureAttributor cpuAttributor;
+    private final IoPressureAttributor ioAttributor;
     private final Duration maximumSampleAge;
     private final long attributionRefreshMillis;
     private final long startedAt;
@@ -38,9 +39,12 @@ public final class DiagnosticCoordinator {
             new EnumMap<>(ResourceType.class);
     private WorkloadAttribution memoryAttribution = WorkloadAttribution.unresolved();
     private WorkloadAttribution cpuAttribution = WorkloadAttribution.unresolved();
+    private WorkloadAttribution ioAttribution = WorkloadAttribution.unresolved();
     private Long lastMemoryAttributionAt;
     private Long lastCpuAttributionAt;
     private Long lastCpuInputAt;
+    private Long lastIoAttributionAt;
+    private Long lastIoInputAt;
     private int previousHostCpuCount;
 
     public DiagnosticCoordinator(
@@ -111,12 +115,35 @@ public final class DiagnosticCoordinator {
             CpuPressureAttributor cpuAttributor,
             Duration maximumSampleAge,
             Duration attributionRefreshInterval) {
+        this(
+                metricWindow,
+                engine,
+                stateRepository,
+                eventIdSupplier,
+                memoryAttributor,
+                cpuAttributor,
+                null,
+                maximumSampleAge,
+                attributionRefreshInterval);
+    }
+
+    public DiagnosticCoordinator(
+            MetricWindow metricWindow,
+            DiagnosticEngine engine,
+            DiagnosticStateRepository stateRepository,
+            Supplier<String> eventIdSupplier,
+            MemoryPressureAttributor memoryAttributor,
+            CpuPressureAttributor cpuAttributor,
+            IoPressureAttributor ioAttributor,
+            Duration maximumSampleAge,
+            Duration attributionRefreshInterval) {
         this.metricWindow = Objects.requireNonNull(metricWindow, "metricWindow");
         this.engine = Objects.requireNonNull(engine, "engine");
         this.stateRepository = Objects.requireNonNull(stateRepository, "stateRepository");
         this.eventIdSupplier = Objects.requireNonNull(eventIdSupplier, "eventIdSupplier");
         this.memoryAttributor = memoryAttributor;
         this.cpuAttributor = cpuAttributor;
+        this.ioAttributor = ioAttributor;
         this.maximumSampleAge = Objects.requireNonNull(maximumSampleAge, "maximumSampleAge");
         if (maximumSampleAge.toMillis() < 1) {
             throw new IllegalArgumentException("maximumSampleAge must be positive");
@@ -143,6 +170,8 @@ public final class DiagnosticCoordinator {
             memoryAttribution = current.attribution();
         } else if (current.resource() == ResourceType.HOST_CPU) {
             cpuAttribution = current.attribution();
+        } else if (current.resource() == ResourceType.DISK_IO) {
+            ioAttribution = current.attribution();
         }
     }
 
@@ -153,12 +182,14 @@ public final class DiagnosticCoordinator {
         }
         DiagnosticDecision previousMemory = memoryState(resourceStates);
         DiagnosticDecision previousCpu = cpuState(resourceStates);
+        DiagnosticDecision previousIo = ioState(resourceStates);
         DiagnosticEngine.Evaluation evaluation =
                 engine.evaluate(
                         new DiagnosticContext(
                                 metricWindow, previous, Map.copyOf(resourceStates), evaluatedAt));
         DiagnosticDecision currentMemory = memoryState(evaluation.resourceStates());
         DiagnosticDecision currentCpu = cpuState(evaluation.resourceStates());
+        DiagnosticDecision currentIo = ioState(evaluation.resourceStates());
         resourceStates.clear();
         resourceStates.putAll(evaluation.resourceStates());
 
@@ -169,9 +200,11 @@ public final class DiagnosticCoordinator {
                 primary.severity() == Severity.NORMAL ? ResourceState.NORMAL : primary.state();
         updateMemoryAttribution(previousMemory, currentMemory, evaluatedAt);
         updateCpuAttribution(previousCpu, currentCpu, evaluatedAt);
+        updateIoAttribution(previousIo, currentIo, evaluatedAt);
         WorkloadAttribution attribution = switch (snapshotResource) {
             case HOST_MEMORY -> memoryAttribution;
             case HOST_CPU -> cpuAttribution;
+            case DISK_IO -> ioAttribution;
             default -> WorkloadAttribution.unresolved();
         };
 
@@ -391,6 +424,61 @@ public final class DiagnosticCoordinator {
         }
     }
 
+    private void updateIoAttribution(
+            DiagnosticDecision previousIo,
+            DiagnosticDecision currentIo,
+            long evaluatedAt) {
+        if (ioAttributor == null || currentIo.severity().ordinal() < Severity.HIGH.ordinal()) {
+            if (ioAttributor != null
+                    && previousIo.severity().ordinal() >= Severity.HIGH.ordinal()) {
+                resetIoHistory();
+            }
+            ioAttribution = WorkloadAttribution.unresolved();
+            return;
+        }
+
+        Optional<MetricSample> pressure = MetricConditions.latest(
+                metricWindow, MetricType.HOST_IO_PSI_SOME_AVG10, evaluatedAt, maximumSampleAge);
+        if (pressure.isEmpty()
+                || MetricConditions.hasExpired(
+                        metricWindow,
+                        MetricType.HOST_IO_PSI_FULL_AVG10,
+                        evaluatedAt,
+                        maximumSampleAge)) {
+            // Preserve the last explanation, but require a new baseline after missing telemetry.
+            if (lastIoInputAt != null) {
+                resetIoHistory();
+            }
+            return;
+        }
+
+        long inputAt = pressure.orElseThrow().timestamp();
+        if (lastIoInputAt != null
+                && inputAt - lastIoInputAt > maximumSampleAge.toMillis()) {
+            resetIoHistory();
+        }
+        boolean newInput = lastIoInputAt == null || inputAt > lastIoInputAt;
+        lastIoInputAt = inputAt;
+
+        boolean highEntry = currentIo.severity() == Severity.HIGH
+                && previousIo.severity() != Severity.HIGH;
+        boolean critical = currentIo.severity() == Severity.CRITICAL;
+        boolean refreshDue = lastIoAttributionAt == null
+                || evaluatedAt - lastIoAttributionAt >= attributionRefreshMillis;
+        boolean baselineNeeded =
+                ioAttribution.status() == WorkloadAttribution.Status.INSUFFICIENT_DATA;
+        if (newInput && (highEntry || critical || refreshDue || baselineNeeded)) {
+            lastIoAttributionAt = evaluatedAt;
+            ioAttribution = ioAttributor.attribute();
+        }
+    }
+
+    private void resetIoHistory() {
+        ioAttributor.reset();
+        lastIoAttributionAt = null;
+        lastIoInputAt = null;
+    }
+
     private void resetCpuHistory() {
         cpuAttributor.reset();
         lastCpuAttributionAt = null;
@@ -431,6 +519,12 @@ public final class DiagnosticCoordinator {
         return states.getOrDefault(
                 ResourceType.HOST_CPU,
                 DiagnosticDecision.normal(ResourceType.HOST_CPU, "CPU condition nominal."));
+    }
+
+    private static DiagnosticDecision ioState(Map<ResourceType, DiagnosticDecision> states) {
+        return states.getOrDefault(
+                ResourceType.DISK_IO,
+                DiagnosticDecision.normal(ResourceType.DISK_IO, "IO condition nominal."));
     }
 
     private static boolean sameState(
