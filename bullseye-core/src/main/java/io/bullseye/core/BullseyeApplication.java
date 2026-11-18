@@ -6,6 +6,7 @@ import io.bullseye.core.config.PropertiesConfigurationLoader;
 import io.bullseye.core.diagnostic.CpuPressureAttributor;
 import io.bullseye.core.diagnostic.DiagnosticCoordinator;
 import io.bullseye.core.diagnostic.DiagnosticEngine;
+import io.bullseye.core.diagnostic.IoPressureAttributor;
 import io.bullseye.core.diagnostic.MemoryPressureAttributor;
 import io.bullseye.core.diagnostic.rule.CpuPressureRule;
 import io.bullseye.core.diagnostic.rule.IoPressureRule;
@@ -88,6 +89,12 @@ public final class BullseyeApplication {
                                 configuration.cgroup().attributionMinimumScore(),
                                 configuration.cgroup().attributionDominanceRatio()),
                         new CpuPressureAttributor(
+                                cgroupMonitor,
+                                configuration.cgroup().attributionMinimumScore(),
+                                configuration.cgroup().attributionDominanceRatio(),
+                                configuration.cgroup().attributionRefreshInterval()
+                                        .plus(sampleFreshness)),
+                        new IoPressureAttributor(
                                 cgroupMonitor,
                                 configuration.cgroup().attributionMinimumScore(),
                                 configuration.cgroup().attributionDominanceRatio(),

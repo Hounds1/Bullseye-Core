@@ -107,6 +107,42 @@ public final class CgroupMonitor {
         }
     }
 
+    public record IoCollectionResult(
+            Status status,
+            List<CgroupIoSnapshot> snapshots,
+            Map<String, CgroupIoSnapshot> previousSnapshots,
+            Coverage coverage,
+            long collectedAt) {
+
+        public IoCollectionResult {
+            Objects.requireNonNull(status, "status");
+            snapshots = List.copyOf(Objects.requireNonNull(snapshots, "snapshots"));
+            previousSnapshots =
+                    Map.copyOf(Objects.requireNonNull(previousSnapshots, "previousSnapshots"));
+            Objects.requireNonNull(coverage, "coverage");
+            if (collectedAt < 0) {
+                throw new IllegalArgumentException("collectedAt must not be negative");
+            }
+        }
+
+        public IoCollectionResult(
+                Status status,
+                List<CgroupIoSnapshot> snapshots,
+                Map<String, CgroupIoSnapshot> previousSnapshots) {
+            this(
+                    status,
+                    snapshots,
+                    previousSnapshots,
+                    Coverage.complete(snapshots.size()),
+                    snapshots.stream().mapToLong(CgroupIoSnapshot::collectedAt).max().orElse(0));
+        }
+
+        public static IoCollectionResult unavailable(Status status) {
+            return new IoCollectionResult(
+                    status, List.of(), Map.of(), new Coverage(0, 0, true, false), 0);
+        }
+    }
+
     public interface FileAccess {
         boolean exists(Path path);
 
@@ -121,6 +157,7 @@ public final class CgroupMonitor {
     private final BullseyeLogger logger;
     private final Map<String, CgroupMemorySnapshot> previousSnapshots = new HashMap<>();
     private final Map<String, CgroupCpuSnapshot> previousCpuSnapshots = new HashMap<>();
+    private final Map<String, CgroupIoSnapshot> previousIoSnapshots = new HashMap<>();
     private List<Path> cachedGroups = List.of();
     private long nextDiscoveryAt;
     private boolean discoveryComplete;
@@ -295,6 +332,52 @@ public final class CgroupMonitor {
         return new CpuCollectionResult(resultStatus, collected, previous, coverage, now);
     }
 
+    public synchronized IoCollectionResult collectIo() {
+        initialize();
+        long now = clock.millis();
+        if (status != Status.AVAILABLE) {
+            previousIoSnapshots.clear();
+            return new IoCollectionResult(
+                    status, List.of(), Map.of(), new Coverage(0, 0, true, false), now);
+        }
+
+        if (!discoveryComplete || now >= nextDiscoveryAt) {
+            discover(now);
+        }
+        boolean accessDenied = discoveryDenied;
+        int failedGroups = 0;
+        List<CgroupIoSnapshot> collected = new ArrayList<>(cachedGroups.size());
+        Map<String, CgroupIoSnapshot> currentByPath = new LinkedHashMap<>();
+        for (Path group : cachedGroups) {
+            String component = "cgroup-io:" + cgroupPath(group);
+            try {
+                CgroupIoSnapshot snapshot = collectIoGroup(group, now);
+                collected.add(snapshot);
+                currentByPath.put(snapshot.workload().cgroupPath(), snapshot);
+                logger.componentRestored(component);
+            } catch (AccessDeniedException failure) {
+                accessDenied = true;
+                failedGroups++;
+                logger.componentInterrupted(component, failure);
+            } catch (Exception failure) {
+                failedGroups++;
+                logger.componentInterrupted(component, failure);
+            }
+        }
+
+        Map<String, CgroupIoSnapshot> previous = Map.copyOf(previousIoSnapshots);
+        previousIoSnapshots.clear();
+        previousIoSnapshots.putAll(currentByPath);
+        Coverage coverage =
+                new Coverage(collected.size(), failedGroups, discoveryFailed, discoveryLimited);
+        if (failedGroups > 0) {
+            discoveryComplete = false;
+        }
+        Status resultStatus =
+                collected.isEmpty() && accessDenied ? Status.ACCESS_DENIED : Status.AVAILABLE;
+        return new IoCollectionResult(resultStatus, collected, previous, coverage, now);
+    }
+
     public synchronized Status status() {
         initialize();
         return status;
@@ -307,6 +390,11 @@ public final class CgroupMonitor {
 
     public synchronized void clearCpuHistory() {
         previousCpuSnapshots.clear();
+        discoveryComplete = false;
+    }
+
+    public synchronized void clearIoHistory() {
+        previousIoSnapshots.clear();
         discoveryComplete = false;
     }
 
@@ -356,6 +444,7 @@ public final class CgroupMonitor {
             leaves.forEach(path -> active.add(cgroupPath(path)));
             previousSnapshots.keySet().retainAll(active);
             previousCpuSnapshots.keySet().retainAll(active);
+            previousIoSnapshots.keySet().retainAll(active);
         }
         discoveryComplete = true;
         discoveryFailed = failed;
@@ -410,6 +499,120 @@ public final class CgroupMonitor {
                 counters.get("throttled_usec"),
                 some(pressure),
                 now);
+    }
+
+    private CgroupIoSnapshot collectIoGroup(Path group, long now) throws IOException {
+        Map<String, CgroupIoSnapshot.DeviceStats> devices =
+                ioCounters(files.read(group.resolve("io.stat")));
+        String maximum = optionalRead(group.resolve("io.max"));
+        Map<String, CgroupIoSnapshot.DeviceLimit> limits =
+                maximum == null ? Map.of() : ioLimits(maximum);
+        PsiParser.Snapshot pressure = pressure(group.resolve("io.pressure"));
+        return new CgroupIoSnapshot(
+                WorkloadIdentity.fromCgroupPath(cgroupPath(group)),
+                devices,
+                limits,
+                maximum != null,
+                some(pressure),
+                full(pressure),
+                now);
+    }
+
+    private static Map<String, CgroupIoSnapshot.DeviceStats> ioCounters(String raw) {
+        Map<String, CgroupIoSnapshot.DeviceStats> devices = new LinkedHashMap<>();
+        Set<String> counterNames = Set.of("rbytes", "wbytes", "rios", "wios", "dbytes", "dios");
+        for (var entry : ioDeviceFields(raw, "io.stat").entrySet()) {
+            Map<String, Long> counters = new HashMap<>();
+            for (var field : entry.getValue().entrySet()) {
+                // Controller extensions can contain signed or fractional values.
+                if (!counterNames.contains(field.getKey())) {
+                    continue;
+                }
+                long value = Long.parseLong(field.getValue());
+                if (value < 0) {
+                    throw new IllegalArgumentException("Negative io.stat counter: " + field.getKey());
+                }
+                counters.put(field.getKey(), value);
+            }
+            // The kernel omits all four read/write fields when their counters are zero.
+            if (!counters.containsKey("rbytes")
+                    && !counters.containsKey("wbytes")
+                    && !counters.containsKey("rios")
+                    && !counters.containsKey("wios")) {
+                counters.put("rbytes", 0L);
+                counters.put("wbytes", 0L);
+                counters.put("rios", 0L);
+                counters.put("wios", 0L);
+            }
+            devices.put(
+                    entry.getKey(),
+                    new CgroupIoSnapshot.DeviceStats(
+                            requiredIoCounter(counters, "rbytes"),
+                            requiredIoCounter(counters, "wbytes"),
+                            requiredIoCounter(counters, "rios"),
+                            requiredIoCounter(counters, "wios")));
+        }
+        return devices;
+    }
+
+    private static Map<String, CgroupIoSnapshot.DeviceLimit> ioLimits(String raw) {
+        Map<String, CgroupIoSnapshot.DeviceLimit> limits = new LinkedHashMap<>();
+        for (var entry : ioDeviceFields(raw, "io.max").entrySet()) {
+            Map<String, Long> values = new HashMap<>();
+            for (var field : entry.getValue().entrySet()) {
+                Long value = "max".equals(field.getValue())
+                        ? null
+                        : Long.parseLong(field.getValue());
+                if (value != null && value <= 0) {
+                    throw new IllegalArgumentException("Non-positive io.max limit: " + field.getKey());
+                }
+                values.put(field.getKey(), value);
+            }
+            limits.put(
+                    entry.getKey(),
+                    new CgroupIoSnapshot.DeviceLimit(
+                            values.get("rbps"),
+                            values.get("wbps"),
+                            values.get("riops"),
+                            values.get("wiops")));
+        }
+        return limits;
+    }
+
+    private static Map<String, Map<String, String>> ioDeviceFields(String raw, String fileName) {
+        Map<String, Map<String, String>> devices = new LinkedHashMap<>();
+        for (String line : raw.lines().toList()) {
+            if (line.isBlank()) {
+                continue;
+            }
+            String[] parts = line.trim().split("\\s+");
+            if (parts.length < 2 && !"io.stat".equals(fileName)) {
+                throw new IllegalArgumentException("Malformed " + fileName + " line");
+            }
+            CgroupIoSnapshot.requireDeviceId(parts[0]);
+            Map<String, String> fields = new HashMap<>();
+            if (devices.put(parts[0], fields) != null) {
+                throw new IllegalArgumentException("Duplicate " + fileName + " device: " + parts[0]);
+            }
+            for (int index = 1; index < parts.length; index++) {
+                String[] field = parts[index].split("=", -1);
+                if (field.length != 2
+                        || field[0].isEmpty()
+                        || field[1].isEmpty()
+                        || fields.put(field[0], field[1]) != null) {
+                    throw new IllegalArgumentException("Malformed " + fileName + " field: " + parts[index]);
+                }
+            }
+        }
+        return devices;
+    }
+
+    private static long requiredIoCounter(Map<String, Long> counters, String key) {
+        Long value = counters.get(key);
+        if (value == null) {
+            throw new IllegalArgumentException("Missing io.stat counter: " + key);
+        }
+        return value;
     }
 
     private static Map<String, Long> cpuCounters(String raw) {

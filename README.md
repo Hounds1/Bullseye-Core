@@ -2,7 +2,7 @@
 
 Bullseye Core is a standalone Linux host diagnostics agent. It reads host metrics and
 Linux PSI from `/proc`, evaluates sustained CPU, memory, and IO pressure, and uses bounded
-cgroup v2 CPU and memory collection to locate a likely workload source. Current state is
+cgroup v2 CPU, memory, and IO collection to locate a likely workload source. Current state is
 published as an atomically replaced JSON file.
 
 Bullseye observes and publishes state. It does not throttle traffic, modify application
@@ -193,7 +193,9 @@ Collection outages preserve the last diagnosis instead of reporting a false reco
 attribution is not refreshed while its required host usage/PSI inputs or a previously observed
 host PSI full input are expired. CPU attribution requires fresh host usage and CPU count and
 also pauses when previously observed host CPU PSI expires. It discards its CPU measurement
-baseline while retaining the last explanation until a new attempt. A resumed sample can restore
+baseline while retaining the last explanation until a new attempt. IO attribution similarly
+requires fresh host PSI some and pauses if previously observed host PSI full expires, clearing
+its measurement baseline. A resumed sample can restore
 observation freshness immediately, but each applicable recovery condition still needs its full
 continuous observation period. Samples before a collection gap cannot complete that period.
 
@@ -222,22 +224,24 @@ individual cgroup failures are isolated from host telemetry.
   gap. Trend logs and their `duration` evidence report that actual interval, including fractional
   seconds such as `10.127s`; non-trend sustained logs retain the configured minimum duration.
 - The highest active resource severity becomes host severity.
-- CPU and memory attribution run on `HIGH` entry, then every
+- CPU, memory, and IO attribution run on `HIGH` entry, then every
   `bullseye.cgroup.attribution.refresh-interval` (default `30s`) while HIGH persists.
   Failed/empty attempts retry on the same interval. `CRITICAL` rechecks on every fresh evaluation.
-  CPU needs two snapshots to measure usage: `INSUFFICIENT_DATA` retries on the next fresh host
-  sample instead of waiting for the refresh interval. Repeated evaluations of the same host CPU
-  sample do not collect another CPU snapshot.
+  CPU and IO need two snapshots to measure activity: `INSUFFICIENT_DATA` retries on the next
+  fresh host sample instead of waiting for the refresh interval. Repeated evaluations of the
+  same host CPU usage or IO PSI some sample do not collect another snapshot for that resource.
   Actual execution is aligned to diagnostic evaluations, so shorter settings do not increase
   the host sampling rate. Stale host inputs defer attempts without advancing the refresh timer.
 - Recovery below HIGH clears that resource's attribution, previous cgroup samples, and refresh
-  timer. CPU and memory histories/timers are independent; both remain active while their own
-  severity is HIGH/CRITICAL, even if the other resource is selected as primary.
+  timer. All three histories/timers are independent and remain active while their own severity
+  is HIGH/CRITICAL, even if another resource is selected as primary.
 - cgroup discovery is cached and bounded. No background cgroup sampling executor is used.
 - Memory attribution ranks host memory share and growth rate. Memory limits, PSI, and events
   explain the selected workload's condition without increasing its contribution score. CPU
   attribution ranks actual CPU consumption relative to host capacity. Similar candidates are
   retained with `LOW` confidence rather than overstating certainty.
+- IO compares observed byte and operation shares within each device. It selects a common
+  dominant workload only when active devices agree; ambiguity yields `NO_CANDIDATE`.
 - Unsupported, denied, empty, and insufficient-data outcomes are represented explicitly.
 
 ## Attribution evidence
@@ -247,7 +251,7 @@ individual cgroup failures are isolated from host telemetry.
 the heartbeat's `evaluatedAt` while HIGH reuses its cached result. Before any attempt, coverage
 and collection time are null and attribution evidence is empty. Failed attempts still publish
 their coverage and collection time, with no selected-workload evidence. The JSON fields and
-source-announcement format are shared by CPU and memory attribution.
+source-announcement format are shared by CPU, memory, and IO attribution.
 
 ### Memory evidence
 
@@ -345,9 +349,56 @@ describes the cgroup's own configured limit, not effective capacity after ancest
 cpuset restrictions. Throttling deltas require both endpoints and monotonic counters, and are
 not presented as host CPU utilization percentages.
 
+### IO evidence
+
+Two `io.stat` snapshots provide read/write byte and operation deltas for each `MAJOR:MINOR`
+device. Deltas are divided by elapsed seconds before comparing workloads on the same device.
+Discard counters are not scored. The device score is calculated as follows:
+
+```text
+observed byte share = workload bytes/second / observed device bytes/second * 100
+observed operation share = workload operations/second / observed device operations/second * 100
+device score = (observed byte share + observed operation share) / 2
+attributionScore = minimum device score of the common winning workload
+```
+
+When only one activity axis has a positive total, that axis supplies the entire device score.
+A device with no measured read/write activity is inactive. On every active device the winner
+must meet the shared minimum score and beat the runner-up by the configured dominance ratio.
+Ties, insufficient dominance, and different winners across devices yield `NO_CANDIDATE`.
+For example, 90% of bytes and 70% of operations on one device scores 80. Another device with
+a different leading workload prevents selection, even if its absolute traffic is smaller.
+
+IO confidence is always `LOW`: this identifies a workload leading the **observed IO activity**,
+not a proven bottleneck. The score is neither disk utilization nor a share of host IO capacity.
+Even a sole low-traffic group can score 100. Host PSI does not identify the stalled device, and
+this implementation does not measure device capacity or latency. Conservatively withholding a
+candidate across conflicting devices can therefore miss a real source.
+
+Evidence is grouped under `device.<MAJOR:MINOR>.*`, with read/write deltas and rates, observed
+byte/operation shares, and the device score. It also includes the observation duration, measured
+and unmeasured candidate/device counts, and available cgroup PSI and local `io.max` limits.
+PSI and limits add no points. A stalled workload with no measured IO is not selected simply
+because it waits; a workload with a finite limit is still eligible based on its activity.
+Local limit usage is included only when the limit is unchanged across the interval. It excludes
+ancestor limits. Missing `io.max` is distinguished from an available file with no finite limits.
+
+First observations, new/reset device counters, non-increasing timestamps, and intervals longer
+than the refresh interval plus host sample freshness cannot provide a device delta. Other valid
+devices can still be measured, with missing comparisons reported as unmeasured. If no candidate
+can be measured and comparisons are missing, the result is `INSUFFICIENT_DATA`; known zero
+activity yields `NO_CANDIDATE`. Host collection gaps and recovery require a new baseline.
+An empty `io.stat` is valid idle data. Device rows may omit all four read/write counters when
+zero; partial counter sets, malformed files, and denied reads are collection failures. Optional
+controller extension fields are tolerated. Missing `io.pressure` or `io.max` is supported.
+
+Kernel accounting also depends on filesystem writeback support and may assign shared-file IO
+to a different cgroup than the writer. See the [cgroup IO/writeback documentation](https://docs.kernel.org/admin-guide/cgroup-v2.html#io)
+and [PSI semantics](https://docs.kernel.org/accounting/psi.html).
+
 ### Confidence and collection coverage
 
-Complete investigations retain the score/runner-up confidence policy: HIGH requires score >=45
+Complete CPU/memory investigations retain the score/runner-up confidence policy: HIGH requires score >=45
 and a winner/runner ratio >=max(2, configured dominance ratio); MEDIUM requires score >=20 and
 the configured ratio; otherwise LOW. Tied scores use cgroup path order for stable selection.
 Confidence expresses the strength of this heuristic ranking and collection coverage; it is
@@ -363,7 +414,7 @@ cgroup access failures are retried on later attribution attempts.
 
 Completeness describes the configured, visible cgroup tree. An isolated Docker cgroup namespace
 does not reveal sibling containers; use a host-visible cgroup tree for cross-container attribution.
-Both resources use discovered leaf candidates so parent and child counters are not ranked twice.
+All three resources use discovered leaf candidates so parent and child counters are not ranked twice.
 Score, evidence, collection-time and coverage-only updates refresh JSON without advancing the
 diagnostic version or generating repeated source announcements. Workload/confidence/status changes
 still produce transitions. Incomplete investigations include `coverage=PARTIAL` in source logs.
@@ -380,6 +431,7 @@ Operational messages use short state announcements:
 [BULLSEYE] Critical memory pressure detected. usage=88.1% psi.some=24.3% rise=+6.1pp/10s previous=ELEVATED current=HIGH resource=HOST_MEMORY
 [BULLSEYE] Pressure source identified. resource=HOST_MEMORY workload=order-api.service confidence=MEDIUM score=30.0
 [BULLSEYE] Pressure source identified. resource=HOST_CPU workload=worker.service confidence=HIGH score=60.0
+[BULLSEYE] Pressure source identified. resource=DISK_IO workload=writer.service confidence=LOW score=80.0
 ```
 
 ## Real Linux validation
