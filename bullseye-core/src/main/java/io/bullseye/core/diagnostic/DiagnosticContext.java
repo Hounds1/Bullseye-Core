@@ -33,11 +33,20 @@ public record DiagnosticContext(
                 resource, DiagnosticDecision.normal(resource, resource + " status nominal."));
     }
 
-    private static Map<ResourceType, DiagnosticDecision> initialStates(
+    static Map<ResourceType, DiagnosticDecision> initialStates(
             DiagnosticSnapshot snapshot) {
         EnumMap<ResourceType, DiagnosticDecision> states = new EnumMap<>(ResourceType.class);
+        snapshot.resources().forEach((resource, diagnosis) -> states.put(
+                resource,
+                new DiagnosticDecision(
+                        resource,
+                        diagnosis.state(),
+                        diagnosis.severity(),
+                        diagnosis.reason(),
+                        diagnosis.evidence(),
+                        0)));
         if (snapshot.resource() != ResourceType.UNKNOWN) {
-            states.put(
+            states.putIfAbsent(
                     snapshot.resource(),
                     new DiagnosticDecision(
                             snapshot.resource(),

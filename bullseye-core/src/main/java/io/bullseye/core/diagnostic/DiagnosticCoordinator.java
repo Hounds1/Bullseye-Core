@@ -5,6 +5,7 @@ import io.bullseye.common.diagnostic.DiagnosticEvidence;
 import io.bullseye.common.diagnostic.DiagnosticSnapshot;
 import io.bullseye.common.diagnostic.DiagnosticSnapshot.Observation;
 import io.bullseye.common.diagnostic.DiagnosticSnapshot.ObservationStatus;
+import io.bullseye.common.diagnostic.DiagnosticSnapshot.ResourceDiagnosis;
 import io.bullseye.common.diagnostic.ResourceState;
 import io.bullseye.common.diagnostic.ResourceType;
 import io.bullseye.common.diagnostic.Severity;
@@ -157,24 +158,11 @@ public final class DiagnosticCoordinator {
         }
         DiagnosticSnapshot current = stateRepository.current();
         this.startedAt = current.evaluatedAt();
-        if (current.resource() != ResourceType.UNKNOWN) {
-            resourceStates.put(
-                    current.resource(),
-                    new DiagnosticDecision(
-                            current.resource(),
-                            current.state(),
-                            current.severity(),
-                            "Diagnostic state retained.",
-                            current.evidence(),
-                            0));
-        }
-        if (current.resource() == ResourceType.HOST_MEMORY) {
-            memoryAttribution = current.attribution();
-        } else if (current.resource() == ResourceType.HOST_CPU) {
-            cpuAttribution = current.attribution();
-        } else if (current.resource() == ResourceType.DISK_IO) {
-            ioAttribution = current.attribution();
-        }
+        resourceStates.putAll(DiagnosticContext.initialStates(current));
+        resourceStates.keySet().retainAll(engine.resources());
+        memoryAttribution = current.diagnosis(ResourceType.HOST_MEMORY).attribution();
+        cpuAttribution = current.diagnosis(ResourceType.HOST_CPU).attribution();
+        ioAttribution = current.diagnosis(ResourceType.DISK_IO).attribution();
     }
 
     public synchronized Optional<DiagnosticTransition> evaluate(long evaluatedAt) {
@@ -203,15 +191,12 @@ public final class DiagnosticCoordinator {
         updateMemoryAttribution(previousMemory, currentMemory, evaluatedAt);
         updateCpuAttribution(previousCpu, currentCpu, evaluatedAt);
         updateIoAttribution(previousIo, currentIo, evaluatedAt);
-        WorkloadAttribution attribution = switch (snapshotResource) {
-            case HOST_MEMORY -> memoryAttribution;
-            case HOST_CPU -> cpuAttribution;
-            case DISK_IO -> ioAttribution;
-            default -> WorkloadAttribution.unresolved();
-        };
-
-        boolean changed =
+        WorkloadAttribution attribution = attributionFor(snapshotResource);
+        boolean primaryChanged =
                 !sameState(previous, primary, snapshotResource, snapshotState, attribution);
+        Map<ResourceType, ResourceDiagnosis> resources = resourceDiagnoses(previous, evaluatedAt);
+        List<ResourceType> changedResources = changedResources(previous, resources);
+        boolean changed = primaryChanged || !changedResources.isEmpty();
         Map<ResourceType, Observation> observations = observations(evaluatedAt);
 
         DiagnosticSnapshot current =
@@ -223,30 +208,83 @@ public final class DiagnosticCoordinator {
                         snapshotState,
                         attribution,
                         primary.evidence(),
-                        changed ? evaluatedAt : previous.since(),
+                        primaryChanged ? evaluatedAt : previous.since(),
                         changed ? previous.version() + 1 : previous.version(),
                         evaluatedAt,
                         observationStatus(observations),
-                        observations);
+                        observations,
+                        resources);
         stateRepository.update(current);
         if (!changed) {
             return Optional.empty();
         }
+        DiagnosticDecision eventDecision = primaryChanged
+                ? primary
+                : resourceStates.getOrDefault(
+                        changedResources.getFirst(),
+                        DiagnosticDecision.normal(
+                                changedResources.getFirst(), "Diagnostic monitoring withdrawn."));
         DiagnosticEvent event =
                 new DiagnosticEvent(
                         eventIdSupplier.get(),
                         current.host(),
                         current.application(),
-                        primary.resource(),
-                        primary.state(),
-                        primary.severity(),
+                        eventDecision.resource(),
+                        eventDecision.state(),
+                        eventDecision.severity(),
                         evaluatedAt,
-                        primary.reason());
+                        eventDecision.reason());
         return Optional.of(new DiagnosticTransition(previous, current, event));
     }
 
     public synchronized Map<ResourceType, DiagnosticDecision> resourceStates() {
         return Map.copyOf(resourceStates);
+    }
+
+    private WorkloadAttribution attributionFor(ResourceType resource) {
+        return switch (resource) {
+            case HOST_MEMORY -> memoryAttribution;
+            case HOST_CPU -> cpuAttribution;
+            case DISK_IO -> ioAttribution;
+            default -> WorkloadAttribution.unresolved();
+        };
+    }
+
+    private Map<ResourceType, ResourceDiagnosis> resourceDiagnoses(
+            DiagnosticSnapshot previous, long evaluatedAt) {
+        EnumMap<ResourceType, ResourceDiagnosis> diagnoses = new EnumMap<>(ResourceType.class);
+        for (ResourceType resource : engine.resources()) {
+            DiagnosticDecision decision = resourceStates.get(resource);
+            ResourceDiagnosis before = previous.diagnosis(resource);
+            WorkloadAttribution attribution = attributionFor(resource);
+            boolean unchanged = before.severity() == decision.severity()
+                    && before.state() == decision.state()
+                    && before.attribution().sameSourceAs(attribution);
+            diagnoses.put(resource, new ResourceDiagnosis(
+                    decision.severity(),
+                    decision.state(),
+                    decision.reason(),
+                    decision.evidence(),
+                    attribution,
+                    unchanged ? before.since() : evaluatedAt));
+        }
+        return Map.copyOf(diagnoses);
+    }
+
+    private static List<ResourceType> changedResources(
+            DiagnosticSnapshot previous, Map<ResourceType, ResourceDiagnosis> current) {
+        List<ResourceType> changed = new ArrayList<>();
+        for (ResourceType resource : ResourceType.values()) {
+            ResourceDiagnosis diagnosis = current.get(resource);
+            if (diagnosis != null) {
+                if (!previous.diagnosis(resource).sameStateAs(diagnosis)) {
+                    changed.add(resource);
+                }
+            } else if (previous.resources().containsKey(resource)) {
+                changed.add(resource);
+            }
+        }
+        return List.copyOf(changed);
     }
 
     private Map<ResourceType, Observation> observations(long now) {
@@ -591,8 +629,6 @@ public final class DiagnosticCoordinator {
         return previous.severity() == primary.severity()
                 && previous.resource() == resource
                 && previous.state() == state
-                && previous.attribution().workload().equals(attribution.workload())
-                && previous.attribution().confidence() == attribution.confidence()
-                && previous.attribution().status() == attribution.status();
+                && previous.attribution().sameSourceAs(attribution);
     }
 }

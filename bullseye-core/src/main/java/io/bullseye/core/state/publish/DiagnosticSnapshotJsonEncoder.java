@@ -29,37 +29,12 @@ public final class DiagnosticSnapshotJsonEncoder {
                         .append("\",\n")
                         .append("  \"state\": \"")
                         .append(snapshot.state())
-                        .append("\",\n")
-                        .append("  \"primaryWorkload\": \"")
-                        .append(escape(snapshot.attribution().workload().name()))
-                        .append("\",\n")
-                        .append("  \"workloadType\": \"")
-                        .append(snapshot.attribution().workload().type())
-                        .append("\",\n")
-                        .append("  \"cgroupPath\": \"")
-                        .append(escape(snapshot.attribution().workload().cgroupPath()))
-                        .append("\",\n")
-                        .append("  \"attributionConfidence\": \"")
-                        .append(snapshot.attribution().confidence())
-                        .append("\",\n")
-                        .append("  \"attributionStatus\": \"")
-                        .append(snapshot.attribution().status())
-                        .append("\",\n")
-                        .append("  \"attributionScore\": ")
-                        .append(snapshot.attribution().score())
-                        .append(",\n")
-                        .append("  \"attributionCollectedAt\": ")
-                        .append(snapshot.attribution().collectedAt())
-                        .append(",\n")
-                        .append("  \"attributionCoverage\": ")
-                        .append(coverage(snapshot.attribution().coverage()))
-                        .append(",\n")
-                        .append("  \"attributionEvidence\": ")
-                        .append(evidence(snapshot.attribution().evidence(), "  "))
-                        .append(",\n")
-                        .append("  \"evidence\": ")
-                        .append(evidence(snapshot.evidence(), "  "));
+                        .append("\",\n");
+        appendAttribution(json, snapshot.attribution(), "  ");
         return json.append(",\n")
+                .append("  \"evidence\": ")
+                .append(evidence(snapshot.evidence(), "  "))
+                .append(",\n")
                 .append("  \"evaluatedAt\": ")
                 .append(snapshot.evaluatedAt())
                 .append(",\n")
@@ -68,6 +43,9 @@ public final class DiagnosticSnapshotJsonEncoder {
                 .append("\",\n")
                 .append("  \"observations\": ")
                 .append(observations(snapshot))
+                .append(",\n")
+                .append("  \"resources\": ")
+                .append(resources(snapshot))
                 .append(",\n")
                 .append("  \"since\": ")
                 .append(snapshot.since())
@@ -79,22 +57,56 @@ public final class DiagnosticSnapshotJsonEncoder {
                 .toString();
     }
 
-    private static String coverage(WorkloadAttribution.Coverage coverage) {
+    private static void appendAttribution(
+            StringBuilder json, WorkloadAttribution attribution, String indent) {
+        json.append(indent).append("\"primaryWorkload\": \"")
+                .append(escape(attribution.workload().name()))
+                .append("\",\n")
+                .append(indent).append("\"workloadType\": \"")
+                .append(attribution.workload().type())
+                .append("\",\n")
+                .append(indent).append("\"cgroupPath\": \"")
+                .append(escape(attribution.workload().cgroupPath()))
+                .append("\",\n")
+                .append(indent).append("\"attributionConfidence\": \"")
+                .append(attribution.confidence())
+                .append("\",\n")
+                .append(indent).append("\"attributionStatus\": \"")
+                .append(attribution.status())
+                .append("\",\n")
+                .append(indent).append("\"attributionScore\": ")
+                .append(attribution.score())
+                .append(",\n")
+                .append(indent).append("\"attributionCollectedAt\": ")
+                .append(attribution.collectedAt())
+                .append(",\n")
+                .append(indent).append("\"attributionCoverage\": ")
+                .append(coverage(attribution.coverage(), indent))
+                .append(",\n")
+                .append(indent).append("\"attributionEvidence\": ")
+                .append(evidence(attribution.evidence(), indent));
+    }
+
+    private static String coverage(WorkloadAttribution.Coverage coverage, String indent) {
         if (coverage == null) {
             return "null";
         }
         return new StringBuilder("{\n")
-                .append("    \"complete\": ")
+                .append(indent).append("  \"complete\": ")
                 .append(coverage.complete())
-                .append(",\n    \"collectedGroups\": ")
+                .append(",\n")
+                .append(indent).append("  \"collectedGroups\": ")
                 .append(coverage.collectedGroups())
-                .append(",\n    \"failedGroups\": ")
+                .append(",\n")
+                .append(indent).append("  \"failedGroups\": ")
                 .append(coverage.failedGroups())
-                .append(",\n    \"discoveryFailed\": ")
+                .append(",\n")
+                .append(indent).append("  \"discoveryFailed\": ")
                 .append(coverage.discoveryFailed())
-                .append(",\n    \"discoveryLimited\": ")
+                .append(",\n")
+                .append(indent).append("  \"discoveryLimited\": ")
                 .append(coverage.discoveryLimited())
-                .append("\n  }")
+                .append('\n').append(indent).append('}')
                 .toString();
     }
 
@@ -148,6 +160,45 @@ public final class DiagnosticSnapshotJsonEncoder {
         }
         if (!first) {
             json.append('\n').append("  ");
+        }
+        return json.append('}').toString();
+    }
+
+    private static String resources(DiagnosticSnapshot snapshot) {
+        StringBuilder json = new StringBuilder("{");
+        boolean first = true;
+        for (ResourceType resource : ResourceType.values()) {
+            var diagnosis = snapshot.resources().get(resource);
+            if (diagnosis == null) {
+                continue;
+            }
+            if (!first) {
+                json.append(',');
+            }
+            first = false;
+            json.append("\n    \"")
+                    .append(resource)
+                    .append("\": {\n")
+                    .append("      \"severity\": \"")
+                    .append(diagnosis.severity())
+                    .append("\",\n")
+                    .append("      \"state\": \"")
+                    .append(diagnosis.state())
+                    .append("\",\n")
+                    .append("      \"reason\": \"")
+                    .append(escape(diagnosis.reason()))
+                    .append("\",\n")
+                    .append("      \"since\": ")
+                    .append(diagnosis.since())
+                    .append(",\n")
+                    .append("      \"evidence\": ")
+                    .append(evidence(diagnosis.evidence(), "      "))
+                    .append(",\n");
+            appendAttribution(json, diagnosis.attribution(), "      ");
+            json.append("\n    }");
+        }
+        if (!first) {
+            json.append("\n  ");
         }
         return json.append('}').toString();
     }

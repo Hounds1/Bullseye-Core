@@ -121,4 +121,11 @@ public record WorkloadAttribution(
     public boolean resolved() {
         return status == Status.IDENTIFIED;
     }
+
+    public boolean sameSourceAs(WorkloadAttribution other) {
+        Objects.requireNonNull(other, "other");
+        return workload.equals(other.workload)
+                && confidence == other.confidence
+                && status == other.status;
+    }
 }

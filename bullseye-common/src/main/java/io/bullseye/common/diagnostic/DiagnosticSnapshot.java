@@ -18,7 +18,8 @@ public record DiagnosticSnapshot(
         long version,
         long evaluatedAt,
         ObservationStatus observationStatus,
-        Map<ResourceType, Observation> observations) {
+        Map<ResourceType, Observation> observations,
+        Map<ResourceType, ResourceDiagnosis> resources) {
 
     public enum ObservationStatus {
         INITIALIZING,
@@ -38,6 +39,33 @@ public record DiagnosticSnapshot(
         }
     }
 
+    public record ResourceDiagnosis(
+            Severity severity,
+            ResourceState state,
+            String reason,
+            List<DiagnosticEvidence> evidence,
+            WorkloadAttribution attribution,
+            long since) {
+
+        public ResourceDiagnosis {
+            Objects.requireNonNull(severity, "severity");
+            Objects.requireNonNull(state, "state");
+            requireText(reason, "reason");
+            evidence = List.copyOf(Objects.requireNonNull(evidence, "evidence"));
+            Objects.requireNonNull(attribution, "attribution");
+            if (since < 0) {
+                throw new IllegalArgumentException("since must not be negative");
+            }
+        }
+
+        public boolean sameStateAs(ResourceDiagnosis other) {
+            Objects.requireNonNull(other, "other");
+            return severity == other.severity
+                    && state == other.state
+                    && attribution.sameSourceAs(other.attribution);
+        }
+    }
+
     public DiagnosticSnapshot {
         requireText(host, "host");
         requireText(application, "application");
@@ -48,6 +76,7 @@ public record DiagnosticSnapshot(
         evidence = List.copyOf(Objects.requireNonNull(evidence, "evidence"));
         Objects.requireNonNull(observationStatus, "observationStatus");
         observations = Map.copyOf(Objects.requireNonNull(observations, "observations"));
+        resources = Map.copyOf(Objects.requireNonNull(resources, "resources"));
         if (since < 0) {
             throw new IllegalArgumentException("since must not be negative");
         }
@@ -57,6 +86,40 @@ public record DiagnosticSnapshot(
         if (evaluatedAt < since) {
             throw new IllegalArgumentException("evaluatedAt must not precede since");
         }
+        for (ResourceDiagnosis diagnosis : resources.values()) {
+            if (diagnosis.since() > evaluatedAt) {
+                throw new IllegalArgumentException("Resource since must not follow evaluatedAt");
+            }
+        }
+    }
+
+    public DiagnosticSnapshot(
+            String host,
+            String application,
+            Severity severity,
+            ResourceType resource,
+            ResourceState state,
+            WorkloadAttribution attribution,
+            List<DiagnosticEvidence> evidence,
+            long since,
+            long version,
+            long evaluatedAt,
+            ObservationStatus observationStatus,
+            Map<ResourceType, Observation> observations) {
+        this(
+                host,
+                application,
+                severity,
+                resource,
+                state,
+                attribution,
+                evidence,
+                since,
+                version,
+                evaluatedAt,
+                observationStatus,
+                observations,
+                Map.of());
     }
 
     public DiagnosticSnapshot(
@@ -115,6 +178,31 @@ public record DiagnosticSnapshot(
                 List.of(),
                 now,
                 1);
+    }
+
+    public ResourceDiagnosis diagnosis(ResourceType requestedResource) {
+        Objects.requireNonNull(requestedResource, "requestedResource");
+        ResourceDiagnosis diagnosis = resources.get(requestedResource);
+        if (diagnosis != null) {
+            return diagnosis;
+        }
+        // Older snapshots contain only the primary diagnosis.
+        if (resource == requestedResource) {
+            return new ResourceDiagnosis(
+                    severity,
+                    state,
+                    "Diagnostic state retained.",
+                    evidence,
+                    attribution,
+                    since);
+        }
+        return new ResourceDiagnosis(
+                Severity.NORMAL,
+                ResourceState.NORMAL,
+                "System status nominal.",
+                List.of(),
+                WorkloadAttribution.unresolved(),
+                since);
     }
 
     private static void requireText(String value, String name) {
