@@ -20,7 +20,7 @@ import java.util.function.Supplier;
 
 public final class IoPressureAttributor {
 
-    private final Supplier<CgroupMonitor.IoCollectionResult> collections;
+    private final Supplier<CgroupMonitor.CollectionResult<CgroupIoSnapshot>> collections;
     private final Runnable historyReset;
     private final double minimumScore;
     private final double dominanceRatio;
@@ -40,7 +40,7 @@ public final class IoPressureAttributor {
     }
 
     IoPressureAttributor(
-            Supplier<CgroupMonitor.IoCollectionResult> collections,
+            Supplier<CgroupMonitor.CollectionResult<CgroupIoSnapshot>> collections,
             double minimumScore,
             double dominanceRatio,
             Duration maximumObservationGap) {
@@ -48,7 +48,7 @@ public final class IoPressureAttributor {
     }
 
     private IoPressureAttributor(
-            Supplier<CgroupMonitor.IoCollectionResult> collections,
+            Supplier<CgroupMonitor.CollectionResult<CgroupIoSnapshot>> collections,
             Runnable historyReset,
             double minimumScore,
             double dominanceRatio,
@@ -71,7 +71,7 @@ public final class IoPressureAttributor {
     }
 
     public WorkloadAttribution attribute() {
-        CgroupMonitor.IoCollectionResult collection = collections.get();
+        CgroupMonitor.CollectionResult<CgroupIoSnapshot> collection = collections.get();
         if (collection.status() != CgroupMonitor.Status.AVAILABLE) {
             reset();
             WorkloadAttribution.Status status =
@@ -292,7 +292,8 @@ public final class IoPressureAttributor {
     }
 
     private static WorkloadAttribution unavailable(
-            WorkloadAttribution.Status status, CgroupMonitor.IoCollectionResult collection) {
+            WorkloadAttribution.Status status,
+            CgroupMonitor.CollectionResult<CgroupIoSnapshot> collection) {
         return WorkloadAttribution.unavailable(
                 status, collection.coverage(), collection.collectedAt());
     }

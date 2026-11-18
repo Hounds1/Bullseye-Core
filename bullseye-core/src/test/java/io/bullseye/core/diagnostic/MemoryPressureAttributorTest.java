@@ -6,13 +6,16 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.bullseye.common.workload.WorkloadAttribution;
+import io.bullseye.common.workload.WorkloadAttribution.Confidence;
 import io.bullseye.common.workload.WorkloadAttribution.Coverage;
 import io.bullseye.common.workload.WorkloadIdentity;
+import io.bullseye.core.config.BullseyeConfiguration.AttributionConfidence;
 import io.bullseye.core.linux.cgroup.CgroupMemorySnapshot;
 import io.bullseye.core.linux.cgroup.CgroupMonitor;
 
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
@@ -23,7 +26,7 @@ class MemoryPressureAttributorTest {
     private static final long HOST_TOTAL = 16 * GIB;
 
     @Test
-    void identifiesClearSingleCauseWithHighConfidence() {
+    void identifiesClearSingleCauseWithInitialLowConfidence() {
         WorkloadAttribution result =
                 attribute(
                         List.of(
@@ -36,7 +39,7 @@ class MemoryPressureAttributorTest {
                                 path("service-c"), snapshotAt("service-c", 4, 1, 0, 0)));
 
         assertEquals("service-b", result.workload().name());
-        assertEquals(WorkloadAttribution.Confidence.HIGH, result.confidence());
+        assertEquals(WorkloadAttribution.Confidence.LOW, result.confidence());
     }
 
     @Test
@@ -75,7 +78,7 @@ class MemoryPressureAttributorTest {
 
         assertEquals("order-api.service", result.workload().name());
         assertEquals(28.4375, result.score(), 0.000001);
-        assertEquals(WorkloadAttribution.Confidence.MEDIUM, result.confidence());
+        assertEquals(WorkloadAttribution.Confidence.LOW, result.confidence());
         assertEquals(0, value(result, "score.pressure"));
         assertEquals(0, value(result, "score.events"));
     }
@@ -93,7 +96,7 @@ class MemoryPressureAttributorTest {
 
         assertEquals("database.service", result.workload().name());
         assertEquals(48.75, result.score(), 0.000001);
-        assertEquals(WorkloadAttribution.Confidence.HIGH, result.confidence());
+        assertEquals(WorkloadAttribution.Confidence.LOW, result.confidence());
     }
 
     @Test
@@ -141,7 +144,7 @@ class MemoryPressureAttributorTest {
 
         assertEquals("limited-large.service", result.workload().name());
         assertEquals(48.75, result.score(), 0.000001);
-        assertEquals(WorkloadAttribution.Confidence.HIGH, result.confidence());
+        assertEquals(WorkloadAttribution.Confidence.LOW, result.confidence());
         assertEquals(120, value(result, "limit.high.usage"), 0.000001);
         assertEquals(12.0 / 14 * 100, value(result, "limit.max.usage"), 0.000001);
     }
@@ -192,10 +195,12 @@ class MemoryPressureAttributorTest {
 
     @Test
     void zeroMinimumScoreDoesNotIdentifyAnEmptyGroupWithPressure() {
-        var collection = new CgroupMonitor.CollectionResult(
+        var collection = new CgroupMonitor.CollectionResult<>(
                 CgroupMonitor.Status.AVAILABLE,
                 List.of(snapshot("empty.service", 0, 100, 100)),
-                Map.of());
+                Map.of(),
+                Coverage.complete(1),
+                5_000);
 
         var result = new MemoryPressureAttributor(() -> collection, 0, 1.2)
                 .attribute(HOST_TOTAL);
@@ -206,7 +211,7 @@ class MemoryPressureAttributorTest {
 
     @Test
     void accessDeniedIsReturnedWithoutException() {
-        CgroupMonitor.CollectionResult denied =
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> denied =
                 CgroupMonitor.CollectionResult.unavailable(CgroupMonitor.Status.ACCESS_DENIED);
         MemoryPressureAttributor attributor = new MemoryPressureAttributor(() -> denied, 5, 1.2);
 
@@ -225,11 +230,13 @@ class MemoryPressureAttributorTest {
 
     @Test
     void missingHostCapacityReturnsInsufficientData() {
-        CgroupMonitor.CollectionResult collection =
-                new CgroupMonitor.CollectionResult(
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> collection =
+                new CgroupMonitor.CollectionResult<>(
                         CgroupMonitor.Status.AVAILABLE,
                         List.of(snapshot("order-api.service", 7, 40, 6)),
-                        Map.of());
+                        Map.of(),
+                        Coverage.complete(1),
+                        5_000);
         MemoryPressureAttributor attributor =
                 new MemoryPressureAttributor(() -> collection, 5, 1.2);
 
@@ -338,14 +345,14 @@ class MemoryPressureAttributorTest {
     @Test
     void incompleteCollectionCapsConfidenceAndRetainsCoverage() {
         var current = snapshotAt("api.service", 12, 40, 6, 5_000);
-        assertEquals(WorkloadAttribution.Confidence.HIGH,
+        assertEquals(WorkloadAttribution.Confidence.LOW,
                 attribute(List.of(current), Map.of()).confidence());
 
         for (Coverage coverage : List.of(
                 new Coverage(1, 1, false, false),
                 new Coverage(1, 0, true, false),
                 new Coverage(1, 0, false, true))) {
-            var collection = new CgroupMonitor.CollectionResult(
+            var collection = new CgroupMonitor.CollectionResult<>(
                     CgroupMonitor.Status.AVAILABLE, List.of(current), Map.of(), coverage, 5_000);
             var result = new MemoryPressureAttributor(() -> collection, 5, 1.2)
                     .attribute(HOST_TOTAL);
@@ -360,7 +367,7 @@ class MemoryPressureAttributorTest {
     @Test
     void noCandidateStillReportsIncompleteInvestigation() {
         var coverage = new Coverage(0, 1, true, false);
-        var collection = new CgroupMonitor.CollectionResult(
+        var collection = new CgroupMonitor.CollectionResult<CgroupMemorySnapshot>(
                 CgroupMonitor.Status.AVAILABLE, List.of(), Map.of(), coverage, 5_000);
         var result = new MemoryPressureAttributor(() -> collection, 5, 1.2).attribute(HOST_TOTAL);
 
@@ -376,6 +383,226 @@ class MemoryPressureAttributorTest {
 
         assertEquals("a.service", attribute(List.of(a, b), Map.of()).workload().name());
         assertEquals("a.service", attribute(List.of(b, a), Map.of()).workload().name());
+    }
+
+    @Test
+    void stableGaugeConfidenceRequiresDistinctObservationsAndTenSeconds() {
+        var collections = new AtomicReference<>(observedMemory(5_000, 12, 2));
+        var attributor = new MemoryPressureAttributor(collections::get, 5, 1.2);
+        var first = attributor.attribute(HOST_TOTAL);
+        assertEquals(Confidence.LOW, first.confidence());
+        assertEquals(48.75, first.score());
+        assertEquals(1, value(first, "confidence.observations"));
+        assertEquals(0, value(first, "confidence.duration"));
+        assertEquals(40.625, value(first, "confidence.margin"));
+        assertEquals(8.125, value(first, "confidence.runner-score"));
+        assertEquals(3, value(first, "confidence.confirmations-remaining"));
+        assertTrue(attributor.needsConfirmation());
+
+        collections.set(observedMemory(10_000, 12, 2));
+        assertEquals(Confidence.LOW, attributor.attribute(HOST_TOTAL).confidence());
+        collections.set(observedMemory(14_999, 12, 2));
+        var tooEarly = attributor.attribute(HOST_TOTAL);
+        assertEquals(3, value(tooEarly, "confidence.observations"));
+        assertEquals(9.999, value(tooEarly, "confidence.duration"), 0.000001);
+        assertEquals(Confidence.LOW, tooEarly.confidence());
+
+        collections.set(observedMemory(15_000, 12, 2));
+        var confirmed = attributor.attribute(HOST_TOTAL);
+        assertEquals(Confidence.HIGH, confirmed.confidence());
+        assertEquals(48.75, confirmed.score());
+        assertEquals(4, value(confirmed, "confidence.observations"));
+        assertEquals(10, value(confirmed, "confidence.duration"));
+        assertFalse(attributor.needsConfirmation());
+    }
+
+    @Test
+    void repeatedMemoryCollectionConsumesAttemptsWithoutAdvancingConfidence() {
+        var collections = new AtomicReference<>(observedMemory(5_000, 12, 2));
+        var attributor = new MemoryPressureAttributor(collections::get, 5, 1.2);
+        var first = attributor.attribute(HOST_TOTAL);
+        assertEquals(3, value(first, "confidence.confirmations-remaining"));
+
+        for (int remaining = 2; remaining >= 0; remaining--) {
+            assertTrue(attributor.needsConfirmation());
+            var repeated = attributor.attribute(HOST_TOTAL);
+            assertEquals(Confidence.LOW, repeated.confidence());
+            assertEquals(1, value(repeated, "confidence.observations"));
+            assertEquals(0, value(repeated, "confidence.duration"));
+            assertEquals(remaining, value(repeated, "confidence.confirmations-remaining"));
+        }
+
+        assertFalse(attributor.needsConfirmation());
+    }
+
+    @Test
+    void hostShareOnlyCandidateCanReachMediumAfterConfirmation() {
+        var collections = new AtomicReference<>(observedMemory(5_000, 7, 1));
+        var attributor = new MemoryPressureAttributor(collections::get, 5, 1.2);
+        assertEquals(Confidence.LOW, attributor.attribute(HOST_TOTAL).confidence());
+        collections.set(observedMemory(10_000, 7, 1));
+        assertEquals(Confidence.LOW, attributor.attribute(HOST_TOTAL).confidence());
+        collections.set(observedMemory(15_000, 7, 1));
+
+        var confirmed = attributor.attribute(HOST_TOTAL);
+        assertEquals(Confidence.MEDIUM, confirmed.confidence());
+        assertEquals(28.4375, confirmed.score());
+        assertEquals(0, value(confirmed, "score.growth"));
+        assertFalse(attributor.needsConfirmation());
+    }
+
+    @Test
+    void changingMemoryWinnerOrBaseGradeDoesNotReplenishConfirmationBudget() {
+        var collections = new AtomicReference<>(observedMemory(5_000, 12, 2));
+        var attributor = new MemoryPressureAttributor(collections::get, 5, 1.2);
+        attributor.attribute(HOST_TOTAL);
+
+        collections.set(observedMemory(10_000, 7, 2));
+        var changedGrade = attributor.attribute(HOST_TOTAL);
+        assertEquals(Confidence.LOW, changedGrade.confidence());
+        assertEquals(1, value(changedGrade, "confidence.observations"));
+        assertEquals(2, value(changedGrade, "confidence.confirmations-remaining"));
+
+        collections.set(observedMemory(15_000, 2, 12));
+        var changedWinner = attributor.attribute(HOST_TOTAL);
+        assertEquals("runner.service", changedWinner.workload().name());
+        assertEquals(1, value(changedWinner, "confidence.observations"));
+        assertEquals(1, value(changedWinner, "confidence.confirmations-remaining"));
+
+        collections.set(observedMemory(20_000, 12, 2));
+        var exhausted = attributor.attribute(HOST_TOTAL);
+        assertEquals(Confidence.LOW, exhausted.confidence());
+        assertEquals(1, value(exhausted, "confidence.observations"));
+        assertEquals(0, value(exhausted, "confidence.confirmations-remaining"));
+        assertFalse(attributor.needsConfirmation());
+    }
+
+    @Test
+    void partialCollectionAndResetBothDiscardConfirmedMemoryHistory() {
+        var collections = new AtomicReference<>(observedMemory(5_000, 12, 2));
+        var attributor = new MemoryPressureAttributor(collections::get, 5, 1.2);
+        confirmHigh(attributor, collections);
+
+        var complete = observedMemory(20_000, 12, 2);
+        collections.set(new CgroupMonitor.CollectionResult<>(
+                complete.status(), complete.snapshots(), complete.previousSnapshots(),
+                new Coverage(2, 0, false, true), complete.collectedAt()));
+        var partial = attributor.attribute(HOST_TOTAL);
+        assertEquals(Confidence.LOW, partial.confidence());
+        assertEquals(48.75, partial.score());
+
+        collections.set(observedMemory(25_000, 12, 2));
+        var recovered = attributor.attribute(HOST_TOTAL);
+        assertEquals(Confidence.LOW, recovered.confidence());
+        assertEquals(1, value(recovered, "confidence.observations"));
+
+        attributor.reset();
+        assertFalse(attributor.needsConfirmation());
+        collections.set(observedMemory(30_000, 12, 2));
+        var restarted = attributor.attribute(HOST_TOTAL);
+        assertEquals(Confidence.LOW, restarted.confidence());
+        assertEquals(1, value(restarted, "confidence.observations"));
+    }
+
+    @Test
+    void hostCapacityChangeDiscardsGrowthAndConfidenceButKeepsCurrentShare() {
+        var collections = new AtomicReference<>(observedMemory(5_000, 12, 2));
+        var attributor = new MemoryPressureAttributor(collections::get, 5, 1.2);
+        confirmHigh(attributor, collections);
+
+        var current = snapshotAt("worker.service", 24, 0, 0, 20_000);
+        var previous = snapshotAt("worker.service", 12, 0, 0, 15_000);
+        collections.set(new CgroupMonitor.CollectionResult<>(
+                CgroupMonitor.Status.AVAILABLE,
+                List.of(current), Map.of(path("worker.service"), previous),
+                Coverage.complete(1), 20_000));
+        var resized = attributor.attribute(HOST_TOTAL * 2);
+
+        assertEquals(Confidence.LOW, resized.confidence());
+        assertEquals(75, value(resized, "host.share"));
+        assertEquals(48.75, resized.score());
+        assertEquals(0, value(resized, "score.growth"));
+        assertFalse(hasEvidence(resized, "growth.bytes"));
+    }
+
+    @Test
+    void excessiveObservationGapDiscardsGrowthWithoutDiscardingHostShare() {
+        var current = snapshotAt("api.service", 12, 0, 0, 40_000);
+        var previous = snapshotAt("api.service", 2, 0, 0, 0);
+        var collection = new CgroupMonitor.CollectionResult<>(
+                CgroupMonitor.Status.AVAILABLE,
+                List.of(current), Map.of(path("api.service"), previous),
+                Coverage.complete(1), 40_000);
+        var attributor = new MemoryPressureAttributor(
+                () -> collection, 5, 1.2, Duration.ofSeconds(32),
+                new AttributionConfidence(3, Duration.ofSeconds(10), 3, 5));
+
+        var result = attributor.attribute(HOST_TOTAL);
+
+        assertEquals(Confidence.LOW, result.confidence());
+        assertEquals(48.75, result.score());
+        assertEquals(0, value(result, "score.growth"));
+        assertFalse(hasEvidence(result, "growth.bytes"));
+        assertFalse(hasEvidence(result, "observation.duration"));
+    }
+
+    @Test
+    void eventCounterRollbackInvalidatesConfidenceWithoutChangingContributionScore() {
+        var collections = new AtomicReference<>(observedMemory(5_000, 12, 2));
+        var attributor = new MemoryPressureAttributor(collections::get, 5, 1.2);
+        confirmHigh(attributor, collections);
+
+        var previous = new CgroupMemorySnapshot(
+                WorkloadIdentity.fromCgroupPath(path("worker.service")),
+                12 * GIB, null, 0, 0, 100, 100, 10, 5, 15_000);
+        var current = snapshotAt("worker.service", 12, 0, 0, 20_000);
+        collections.set(new CgroupMonitor.CollectionResult<>(
+                CgroupMonitor.Status.AVAILABLE,
+                List.of(current), Map.of(path("worker.service"), previous),
+                Coverage.complete(1), 20_000));
+        var rollback = attributor.attribute(HOST_TOTAL);
+        assertEquals(Confidence.LOW, rollback.confidence());
+        assertEquals(48.75, rollback.score());
+        assertEquals(0, value(rollback, "growth.bytes"));
+        assertEquals(0, value(rollback, "events.oom_kill.delta"));
+
+        collections.set(observedMemory(25_000, 12, 2));
+        var recovered = attributor.attribute(HOST_TOTAL);
+        assertEquals(Confidence.LOW, recovered.confidence());
+        assertEquals(1, value(recovered, "confidence.observations"));
+    }
+
+    @Test
+    void reversedGaugeTimeCannotAdvanceConfirmation() {
+        var collections = new AtomicReference<>(observedMemory(5_000, 12, 2));
+        var attributor = new MemoryPressureAttributor(collections::get, 5, 1.2);
+        attributor.attribute(HOST_TOTAL);
+        collections.set(observedMemory(4_000, 12, 2));
+
+        var reversed = attributor.attribute(HOST_TOTAL);
+        assertEquals(Confidence.LOW, reversed.confidence());
+        assertTrue(value(reversed, "confidence.observations") <= 1);
+    }
+
+    private static void confirmHigh(
+            MemoryPressureAttributor attributor,
+            AtomicReference<CgroupMonitor.CollectionResult<CgroupMemorySnapshot>> collections) {
+        WorkloadAttribution result = null;
+        for (long time : List.of(5_000L, 10_000L, 15_000L)) {
+            collections.set(observedMemory(time, 12, 2));
+            result = attributor.attribute(HOST_TOTAL);
+        }
+        assertEquals(Confidence.HIGH, result.confidence());
+    }
+
+    private static CgroupMonitor.CollectionResult<CgroupMemorySnapshot> observedMemory(
+            long timestamp, double workerGib, double runnerGib) {
+        return new CgroupMonitor.CollectionResult<>(
+                CgroupMonitor.Status.AVAILABLE,
+                List.of(
+                        snapshotAt("worker.service", workerGib, 0, 0, timestamp),
+                        snapshotAt("runner.service", runnerGib, 0, 0, timestamp)),
+                Map.of(), Coverage.complete(2), timestamp);
     }
 
     private static double value(WorkloadAttribution result, String name) {
@@ -397,10 +624,17 @@ class MemoryPressureAttributorTest {
 
     private static WorkloadAttribution attribute(
             List<CgroupMemorySnapshot> current, Map<String, CgroupMemorySnapshot> previous) {
-        AtomicReference<CgroupMonitor.CollectionResult> result =
+        AtomicReference<CgroupMonitor.CollectionResult<CgroupMemorySnapshot>> result =
                 new AtomicReference<>(
-                        new CgroupMonitor.CollectionResult(
-                                CgroupMonitor.Status.AVAILABLE, current, previous));
+                        new CgroupMonitor.CollectionResult<>(
+                                CgroupMonitor.Status.AVAILABLE,
+                                current,
+                                previous,
+                                Coverage.complete(current.size()),
+                                current.stream()
+                                        .mapToLong(CgroupMemorySnapshot::collectedAt)
+                                        .max()
+                                        .orElse(0)));
         return new MemoryPressureAttributor(result::get, 5, 1.2).attribute(HOST_TOTAL);
     }
 

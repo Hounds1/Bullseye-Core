@@ -41,6 +41,8 @@ public final class DiagnosticCoordinator {
     private WorkloadAttribution cpuAttribution = WorkloadAttribution.unresolved();
     private WorkloadAttribution ioAttribution = WorkloadAttribution.unresolved();
     private Long lastMemoryAttributionAt;
+    private Long lastMemoryInputAt;
+    private long previousHostMemoryTotal;
     private Long lastCpuAttributionAt;
     private Long lastCpuInputAt;
     private Long lastIoAttributionAt;
@@ -339,12 +341,49 @@ public final class DiagnosticCoordinator {
                 || currentMemory.severity().ordinal() < Severity.HIGH.ordinal()) {
             if (memoryAttributor != null
                     && previousMemory.severity().ordinal() >= Severity.HIGH.ordinal()) {
-                memoryAttributor.reset();
+                resetMemoryHistory();
             }
             memoryAttribution = WorkloadAttribution.unresolved();
             lastMemoryAttributionAt = null;
             return;
         }
+
+        Optional<MetricSample> usage = MetricConditions.latest(
+                metricWindow, MetricType.HOST_MEMORY_USAGE, evaluatedAt, maximumSampleAge);
+        boolean fresh =
+                usage.isPresent()
+                        && MetricConditions.latest(
+                                        metricWindow,
+                                        MetricType.HOST_MEMORY_PSI_SOME_AVG10,
+                                        evaluatedAt,
+                                        maximumSampleAge)
+                                .isPresent()
+                        && !MetricConditions.hasExpired(
+                                metricWindow,
+                                MetricType.HOST_MEMORY_PSI_FULL_AVG10,
+                                evaluatedAt,
+                                maximumSampleAge);
+        if (!fresh) {
+            if (lastMemoryInputAt != null) {
+                resetMemoryHistory();
+            }
+            memoryAttribution = retainedLowConfidence(memoryAttribution);
+            return;
+        }
+
+        long inputAt = usage.orElseThrow().timestamp();
+        long hostMemoryTotal = latestHostMemoryTotal(evaluatedAt);
+        boolean inputGap = lastMemoryInputAt != null
+                && inputAt - lastMemoryInputAt > maximumSampleAge.toMillis();
+        boolean capacityChanged = previousHostMemoryTotal > 0
+                && previousHostMemoryTotal != hostMemoryTotal;
+        if (inputGap || capacityChanged) {
+            resetMemoryHistory();
+            memoryAttribution = retainedLowConfidence(memoryAttribution);
+        }
+        boolean newInput = lastMemoryInputAt == null || inputAt > lastMemoryInputAt;
+        lastMemoryInputAt = inputAt;
+        previousHostMemoryTotal = hostMemoryTotal;
 
         boolean highEntry =
                 currentMemory.severity() == Severity.HIGH
@@ -353,20 +392,10 @@ public final class DiagnosticCoordinator {
         boolean refreshDue =
                 lastMemoryAttributionAt == null
                         || evaluatedAt - lastMemoryAttributionAt >= attributionRefreshMillis;
-        boolean fresh =
-                requiredMetrics(ResourceType.HOST_MEMORY).stream()
-                        .allMatch(
-                                type -> MetricConditions.latest(
-                                                metricWindow, type, evaluatedAt, maximumSampleAge)
-                                        .isPresent())
-                        && !MetricConditions.hasExpired(
-                                metricWindow,
-                                MetricType.HOST_MEMORY_PSI_FULL_AVG10,
-                                evaluatedAt,
-                                maximumSampleAge);
-        if ((highEntry || critical || refreshDue) && fresh) {
+        boolean confirmationDue = newInput && memoryAttributor.needsConfirmation();
+        if (highEntry || critical || refreshDue || confirmationDue) {
             lastMemoryAttributionAt = evaluatedAt;
-            memoryAttribution = memoryAttributor.attribute(latestHostMemoryTotal(evaluatedAt));
+            memoryAttribution = memoryAttributor.attribute(hostMemoryTotal);
         }
     }
 
@@ -397,6 +426,7 @@ public final class DiagnosticCoordinator {
             if (lastCpuInputAt != null) {
                 resetCpuHistory();
             }
+            cpuAttribution = retainedLowConfidence(cpuAttribution);
             return;
         }
         long inputAt = usage.orElseThrow().timestamp();
@@ -406,6 +436,7 @@ public final class DiagnosticCoordinator {
         boolean capacityChanged = previousHostCpuCount != 0 && previousHostCpuCount != hostCpuCount;
         if (inputGap || capacityChanged) {
             resetCpuHistory();
+            cpuAttribution = retainedLowConfidence(cpuAttribution);
         }
         boolean newInput = lastCpuInputAt == null || inputAt > lastCpuInputAt;
         lastCpuInputAt = inputAt;
@@ -418,7 +449,9 @@ public final class DiagnosticCoordinator {
                 || evaluatedAt - lastCpuAttributionAt >= attributionRefreshMillis;
         boolean baselineNeeded =
                 cpuAttribution.status() == WorkloadAttribution.Status.INSUFFICIENT_DATA;
-        if (newInput && (highEntry || critical || refreshDue || baselineNeeded)) {
+        if (newInput
+                && (highEntry || critical || refreshDue || baselineNeeded
+                        || cpuAttributor.needsConfirmation())) {
             lastCpuAttributionAt = evaluatedAt;
             cpuAttribution = cpuAttributor.attribute(hostCpuCount);
         }
@@ -479,11 +512,33 @@ public final class DiagnosticCoordinator {
         lastIoInputAt = null;
     }
 
+    private void resetMemoryHistory() {
+        memoryAttributor.reset();
+        lastMemoryAttributionAt = null;
+        lastMemoryInputAt = null;
+        previousHostMemoryTotal = 0;
+    }
+
     private void resetCpuHistory() {
         cpuAttributor.reset();
         lastCpuAttributionAt = null;
         lastCpuInputAt = null;
         previousHostCpuCount = 0;
+    }
+
+    private static WorkloadAttribution retainedLowConfidence(WorkloadAttribution attribution) {
+        if (!attribution.resolved()
+                || attribution.confidence() == WorkloadAttribution.Confidence.LOW) {
+            return attribution;
+        }
+        return new WorkloadAttribution(
+                attribution.workload(),
+                attribution.score(),
+                WorkloadAttribution.Confidence.LOW,
+                attribution.status(),
+                attribution.evidence(),
+                attribution.coverage(),
+                attribution.collectedAt());
     }
 
     private int latestHostCpuCount(long evaluatedAt) {

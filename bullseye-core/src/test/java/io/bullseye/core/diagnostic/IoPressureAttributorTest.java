@@ -14,7 +14,7 @@ import io.bullseye.core.linux.cgroup.CgroupIoSnapshot;
 import io.bullseye.core.linux.cgroup.CgroupIoSnapshot.DeviceLimit;
 import io.bullseye.core.linux.cgroup.CgroupIoSnapshot.DeviceStats;
 import io.bullseye.core.linux.cgroup.CgroupMonitor;
-import io.bullseye.core.linux.cgroup.CgroupMonitor.IoCollectionResult;
+import io.bullseye.core.linux.cgroup.CgroupMonitor.CollectionResult;
 
 import org.junit.jupiter.api.Test;
 
@@ -325,7 +325,7 @@ class IoPressureAttributorTest {
         var newGroup = snapshot("new.service", 1_000,
                 Map.of("8:0", new DeviceStats(1_000_000, 0, 100_000, 0)));
         var coverage = new Coverage(2, 1, true, true);
-        var collection = new IoCollectionResult(
+        var collection = new CollectionResult<>(
                 CgroupMonitor.Status.AVAILABLE,
                 List.of(current, newGroup), Map.of(path("worker.service"), previous),
                 coverage, 1_000);
@@ -391,7 +391,8 @@ class IoPressureAttributorTest {
         var coverage = new Coverage(0, 1, true, false);
         for (CgroupMonitor.Status status : List.of(
                 CgroupMonitor.Status.ACCESS_DENIED, CgroupMonitor.Status.CGROUP_V2_NOT_AVAILABLE)) {
-            var collection = new IoCollectionResult(status, List.of(), Map.of(), coverage, 1_000);
+            var collection = new CollectionResult<CgroupIoSnapshot>(
+                    status, List.of(), Map.of(), coverage, 1_000);
             var result = new IoPressureAttributor(() -> collection, 5, 1.2, MAXIMUM_GAP).attribute();
 
             assertEquals(status.name(), result.status().name());
@@ -422,9 +423,14 @@ class IoPressureAttributorTest {
         return new IoPressureAttributor(() -> collection, 5, 1.2, MAXIMUM_GAP).attribute();
     }
 
-    private static IoCollectionResult collection(
+    private static CollectionResult<CgroupIoSnapshot> collection(
             List<CgroupIoSnapshot> current, Map<String, CgroupIoSnapshot> previous) {
-        return new IoCollectionResult(CgroupMonitor.Status.AVAILABLE, current, previous);
+        return new CollectionResult<>(
+                CgroupMonitor.Status.AVAILABLE,
+                current,
+                previous,
+                Coverage.complete(current.size()),
+                current.stream().mapToLong(CgroupIoSnapshot::collectedAt).max().orElse(0));
     }
 
     private static CgroupIoSnapshot snapshot(

@@ -32,10 +32,10 @@ public final class CgroupMonitor {
         ACCESS_DENIED
     }
 
-    public record CollectionResult(
+    public record CollectionResult<T>(
             Status status,
-            List<CgroupMemorySnapshot> snapshots,
-            Map<String, CgroupMemorySnapshot> previousSnapshots,
+            List<T> snapshots,
+            Map<String, T> previousSnapshots,
             Coverage coverage,
             long collectedAt) {
 
@@ -50,112 +50,28 @@ public final class CgroupMonitor {
             }
         }
 
-        public CollectionResult(
-                Status status,
-                List<CgroupMemorySnapshot> snapshots,
-                Map<String, CgroupMemorySnapshot> previousSnapshots) {
-            this(
-                    status,
-                    snapshots,
-                    previousSnapshots,
-                    Coverage.complete(snapshots.size()),
-                    snapshots.stream()
-                            .mapToLong(CgroupMemorySnapshot::collectedAt)
-                            .max()
-                            .orElse(0));
-        }
-
-        public static CollectionResult unavailable(Status status) {
-            return new CollectionResult(
-                    status, List.of(), Map.of(), new Coverage(0, 0, true, false), 0);
-        }
-    }
-
-    public record CpuCollectionResult(
-            Status status,
-            List<CgroupCpuSnapshot> snapshots,
-            Map<String, CgroupCpuSnapshot> previousSnapshots,
-            Coverage coverage,
-            long collectedAt) {
-
-        public CpuCollectionResult {
-            Objects.requireNonNull(status, "status");
-            snapshots = List.copyOf(Objects.requireNonNull(snapshots, "snapshots"));
-            previousSnapshots =
-                    Map.copyOf(Objects.requireNonNull(previousSnapshots, "previousSnapshots"));
-            Objects.requireNonNull(coverage, "coverage");
-            if (collectedAt < 0) {
-                throw new IllegalArgumentException("collectedAt must not be negative");
-            }
-        }
-
-        public CpuCollectionResult(
-                Status status,
-                List<CgroupCpuSnapshot> snapshots,
-                Map<String, CgroupCpuSnapshot> previousSnapshots) {
-            this(
-                    status,
-                    snapshots,
-                    previousSnapshots,
-                    Coverage.complete(snapshots.size()),
-                    snapshots.stream().mapToLong(CgroupCpuSnapshot::collectedAt).max().orElse(0));
-        }
-
-        public static CpuCollectionResult unavailable(Status status) {
-            return new CpuCollectionResult(
-                    status, List.of(), Map.of(), new Coverage(0, 0, true, false), 0);
-        }
-    }
-
-    public record IoCollectionResult(
-            Status status,
-            List<CgroupIoSnapshot> snapshots,
-            Map<String, CgroupIoSnapshot> previousSnapshots,
-            Coverage coverage,
-            long collectedAt) {
-
-        public IoCollectionResult {
-            Objects.requireNonNull(status, "status");
-            snapshots = List.copyOf(Objects.requireNonNull(snapshots, "snapshots"));
-            previousSnapshots =
-                    Map.copyOf(Objects.requireNonNull(previousSnapshots, "previousSnapshots"));
-            Objects.requireNonNull(coverage, "coverage");
-            if (collectedAt < 0) {
-                throw new IllegalArgumentException("collectedAt must not be negative");
-            }
-        }
-
-        public IoCollectionResult(
-                Status status,
-                List<CgroupIoSnapshot> snapshots,
-                Map<String, CgroupIoSnapshot> previousSnapshots) {
-            this(
-                    status,
-                    snapshots,
-                    previousSnapshots,
-                    Coverage.complete(snapshots.size()),
-                    snapshots.stream().mapToLong(CgroupIoSnapshot::collectedAt).max().orElse(0));
-        }
-
-        public static IoCollectionResult unavailable(Status status) {
-            return new IoCollectionResult(
+        public static <T> CollectionResult<T> unavailable(Status status) {
+            return new CollectionResult<>(
                     status, List.of(), Map.of(), new Coverage(0, 0, true, false), 0);
         }
     }
 
     public interface FileAccess {
-        boolean exists(Path path);
-
         String read(Path path) throws IOException;
 
         List<Path> directories(Path path) throws IOException;
+    }
+
+    @FunctionalInterface
+    private interface GroupReader<T> {
+        T read(Path group, long collectedAt) throws IOException;
     }
 
     private final BullseyeConfiguration.Cgroup configuration;
     private final FileAccess files;
     private final Clock clock;
     private final BullseyeLogger logger;
-    private final Map<String, CgroupMemorySnapshot> previousSnapshots = new HashMap<>();
+    private final Map<String, CgroupMemorySnapshot> previousMemorySnapshots = new HashMap<>();
     private final Map<String, CgroupCpuSnapshot> previousCpuSnapshots = new HashMap<>();
     private final Map<String, CgroupIoSnapshot> previousIoSnapshots = new HashMap<>();
     private List<Path> cachedGroups = List.of();
@@ -180,11 +96,6 @@ public final class CgroupMonitor {
 
     public static FileAccess nioFileAccess() {
         return new FileAccess() {
-            @Override
-            public boolean exists(Path path) {
-                return Files.exists(path);
-            }
-
             @Override
             public String read(Path path) throws IOException {
                 return Files.readString(path, StandardCharsets.US_ASCII);
@@ -239,105 +150,36 @@ public final class CgroupMonitor {
         }
     }
 
-    public synchronized CollectionResult collectMemory() {
-        initialize();
-        long now = clock.millis();
-        if (status != Status.AVAILABLE) {
-            return new CollectionResult(
-                    status, List.of(), Map.of(), new Coverage(0, 0, true, false), now);
-        }
-
-        if (!discoveryComplete || now >= nextDiscoveryAt) {
-            discover(now);
-        }
-        boolean accessDenied = discoveryDenied;
-        int failedGroups = 0;
-
-        List<CgroupMemorySnapshot> collected = new ArrayList<>(cachedGroups.size());
-        Map<String, CgroupMemorySnapshot> currentByPath = new LinkedHashMap<>();
-        for (Path group : cachedGroups) {
-            String component = "cgroup-memory:" + cgroupPath(group);
-            try {
-                CgroupMemorySnapshot snapshot = collectGroup(group, now);
-                collected.add(snapshot);
-                currentByPath.put(snapshot.workload().cgroupPath(), snapshot);
-                logger.componentRestored(component);
-            } catch (AccessDeniedException failure) {
-                accessDenied = true;
-                failedGroups++;
-                logger.componentInterrupted(component, failure);
-            } catch (Exception failure) {
-                failedGroups++;
-                logger.componentInterrupted(component, failure);
-            }
-        }
-
-        Map<String, CgroupMemorySnapshot> previous = Map.copyOf(previousSnapshots);
-        previousSnapshots.clear();
-        previousSnapshots.putAll(currentByPath);
-        Coverage coverage =
-                new Coverage(collected.size(), failedGroups, discoveryFailed, discoveryLimited);
-        if (failedGroups > 0) {
-            discoveryComplete = false;
-        }
-        if (collected.isEmpty() && accessDenied) {
-            return new CollectionResult(Status.ACCESS_DENIED, List.of(), previous, coverage, now);
-        }
-        return new CollectionResult(Status.AVAILABLE, collected, previous, coverage, now);
+    public synchronized CollectionResult<CgroupMemorySnapshot> collectMemory() {
+        return collect("cgroup-memory", previousMemorySnapshots, this::collectMemoryGroup);
     }
 
-    public synchronized CpuCollectionResult collectCpu() {
-        initialize();
-        long now = clock.millis();
-        if (status != Status.AVAILABLE) {
+    public synchronized CollectionResult<CgroupCpuSnapshot> collectCpu() {
+        CollectionResult<CgroupCpuSnapshot> result =
+                collect("cgroup-cpu", previousCpuSnapshots, this::collectCpuGroup);
+        if (result.status() != Status.AVAILABLE) {
             previousCpuSnapshots.clear();
-            return new CpuCollectionResult(
-                    status, List.of(), Map.of(), new Coverage(0, 0, true, false), now);
         }
-
-        if (!discoveryComplete || now >= nextDiscoveryAt) {
-            discover(now);
-        }
-        boolean accessDenied = discoveryDenied;
-        int failedGroups = 0;
-        List<CgroupCpuSnapshot> collected = new ArrayList<>(cachedGroups.size());
-        Map<String, CgroupCpuSnapshot> currentByPath = new LinkedHashMap<>();
-        for (Path group : cachedGroups) {
-            String component = "cgroup-cpu:" + cgroupPath(group);
-            try {
-                CgroupCpuSnapshot snapshot = collectCpuGroup(group, now);
-                collected.add(snapshot);
-                currentByPath.put(snapshot.workload().cgroupPath(), snapshot);
-                logger.componentRestored(component);
-            } catch (AccessDeniedException failure) {
-                accessDenied = true;
-                failedGroups++;
-                logger.componentInterrupted(component, failure);
-            } catch (Exception failure) {
-                failedGroups++;
-                logger.componentInterrupted(component, failure);
-            }
-        }
-
-        Map<String, CgroupCpuSnapshot> previous = Map.copyOf(previousCpuSnapshots);
-        previousCpuSnapshots.clear();
-        previousCpuSnapshots.putAll(currentByPath);
-        Coverage coverage =
-                new Coverage(collected.size(), failedGroups, discoveryFailed, discoveryLimited);
-        if (failedGroups > 0) {
-            discoveryComplete = false;
-        }
-        Status resultStatus =
-                collected.isEmpty() && accessDenied ? Status.ACCESS_DENIED : Status.AVAILABLE;
-        return new CpuCollectionResult(resultStatus, collected, previous, coverage, now);
+        return result;
     }
 
-    public synchronized IoCollectionResult collectIo() {
+    public synchronized CollectionResult<CgroupIoSnapshot> collectIo() {
+        CollectionResult<CgroupIoSnapshot> result =
+                collect("cgroup-io", previousIoSnapshots, this::collectIoGroup);
+        if (result.status() != Status.AVAILABLE) {
+            previousIoSnapshots.clear();
+        }
+        return result;
+    }
+
+    private <T> CollectionResult<T> collect(
+            String componentPrefix,
+            Map<String, T> history,
+            GroupReader<T> reader) {
         initialize();
         long now = clock.millis();
         if (status != Status.AVAILABLE) {
-            previousIoSnapshots.clear();
-            return new IoCollectionResult(
+            return new CollectionResult<>(
                     status, List.of(), Map.of(), new Coverage(0, 0, true, false), now);
         }
 
@@ -346,14 +188,16 @@ public final class CgroupMonitor {
         }
         boolean accessDenied = discoveryDenied;
         int failedGroups = 0;
-        List<CgroupIoSnapshot> collected = new ArrayList<>(cachedGroups.size());
-        Map<String, CgroupIoSnapshot> currentByPath = new LinkedHashMap<>();
+
+        List<T> collected = new ArrayList<>(cachedGroups.size());
+        Map<String, T> currentByPath = new LinkedHashMap<>();
         for (Path group : cachedGroups) {
-            String component = "cgroup-io:" + cgroupPath(group);
+            String path = cgroupPath(group);
+            String component = componentPrefix + ":" + path;
             try {
-                CgroupIoSnapshot snapshot = collectIoGroup(group, now);
+                T snapshot = reader.read(group, now);
                 collected.add(snapshot);
-                currentByPath.put(snapshot.workload().cgroupPath(), snapshot);
+                currentByPath.put(path, snapshot);
                 logger.componentRestored(component);
             } catch (AccessDeniedException failure) {
                 accessDenied = true;
@@ -365,9 +209,9 @@ public final class CgroupMonitor {
             }
         }
 
-        Map<String, CgroupIoSnapshot> previous = Map.copyOf(previousIoSnapshots);
-        previousIoSnapshots.clear();
-        previousIoSnapshots.putAll(currentByPath);
+        Map<String, T> previous = Map.copyOf(history);
+        history.clear();
+        history.putAll(currentByPath);
         Coverage coverage =
                 new Coverage(collected.size(), failedGroups, discoveryFailed, discoveryLimited);
         if (failedGroups > 0) {
@@ -375,7 +219,7 @@ public final class CgroupMonitor {
         }
         Status resultStatus =
                 collected.isEmpty() && accessDenied ? Status.ACCESS_DENIED : Status.AVAILABLE;
-        return new IoCollectionResult(resultStatus, collected, previous, coverage, now);
+        return new CollectionResult<>(resultStatus, collected, previous, coverage, now);
     }
 
     public synchronized Status status() {
@@ -383,8 +227,8 @@ public final class CgroupMonitor {
         return status;
     }
 
-    public synchronized void clearHistory() {
-        previousSnapshots.clear();
+    public synchronized void clearMemoryHistory() {
+        previousMemorySnapshots.clear();
         discoveryComplete = false;
     }
 
@@ -442,7 +286,7 @@ public final class CgroupMonitor {
             cachedGroups = List.copyOf(leaves);
             Set<String> active = new HashSet<>();
             leaves.forEach(path -> active.add(cgroupPath(path)));
-            previousSnapshots.keySet().retainAll(active);
+            previousMemorySnapshots.keySet().retainAll(active);
             previousCpuSnapshots.keySet().retainAll(active);
             previousIoSnapshots.keySet().retainAll(active);
         }
@@ -453,7 +297,7 @@ public final class CgroupMonitor {
         nextDiscoveryAt = now + configuration.discoveryInterval().toMillis();
     }
 
-    private CgroupMemorySnapshot collectGroup(Path group, long now) throws IOException {
+    private CgroupMemorySnapshot collectMemoryGroup(Path group, long now) throws IOException {
         long currentBytes = Long.parseLong(files.read(group.resolve("memory.current")).trim());
         Long highBytes = memoryLimit(group.resolve("memory.high"));
         Long maxBytes = memoryLimit(group.resolve("memory.max"));
@@ -489,9 +333,9 @@ public final class CgroupMonitor {
         PsiParser.Snapshot pressure = pressure(group.resolve("cpu.pressure"));
         return new CgroupCpuSnapshot(
                 WorkloadIdentity.fromCgroupPath(cgroupPath(group)),
-                requiredCounter(counters, "usage_usec"),
-                requiredCounter(counters, "user_usec"),
-                requiredCounter(counters, "system_usec"),
+                requiredCounter(counters, "usage_usec", "cpu.stat"),
+                requiredCounter(counters, "user_usec", "cpu.stat"),
+                requiredCounter(counters, "system_usec", "cpu.stat"),
                 quota,
                 period,
                 counters.get("nr_periods"),
@@ -547,10 +391,10 @@ public final class CgroupMonitor {
             devices.put(
                     entry.getKey(),
                     new CgroupIoSnapshot.DeviceStats(
-                            requiredIoCounter(counters, "rbytes"),
-                            requiredIoCounter(counters, "wbytes"),
-                            requiredIoCounter(counters, "rios"),
-                            requiredIoCounter(counters, "wios")));
+                            requiredCounter(counters, "rbytes", "io.stat"),
+                            requiredCounter(counters, "wbytes", "io.stat"),
+                            requiredCounter(counters, "rios", "io.stat"),
+                            requiredCounter(counters, "wios", "io.stat")));
         }
         return devices;
     }
@@ -607,14 +451,6 @@ public final class CgroupMonitor {
         return devices;
     }
 
-    private static long requiredIoCounter(Map<String, Long> counters, String key) {
-        Long value = counters.get(key);
-        if (value == null) {
-            throw new IllegalArgumentException("Missing io.stat counter: " + key);
-        }
-        return value;
-    }
-
     private static Map<String, Long> cpuCounters(String raw) {
         Map<String, Long> counters = new HashMap<>();
         for (String line : raw.lines().toList()) {
@@ -633,10 +469,10 @@ public final class CgroupMonitor {
         return counters;
     }
 
-    private static long requiredCounter(Map<String, Long> counters, String key) {
+    private static long requiredCounter(Map<String, Long> counters, String key, String fileName) {
         Long value = counters.get(key);
         if (value == null) {
-            throw new IllegalArgumentException("Missing cpu.stat counter: " + key);
+            throw new IllegalArgumentException("Missing " + fileName + " counter: " + key);
         }
         return value;
     }

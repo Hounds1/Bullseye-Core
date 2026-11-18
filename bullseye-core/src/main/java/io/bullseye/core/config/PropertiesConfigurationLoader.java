@@ -19,6 +19,8 @@ public final class PropertiesConfigurationLoader {
     private static final String MEMORY_PREFIX = "bullseye.diagnostics.memory.";
     private static final String IO_PREFIX = "bullseye.diagnostics.io.";
     private static final String CGROUP_PREFIX = "bullseye.cgroup.";
+    private static final String ATTRIBUTION_CONFIDENCE_PREFIX =
+            CGROUP_PREFIX + "attribution.confidence.";
 
     public BullseyeConfiguration load(Path path) throws IOException {
         Properties properties = read(path);
@@ -105,7 +107,22 @@ public final class PropertiesConfigurationLoader {
                 integer(properties, CGROUP_PREFIX + "maximum-groups", 512),
                 decimal(properties, CGROUP_PREFIX + "attribution.minimum-score", 5),
                 decimal(properties, CGROUP_PREFIX + "attribution.dominance-ratio", 1.2),
-                duration(properties, CGROUP_PREFIX + "attribution.refresh-interval", "30s"));
+                duration(properties, CGROUP_PREFIX + "attribution.refresh-interval", "30s"),
+                loadAttributionConfidence(properties));
+    }
+
+    private static BullseyeConfiguration.AttributionConfidence loadAttributionConfidence(
+            Properties properties) {
+        var defaults = BullseyeConfiguration.AttributionConfidence.defaults();
+        return new BullseyeConfiguration.AttributionConfidence(
+                integer(properties, ATTRIBUTION_CONFIDENCE_PREFIX + "minimum-observations",
+                        defaults.minimumObservations()),
+                duration(properties, ATTRIBUTION_CONFIDENCE_PREFIX + "minimum-duration",
+                        defaults.minimumDuration()),
+                integer(properties, ATTRIBUTION_CONFIDENCE_PREFIX + "maximum-confirmation-collections",
+                        defaults.maximumConfirmationCollections()),
+                decimal(properties, ATTRIBUTION_CONFIDENCE_PREFIX + "minimum-margin",
+                        defaults.minimumMargin()));
     }
 
     static Duration parseDuration(String raw) {
@@ -146,6 +163,11 @@ public final class PropertiesConfigurationLoader {
 
     private static Duration duration(Properties properties, String key, String defaultValue) {
         return parseDuration(properties.getProperty(key, defaultValue));
+    }
+
+    private static Duration duration(Properties properties, String key, Duration defaultValue) {
+        String raw = properties.getProperty(key);
+        return raw == null ? defaultValue : parseDuration(raw);
     }
 
     private static String detectHostName() {

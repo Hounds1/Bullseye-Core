@@ -2,6 +2,7 @@ package io.bullseye.core.diagnostic;
 
 import io.bullseye.common.diagnostic.DiagnosticEvidence;
 import io.bullseye.common.workload.WorkloadAttribution;
+import io.bullseye.core.config.BullseyeConfiguration.AttributionConfidence;
 import io.bullseye.core.linux.cgroup.CgroupCpuSnapshot;
 import io.bullseye.core.linux.cgroup.CgroupMonitor;
 
@@ -14,11 +15,11 @@ import java.util.function.Supplier;
 
 public final class CpuPressureAttributor {
 
-    private final Supplier<CgroupMonitor.CpuCollectionResult> collections;
+    private final Supplier<CgroupMonitor.CollectionResult<CgroupCpuSnapshot>> collections;
     private final Runnable historyReset;
     private final double minimumScore;
-    private final double dominanceRatio;
     private final long maximumObservationGapMillis;
+    private final AttributionConfidenceTracker confidenceTracker;
     private Integer previousHostCpuCount;
 
     public CpuPressureAttributor(
@@ -26,28 +27,50 @@ public final class CpuPressureAttributor {
             double minimumScore,
             double dominanceRatio,
             Duration maximumObservationGap) {
+        this(monitor, minimumScore, dominanceRatio, maximumObservationGap,
+                AttributionConfidence.defaults());
+    }
+
+    public CpuPressureAttributor(
+            CgroupMonitor monitor,
+            double minimumScore,
+            double dominanceRatio,
+            Duration maximumObservationGap,
+            AttributionConfidence confidence) {
         this(
                 Objects.requireNonNull(monitor, "monitor")::collectCpu,
                 monitor::clearCpuHistory,
                 minimumScore,
                 dominanceRatio,
-                maximumObservationGap);
+                maximumObservationGap,
+                confidence);
     }
 
     CpuPressureAttributor(
-            Supplier<CgroupMonitor.CpuCollectionResult> collections,
+            Supplier<CgroupMonitor.CollectionResult<CgroupCpuSnapshot>> collections,
             double minimumScore,
             double dominanceRatio,
             Duration maximumObservationGap) {
-        this(collections, () -> {}, minimumScore, dominanceRatio, maximumObservationGap);
+        this(collections, minimumScore, dominanceRatio, maximumObservationGap,
+                AttributionConfidence.defaults());
+    }
+
+    CpuPressureAttributor(
+            Supplier<CgroupMonitor.CollectionResult<CgroupCpuSnapshot>> collections,
+            double minimumScore,
+            double dominanceRatio,
+            Duration maximumObservationGap,
+            AttributionConfidence confidence) {
+        this(collections, () -> {}, minimumScore, dominanceRatio, maximumObservationGap, confidence);
     }
 
     private CpuPressureAttributor(
-            Supplier<CgroupMonitor.CpuCollectionResult> collections,
+            Supplier<CgroupMonitor.CollectionResult<CgroupCpuSnapshot>> collections,
             Runnable historyReset,
             double minimumScore,
             double dominanceRatio,
-            Duration maximumObservationGap) {
+            Duration maximumObservationGap,
+            AttributionConfidence confidence) {
         this.collections = Objects.requireNonNull(collections, "collections");
         this.historyReset = Objects.requireNonNull(historyReset, "historyReset");
         if (!Double.isFinite(minimumScore) || minimumScore < 0) {
@@ -62,11 +85,12 @@ public final class CpuPressureAttributor {
             throw new IllegalArgumentException("maximumObservationGap must be at least 1ms");
         }
         this.minimumScore = minimumScore;
-        this.dominanceRatio = dominanceRatio;
+        confidenceTracker =
+                new AttributionConfidenceTracker(confidence, dominanceRatio, maximumObservationGap);
     }
 
     public WorkloadAttribution attribute(int hostCpuCount) {
-        CgroupMonitor.CpuCollectionResult collection = collections.get();
+        CgroupMonitor.CollectionResult<CgroupCpuSnapshot> collection = collections.get();
         if (collection.status() != CgroupMonitor.Status.AVAILABLE) {
             reset();
             WorkloadAttribution.Status status =
@@ -114,14 +138,16 @@ public final class CpuPressureAttributor {
 
         Candidate winner = candidates.getFirst();
         double runnerScore = candidates.size() > 1 ? candidates.get(1).score() : 0;
-        double ratio = runnerScore == 0 ? Double.POSITIVE_INFINITY : winner.score() / runnerScore;
-        WorkloadAttribution.Confidence confidence = confidence(winner.score(), ratio);
-        if (!collection.coverage().complete() || unmeasured > 0) {
-            confidence = WorkloadAttribution.Confidence.LOW;
-        }
         List<DiagnosticEvidence> evidence = new ArrayList<>(winner.evidence());
         evidence.add(metric("candidates.measured", candidates.size(), "count"));
         evidence.add(metric("candidates.unmeasured", unmeasured, "count"));
+        CgroupCpuSnapshot snapshot = winner.snapshot();
+        WorkloadAttribution.Confidence confidence = confidenceTracker.observe(
+                snapshot.workload(), winner.score(), runnerScore, collection.collectedAt(),
+                collection.previousSnapshots().get(snapshot.workload().cgroupPath()).collectedAt(),
+                collection.coverage().complete() && unmeasured == 0
+                        && snapshot.collectedAt() == collection.collectedAt(),
+                evidence);
         return WorkloadAttribution.identified(
                 winner.snapshot().workload(),
                 winner.score(),
@@ -133,7 +159,12 @@ public final class CpuPressureAttributor {
 
     public void reset() {
         previousHostCpuCount = null;
+        confidenceTracker.reset();
         historyReset.run();
+    }
+
+    public boolean needsConfirmation() {
+        return confidenceTracker.needsConfirmation();
     }
 
     private boolean comparable(CgroupCpuSnapshot current, CgroupCpuSnapshot previous) {
@@ -208,22 +239,14 @@ public final class CpuPressureAttributor {
         }
     }
 
-    private WorkloadAttribution.Confidence confidence(double score, double ratio) {
-        if (score >= 45 && ratio >= Math.max(2, dominanceRatio)) {
-            return WorkloadAttribution.Confidence.HIGH;
-        }
-        if (score >= 20 && ratio >= dominanceRatio) {
-            return WorkloadAttribution.Confidence.MEDIUM;
-        }
-        return WorkloadAttribution.Confidence.LOW;
-    }
-
     private static DiagnosticEvidence metric(String name, double value, String unit) {
         return new DiagnosticEvidence(name, value, unit);
     }
 
-    private static WorkloadAttribution unavailable(
-            WorkloadAttribution.Status status, CgroupMonitor.CpuCollectionResult collection) {
+    private WorkloadAttribution unavailable(
+            WorkloadAttribution.Status status,
+            CgroupMonitor.CollectionResult<CgroupCpuSnapshot> collection) {
+        confidenceTracker.reset();
         return WorkloadAttribution.unavailable(
                 status, collection.coverage(), collection.collectedAt());
     }

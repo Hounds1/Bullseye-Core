@@ -37,6 +37,9 @@ import java.util.Optional;
 
 class CpuAttributionStateTest {
 
+    private static final BullseyeConfiguration.AttributionConfidence PERIODIC_ONLY =
+            new BullseyeConfiguration.AttributionConfidence(3, Duration.ofSeconds(10), 0, 5);
+
     @TempDir
     Path root;
 
@@ -124,7 +127,8 @@ class CpuAttributionStateTest {
         scenario.tick(3_000, 3_100_000, 3_100_000);
         assertEquals("beta.service", scenario.attribution().workload().name());
         assertEquals(version + 1, scenario.repository.current().version());
-        assertTrue(scenario.log.toString().contains("Critical workload identified."));
+        assertEquals(WorkloadAttribution.Confidence.LOW, scenario.attribution().confidence());
+        assertTrue(scenario.log.toString().contains("Pressure source identified."));
     }
 
     @Test
@@ -231,23 +235,120 @@ class CpuAttributionStateTest {
 
     @Test
     void partialCollectionAndRestorationChangeConfidence() throws Exception {
-        Scenario scenario = new Scenario();
+        Scenario scenario = new Scenario(
+                new BullseyeConfiguration.AttributionConfidence(2, Duration.ofSeconds(1), 0, 5));
         scenario.cpu.severity = Severity.CRITICAL;
         scenario.tick(1_000, 0, 0);
         scenario.tick(2_000, 3_000_000, 100_000);
+        assertEquals(WorkloadAttribution.Confidence.LOW, scenario.attribution().confidence());
+        scenario.tick(3_000, 6_000_000, 200_000);
         assertEquals(WorkloadAttribution.Confidence.HIGH, scenario.attribution().confidence());
 
-        scenario.writeCounters(6_000_000, 200_000);
+        scenario.writeCounters(9_000_000, 300_000);
         Files.writeString(root.resolve("beta.service/cpu.stat"), "broken");
-        scenario.observe(3_000);
+        scenario.observe(4_000);
         assertEquals(WorkloadAttribution.Confidence.LOW, scenario.attribution().confidence());
         assertFalse(scenario.attribution().coverage().complete());
         assertTrue(scenario.log.toString().contains("coverage=PARTIAL"));
 
-        scenario.tick(4_000, 9_000_000, 300_000);
-        assertEquals(WorkloadAttribution.Confidence.LOW, scenario.attribution().confidence());
         scenario.tick(5_000, 12_000_000, 400_000);
+        assertEquals(WorkloadAttribution.Confidence.LOW, scenario.attribution().confidence());
+        scenario.tick(6_000, 15_000_000, 500_000);
+        assertEquals(WorkloadAttribution.Confidence.LOW, scenario.attribution().confidence());
+        scenario.tick(7_000, 18_000_000, 600_000);
         assertEquals(WorkloadAttribution.Confidence.HIGH, scenario.attribution().confidence());
+    }
+
+    @Test
+    void confirmationSamplesAreBoundedAndIgnoreRepeatedHostInput() throws Exception {
+        Scenario scenario = new Scenario(BullseyeConfiguration.AttributionConfidence.defaults());
+        scenario.tick(1_000, 0, 0);
+        scenario.tick(2_000, 3_000_000, 100_000);
+
+        scenario.clock.now = 2_500;
+        assertTrue(scenario.coordinator.evaluate(2_500).isEmpty());
+        assertEquals(2_000, scenario.attribution().collectedAt());
+
+        for (int second = 3; second <= 5; second++) {
+            scenario.tick(second * 1_000L, (second - 1) * 3_000_000L, (second - 1) * 100_000L);
+            assertEquals(second * 1_000L, scenario.attribution().collectedAt());
+        }
+        assertEquals(WorkloadAttribution.Confidence.LOW, scenario.attribution().confidence());
+        for (int second = 6; second <= 9; second++) {
+            scenario.tick(second * 1_000L, (second - 1) * 3_000_000L, (second - 1) * 100_000L);
+            assertEquals(5_000, scenario.attribution().collectedAt());
+        }
+        scenario.tick(10_000, 27_000_000, 900_000);
+        assertEquals(10_000, scenario.attribution().collectedAt());
+    }
+
+    @Test
+    void changingWinnerDoesNotRefillTheConfirmationBudget() throws Exception {
+        Scenario scenario = new Scenario(BullseyeConfiguration.AttributionConfidence.defaults());
+        scenario.tick(1_000, 0, 0);
+        long alpha = 0;
+        long beta = 0;
+        for (int second = 2; second <= 5; second++) {
+            boolean alphaWins = second % 2 == 0;
+            alpha += alphaWins ? 3_000_000 : 100_000;
+            beta += alphaWins ? 100_000 : 3_000_000;
+            scenario.tick(second * 1_000L, alpha, beta);
+            assertEquals(alphaWins ? "alpha.service" : "beta.service",
+                    scenario.attribution().workload().name());
+            assertEquals(WorkloadAttribution.Confidence.LOW, scenario.attribution().confidence());
+        }
+
+        scenario.tick(6_000, alpha + 3_000_000, beta + 100_000);
+        assertEquals(5_000, scenario.attribution().collectedAt());
+        assertEquals("beta.service", scenario.attribution().workload().name());
+    }
+
+    @Test
+    void staleConfirmedSourceIsRetainedAtLowConfidenceAndMustBeConfirmedAgain() throws Exception {
+        Scenario scenario = new Scenario(
+                new BullseyeConfiguration.AttributionConfidence(2, Duration.ofSeconds(1), 3, 5));
+        scenario.tick(1_000, 0, 0);
+        scenario.tick(2_000, 3_000_000, 100_000);
+        scenario.tick(3_000, 6_000_000, 200_000);
+        assertEquals(WorkloadAttribution.Confidence.HIGH, scenario.attribution().confidence());
+
+        scenario.clock.now = 6_000;
+        scenario.coordinator.evaluate(6_000);
+        assertEquals("alpha.service", scenario.attribution().workload().name());
+        assertEquals(3_000, scenario.attribution().collectedAt());
+        assertEquals(WorkloadAttribution.Confidence.LOW, scenario.attribution().confidence());
+
+        scenario.tick(7_000, 30_000_000, 300_000);
+        assertEquals(WorkloadAttribution.Status.INSUFFICIENT_DATA, scenario.attribution().status());
+        scenario.tick(8_000, 33_000_000, 400_000);
+        assertEquals(WorkloadAttribution.Confidence.LOW, scenario.attribution().confidence());
+        scenario.tick(9_000, 36_000_000, 500_000);
+        assertEquals(WorkloadAttribution.Confidence.HIGH, scenario.attribution().confidence());
+    }
+
+    @Test
+    void inputGapsAndCapacityChangesCannotReuseConfirmedConfidence() throws Exception {
+        Scenario scenario = new Scenario(
+                new BullseyeConfiguration.AttributionConfidence(2, Duration.ofSeconds(1), 3, 5));
+        scenario.tick(1_000, 0, 0);
+        scenario.tick(2_000, 3_000_000, 100_000);
+        scenario.tick(3_000, 6_000_000, 200_000);
+        assertEquals(WorkloadAttribution.Confidence.HIGH, scenario.attribution().confidence());
+
+        scenario.tick(7_000, 30_000_000, 300_000);
+        assertEquals(WorkloadAttribution.Status.INSUFFICIENT_DATA, scenario.attribution().status());
+        scenario.tick(8_000, 33_000_000, 400_000);
+        assertEquals(WorkloadAttribution.Confidence.LOW, scenario.attribution().confidence());
+        scenario.tick(9_000, 36_000_000, 500_000);
+        assertEquals(WorkloadAttribution.Confidence.HIGH, scenario.attribution().confidence());
+
+        scenario.hostCpuCount = 8;
+        scenario.tick(10_000, 39_000_000, 600_000);
+        assertEquals(WorkloadAttribution.Status.INSUFFICIENT_DATA, scenario.attribution().status());
+        scenario.tick(11_000, 42_000_000, 700_000);
+        assertEquals(WorkloadAttribution.Confidence.LOW, scenario.attribution().confidence());
+        scenario.tick(12_000, 45_000_000, 800_000);
+        assertEquals(WorkloadAttribution.Confidence.MEDIUM, scenario.attribution().confidence());
     }
 
     @Test
@@ -281,6 +382,10 @@ class CpuAttributionStateTest {
         private int hostCpuCount = 4;
 
         private Scenario() throws IOException {
+            this(PERIODIC_ONLY);
+        }
+
+        private Scenario(BullseyeConfiguration.AttributionConfidence confidence) throws IOException {
             Files.writeString(root.resolve("cgroup.controllers"), "cpu memory");
             for (String group : List.of("alpha.service", "beta.service")) {
                 Path directory = Files.createDirectories(root.resolve(group));
@@ -296,8 +401,8 @@ class CpuAttributionStateTest {
                     new DiagnosticEngine(List.of(cpu, memory)),
                     repository,
                     () -> "event",
-                    new MemoryPressureAttributor(monitor, 5, 1.2),
-                    new CpuPressureAttributor(monitor, 5, 1.2, Duration.ofSeconds(7)),
+                    new MemoryPressureAttributor(monitor, 5, 1.2, Duration.ofSeconds(7), PERIODIC_ONLY),
+                    new CpuPressureAttributor(monitor, 5, 1.2, Duration.ofSeconds(7), confidence),
                     Duration.ofSeconds(2),
                     Duration.ofSeconds(5));
         }

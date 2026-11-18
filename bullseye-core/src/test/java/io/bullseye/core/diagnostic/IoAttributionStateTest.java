@@ -230,7 +230,9 @@ class IoAttributionStateTest {
 
     @Test
     void recoveringIoDoesNotClearCpuOrMemoryCollectionHistory() throws Exception {
-        Scenario scenario = new Scenario();
+        // A confirmation read must not hide an accidental reset of the memory baseline.
+        Scenario scenario = new Scenario(
+                new BullseyeConfiguration.AttributionConfidence(3, Duration.ofSeconds(10), 0, 5));
         scenario.cpu.severity = Severity.CRITICAL;
         scenario.memory.severity = Severity.HIGH;
         scenario.tick(1_000, 0, 0);
@@ -299,6 +301,11 @@ class IoAttributionStateTest {
         private final DiagnosticCoordinator coordinator;
 
         private Scenario() throws IOException {
+            this(BullseyeConfiguration.AttributionConfidence.defaults());
+        }
+
+        private Scenario(BullseyeConfiguration.AttributionConfidence memoryConfidence)
+                throws IOException {
             Files.writeString(root.resolve("cgroup.controllers"), "cpu memory io");
             for (String group : List.of("alpha.service", "beta.service")) {
                 Path directory = Files.createDirectories(root.resolve(group));
@@ -319,7 +326,8 @@ class IoAttributionStateTest {
                     new DiagnosticEngine(List.of(cpu, memory, io)),
                     repository,
                     () -> "event",
-                    new MemoryPressureAttributor(monitor, 5, 1.2),
+                    new MemoryPressureAttributor(
+                            monitor, 5, 1.2, Duration.ofSeconds(7), memoryConfidence),
                     new CpuPressureAttributor(monitor, 5, 1.2, Duration.ofSeconds(7)),
                     new IoPressureAttributor(monitor, 5, 1.2, Duration.ofSeconds(7)),
                     Duration.ofSeconds(2),
