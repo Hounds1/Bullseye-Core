@@ -152,8 +152,10 @@ class MultiResourcePublicationTest {
     }
 
     @Test
-    void secondarySourceReplacementIsVisibleWhileThePrimaryRemainsUnchanged() throws Exception {
-        Scenario scenario = new Scenario();
+    void periodicSecondarySourceReplacementPreservesThePrimary() throws Exception {
+        // Isolate periodic refresh from the additional confidence confirmation collections.
+        Scenario scenario = new Scenario(new BullseyeConfiguration.AttributionConfidence(
+                3, Duration.ofSeconds(10), 0, 5));
         scenario.activate();
         DiagnosticSnapshot before = scenario.current();
         scenario.betaMemory = 10;
@@ -175,6 +177,102 @@ class MultiResourcePublicationTest {
         assertTrue(logs.contains("resource=HOST_MEMORY workload=gamma.service"));
         assertFalse(logs.contains("resource=HOST_CPU"));
         assertFalse(logs.contains("previous=HIGH current=HIGH"));
+    }
+
+    @Test
+    void confirmationCollectionPublishesSecondarySourceReplacementBeforePeriodicRefresh()
+            throws Exception {
+        Scenario scenario = new Scenario();
+        scenario.activate();
+        DiagnosticSnapshot before = scenario.current();
+        scenario.betaMemory = 10;
+        scenario.gammaMemory = 800;
+        scenario.log.reset();
+
+        DiagnosticTransition transition = scenario.tick(3_000).orElseThrow();
+
+        DiagnosticSnapshot after = scenario.current();
+        ResourceDiagnosis memory = after.diagnosis(ResourceType.HOST_MEMORY);
+        assertEquals(ResourceType.HOST_MEMORY, transition.event().resource());
+        assertEquals(ResourceType.HOST_CPU, after.resource());
+        assertEquals(before.version() + 1, after.version());
+        assertEquals(before.since(), after.since());
+        assertTrue(before.attribution().sameSourceAs(after.attribution()));
+        assertDiagnosis(after, ResourceType.HOST_MEMORY, Severity.HIGH, "gamma.service");
+        assertEquals(3_000, memory.since());
+        assertEquals(3_000, memory.attribution().collectedAt());
+        assertEquals(WorkloadAttribution.Confidence.LOW, memory.attribution().confidence());
+        String logs = scenario.log.toString();
+        assertTrue(logs.contains("resource=HOST_MEMORY workload=gamma.service confidence=LOW"));
+        assertFalse(logs.contains("resource=HOST_CPU"));
+        assertFalse(logs.contains("previous="));
+        String publishedMemory = object(
+                object(new DiagnosticSnapshotJsonEncoder().encode(after), "resources"),
+                "HOST_MEMORY");
+        assertTrue(publishedMemory.contains("\"primaryWorkload\": \"gamma.service\""));
+        assertTrue(publishedMemory.contains("\"attributionConfidence\": \"LOW\""));
+
+        scenario.log.reset();
+        assertTrue(scenario.tick(4_000).isEmpty());
+        assertEquals(after.version(), scenario.current().version());
+        assertTrue(scenario.log.toString().isEmpty());
+    }
+
+    @Test
+    void secondaryConfidencePromotionUpdatesPublicationWithoutResettingPrimarySince()
+            throws Exception {
+        Scenario scenario = new Scenario();
+        scenario.activate();
+        for (long now = 3_000; now <= 13_000; now += 1_000) {
+            scenario.tick(now);
+        }
+        // CPU confirms at 12s; memory's bounded burst resumes on periodic refresh at 9s and 14s.
+        DiagnosticSnapshot before = scenario.current();
+        assertEquals(WorkloadAttribution.Confidence.HIGH, before.attribution().confidence());
+        assertEquals(WorkloadAttribution.Confidence.LOW,
+                before.diagnosis(ResourceType.HOST_MEMORY).attribution().confidence());
+        assertEquals(9_000,
+                before.diagnosis(ResourceType.HOST_MEMORY).attribution().collectedAt());
+        scenario.log.reset();
+
+        DiagnosticTransition transition = scenario.tick(14_000).orElseThrow();
+
+        DiagnosticSnapshot after = scenario.current();
+        ResourceDiagnosis memory = after.diagnosis(ResourceType.HOST_MEMORY);
+        assertEquals(ResourceType.HOST_MEMORY, transition.event().resource());
+        assertEquals(ResourceType.HOST_CPU, after.resource());
+        assertEquals(before.version() + 1, after.version());
+        assertEquals(before.since(), after.since());
+        assertTrue(before.attribution().sameSourceAs(after.attribution()));
+        assertDiagnosis(after, ResourceType.HOST_MEMORY, Severity.HIGH, "beta.service");
+        assertEquals(14_000, memory.since());
+        assertEquals(WorkloadAttribution.Confidence.HIGH, memory.attribution().confidence());
+        assertTrue(memory.attribution().evidence().contains(
+                new DiagnosticEvidence("confidence.observations", 6, "count")));
+        assertTrue(memory.attribution().evidence().contains(
+                new DiagnosticEvidence("confidence.duration", 13, "s")));
+        assertEquals(WorkloadAttribution.Confidence.LOW,
+                after.diagnosis(ResourceType.DISK_IO).attribution().confidence());
+        String logs = scenario.log.toString();
+        assertTrue(logs.contains("resource=HOST_MEMORY workload=beta.service confidence=HIGH"));
+        assertFalse(logs.contains("resource=HOST_CPU"));
+        assertFalse(logs.contains("previous="));
+        String publishedMemory = object(
+                object(new DiagnosticSnapshotJsonEncoder().encode(after), "resources"),
+                "HOST_MEMORY");
+        assertTrue(publishedMemory.contains("\"attributionConfidence\": \"HIGH\""));
+        assertTrue(publishedMemory.contains("confidence.observations"));
+        assertTrue(publishedMemory.contains("confidence.duration"));
+
+        scenario.log.reset();
+        for (long now = 15_000; now <= 19_000; now += 1_000) {
+            assertTrue(scenario.tick(now).isEmpty());
+        }
+        assertEquals(after.version(), scenario.current().version());
+        assertEquals(memory.since(), scenario.current().diagnosis(ResourceType.HOST_MEMORY).since());
+        assertEquals(19_000,
+                scenario.current().diagnosis(ResourceType.HOST_MEMORY).attribution().collectedAt());
+        assertTrue(scenario.log.toString().isEmpty());
     }
 
     @Test
@@ -365,12 +463,19 @@ class MultiResourcePublicationTest {
         private final MutableRule memory = new MutableRule(ResourceType.HOST_MEMORY, 80);
         private final MutableRule io = new MutableRule(ResourceType.DISK_IO, 60);
         private final CgroupMonitor monitor;
+        private final BullseyeConfiguration.AttributionConfidence memoryConfidence;
         private DiagnosticCoordinator coordinator;
         private long betaMemory = 800;
         private long gammaMemory = 10;
         private boolean failAlphaIo;
 
         private Scenario() throws IOException {
+            this(BullseyeConfiguration.AttributionConfidence.defaults());
+        }
+
+        private Scenario(BullseyeConfiguration.AttributionConfidence memoryConfidence)
+                throws IOException {
+            this.memoryConfidence = memoryConfidence;
             Files.writeString(root.resolve("cgroup.controllers"), "cpu memory io");
             for (String group : List.of("alpha.service", "beta.service", "gamma.service")) {
                 Path directory = Files.createDirectories(root.resolve(group));
@@ -389,7 +494,8 @@ class MultiResourcePublicationTest {
                     new DiagnosticEngine(List.of(cpu, memory, io)),
                     repository,
                     () -> "event-" + events.incrementAndGet(),
-                    new MemoryPressureAttributor(monitor, 5, 1.2),
+                    new MemoryPressureAttributor(
+                            monitor, 5, 1.2, Duration.ofSeconds(7), memoryConfidence),
                     new CpuPressureAttributor(monitor, 5, 1.2, Duration.ofSeconds(7)),
                     new IoPressureAttributor(monitor, 5, 1.2, Duration.ofSeconds(7)),
                     Duration.ofSeconds(2),
