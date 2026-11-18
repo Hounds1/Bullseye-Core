@@ -4,6 +4,11 @@ public final class ProcStatParser {
 
     private ProcStatParser() {}
 
+    public static int parseLogicalCpuCount(String content) {
+        return Math.toIntExact(
+                content.lines().filter(line -> line.matches("cpu\\d+\\s+.*")).count());
+    }
+
     public static CpuTicks parseCpuTicks(String content) {
         String firstLine =
                 content.lines()

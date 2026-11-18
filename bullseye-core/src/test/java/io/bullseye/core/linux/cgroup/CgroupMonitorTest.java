@@ -11,6 +11,7 @@ import io.bullseye.core.logging.BullseyeLogger;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.PrintStream;
@@ -316,11 +317,239 @@ class CgroupMonitorTest {
         assertTrue(nextEpisode.previousSnapshots().isEmpty());
     }
 
+    @Test
+    void collectsCpuUsageQuotaPressureAndOptionalThrottleCounters() {
+        fixtureCpu(group, 4_000_000);
+        files.content.put(group.resolve("cpu.max"), "200000 100000\n");
+        clock.millis = 2_000;
+
+        CgroupMonitor.CpuCollectionResult result = monitor(512).collectCpu();
+        CgroupCpuSnapshot snapshot = result.snapshots().getFirst();
+
+        assertEquals(4_000_000, snapshot.usageUsec());
+        assertEquals(3_000_000, snapshot.userUsec());
+        assertEquals(1_000_000, snapshot.systemUsec());
+        assertEquals(200_000, snapshot.quotaUsec());
+        assertEquals(100_000, snapshot.periodUsec());
+        assertEquals(20, snapshot.nrPeriods());
+        assertEquals(3, snapshot.nrThrottled());
+        assertEquals(50_000, snapshot.throttledUsec());
+        assertEquals(15, snapshot.psiSome());
+        assertEquals(2_000, snapshot.collectedAt());
+        assertEquals(2_000, result.collectedAt());
+        assertTrue(result.coverage().complete());
+        assertTrue(result.previousSnapshots().isEmpty());
+    }
+
+    @Test
+    void missingOptionalCpuFilesAndCountersRemainUnavailable() {
+        files.content.put(
+                group.resolve("cpu.stat"),
+                "usage_usec 100\nuser_usec 80\nsystem_usec 20\n");
+
+        CgroupMonitor.CpuCollectionResult result = monitor(512).collectCpu();
+        CgroupCpuSnapshot snapshot = result.snapshots().getFirst();
+
+        assertNull(snapshot.quotaUsec());
+        assertNull(snapshot.periodUsec());
+        assertNull(snapshot.nrPeriods());
+        assertNull(snapshot.nrThrottled());
+        assertNull(snapshot.throttledUsec());
+        assertTrue(Double.isNaN(snapshot.psiSome()));
+        assertTrue(result.coverage().complete());
+    }
+
+    @Test
+    void unlimitedCpuQuotaPreservesPeriodWithoutInventingLimit() {
+        fixtureCpu(group, 4_000_000);
+
+        CgroupCpuSnapshot snapshot = monitor(512).collectCpu().snapshots().getFirst();
+
+        assertNull(snapshot.quotaUsec());
+        assertEquals(100_000, snapshot.periodUsec());
+    }
+
+    @Test
+    void rejectsMissingNegativeAndDuplicateRequiredCpuCounters() {
+        for (String counters : List.of(
+                "usage_usec 100\nuser_usec 80\n",
+                "usage_usec -100\nuser_usec 80\nsystem_usec 20\n",
+                "usage_usec 100\nusage_usec 200\nuser_usec 80\nsystem_usec 20\n",
+                "usage_usec broken\nuser_usec 80\nsystem_usec 20\n")) {
+            files.content.put(group.resolve("cpu.stat"), counters);
+
+            CgroupMonitor.CpuCollectionResult result = monitor(512).collectCpu();
+
+            assertTrue(result.snapshots().isEmpty());
+            assertEquals(1, result.coverage().failedGroups());
+            assertFalse(result.coverage().complete());
+        }
+    }
+
+    @Test
+    void invalidCpuQuotaAndDeniedPressureAreCollectionFailures() {
+        fixtureCpu(group, 4_000_000);
+        for (String maximum : List.of("max", "max 0", "0 100000", "100000 broken")) {
+            files.content.put(group.resolve("cpu.max"), maximum);
+
+            CgroupMonitor.CpuCollectionResult result = monitor(512).collectCpu();
+
+            assertTrue(result.snapshots().isEmpty());
+            assertEquals(1, result.coverage().failedGroups());
+        }
+
+        files.content.put(group.resolve("cpu.max"), "max 100000");
+        files.content.remove(group.resolve("cpu.pressure"));
+        files.denied.add(group.resolve("cpu.pressure"));
+        CgroupMonitor.CpuCollectionResult denied = monitor(512).collectCpu();
+
+        assertEquals(CgroupMonitor.Status.ACCESS_DENIED, denied.status());
+        assertEquals(1, denied.coverage().failedGroups());
+    }
+
+    @Test
+    void cpuAndMemoryFailureCoverageRemainIndependent() {
+        Path second = root.resolve("batch.service");
+        files.directories.put(root, List.of(group, second));
+        fixtureGroup(second, "400", "max", 2, 0, "high 0\n");
+        fixtureCpu(group, 4_000_000);
+        fixtureCpu(second, 2_000_000);
+        files.denied.add(second.resolve("cpu.stat"));
+        CgroupMonitor monitor = monitor(512);
+
+        CgroupMonitor.CpuCollectionResult partialCpu = monitor.collectCpu();
+        assertEquals(CgroupMonitor.Status.AVAILABLE, partialCpu.status());
+        assertEquals(1, partialCpu.coverage().collectedGroups());
+        assertEquals(1, partialCpu.coverage().failedGroups());
+        assertFalse(partialCpu.coverage().complete());
+        assertTrue(monitor.collectMemory().coverage().complete());
+
+        files.denied.clear();
+        files.denied.add(second.resolve("memory.current"));
+        assertEquals(1, monitor.collectMemory().coverage().failedGroups());
+        assertTrue(monitor.collectCpu().coverage().complete());
+    }
+
+    @Test
+    void resetsCpuAndMemoryHistoryIndependently() {
+        fixtureCpu(group, 4_000_000);
+        CgroupMonitor monitor = monitor(512);
+        monitor.collectCpu();
+        monitor.collectMemory();
+        monitor.clearHistory();
+        clock.millis = 1_000;
+        fixtureCpu(group, 8_000_000);
+
+        CgroupMonitor.CpuCollectionResult secondCpu = monitor.collectCpu();
+        assertEquals(
+                4_000_000,
+                secondCpu.previousSnapshots().get("/system.slice/order-api.service").usageUsec());
+        assertEquals(8_000_000, secondCpu.snapshots().getFirst().usageUsec());
+        assertTrue(monitor.collectMemory().previousSnapshots().isEmpty());
+
+        monitor.clearCpuHistory();
+        clock.millis = 2_000;
+        assertFalse(monitor.collectMemory().previousSnapshots().isEmpty());
+        assertTrue(monitor.collectCpu().previousSnapshots().isEmpty());
+    }
+
+    @Test
+    void failedCpuReadClearsBaselineBeforeRecovery() {
+        fixtureCpu(group, 4_000_000);
+        CgroupMonitor monitor = monitor(512);
+        monitor.collectCpu();
+        files.missingDuringRead.add(group.resolve("cpu.stat"));
+        clock.millis = 1_000;
+
+        assertEquals(1, monitor.collectCpu().coverage().failedGroups());
+
+        files.missingDuringRead.clear();
+        fixtureCpu(group, 12_000_000);
+        clock.millis = 2_000;
+        CgroupMonitor.CpuCollectionResult recovered = monitor.collectCpu();
+        assertTrue(recovered.coverage().complete());
+        assertTrue(recovered.previousSnapshots().isEmpty());
+    }
+
+    @Test
+    void cpuAndMemoryShareDiscoveryAndOnlyCollectLeafCandidates() {
+        Path child = group.resolve("worker");
+        files.directories.put(group, List.of(child));
+        fixtureCpu(group, 8_000_000);
+        fixtureCpu(child, 4_000_000);
+        fixtureGroup(child, "400", "max", 2, 0, "high 0\n");
+        CgroupMonitor monitor = monitor(512);
+
+        CgroupMonitor.CpuCollectionResult cpu = monitor.collectCpu();
+        int discoveryReads = files.directoryReads;
+        CgroupMonitor.CollectionResult memory = monitor.collectMemory();
+
+        assertEquals(1, cpu.snapshots().size());
+        assertEquals(
+                "/system.slice/order-api.service/worker",
+                cpu.snapshots().getFirst().workload().cgroupPath());
+        assertEquals(4_000_000, cpu.snapshots().getFirst().usageUsec());
+        assertTrue(cpu.coverage().complete());
+        assertEquals(1, memory.snapshots().size());
+        assertEquals(discoveryReads, files.directoryReads);
+    }
+
+    @Test
+    void cpuReportsDiscoveryLimitsAndUnsupportedCgroup() {
+        fixtureCpu(group, 4_000_000);
+        files.directories.put(group, List.of(group.resolve("worker")));
+
+        CgroupMonitor.CpuCollectionResult limited = monitor(512, 1, true).collectCpu();
+
+        assertTrue(limited.coverage().discoveryLimited());
+        assertFalse(limited.coverage().complete());
+
+        files.content.remove(root.resolve("cgroup.controllers"));
+        CgroupMonitor.CpuCollectionResult unsupported = monitor(512).collectCpu();
+        assertEquals(CgroupMonitor.Status.CGROUP_V2_NOT_AVAILABLE, unsupported.status());
+        assertTrue(unsupported.snapshots().isEmpty());
+        assertTrue(unsupported.coverage().discoveryFailed());
+    }
+
+    @Test
+    void successfulMemoryReadDoesNotRestoreFailedCpuComponent() {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        CgroupMonitor monitor =
+                monitor(
+                        512,
+                        8,
+                        true,
+                        new BullseyeLogger(new PrintStream(output), new PrintStream(errors)));
+        fixtureCpu(group, 4_000_000);
+        files.denied.add(group.resolve("cpu.stat"));
+        monitor.collectCpu();
+        monitor.collectMemory();
+
+        assertFalse(output.toString().contains("cgroup-cpu:"));
+        assertTrue(errors.toString().contains("cgroup-cpu:"));
+
+        files.denied.clear();
+        monitor.collectCpu();
+        assertTrue(output.toString().contains("cgroup-cpu:"));
+    }
+
     private CgroupMonitor monitor(int maximumGroups) {
         return monitor(maximumGroups, 8, true);
     }
 
     private CgroupMonitor monitor(int maximumGroups, int maximumDepth, boolean enabled) {
+        return monitor(
+                maximumGroups,
+                maximumDepth,
+                enabled,
+                new BullseyeLogger(
+                        new PrintStream(OutputStream.nullOutputStream()),
+                        new PrintStream(OutputStream.nullOutputStream())));
+    }
+
+    private CgroupMonitor monitor(
+            int maximumGroups, int maximumDepth, boolean enabled, BullseyeLogger logger) {
         return new CgroupMonitor(
                 new BullseyeConfiguration.Cgroup(
                         enabled,
@@ -332,9 +561,21 @@ class CgroupMonitorTest {
                         1.2),
                 files,
                 clock,
-                new BullseyeLogger(
-                        new PrintStream(OutputStream.nullOutputStream()),
-                        new PrintStream(OutputStream.nullOutputStream())));
+                logger);
+    }
+
+    private void fixtureCpu(Path target, long usageUsec) {
+        files.content.put(
+                target.resolve("cpu.stat"),
+                "usage_usec "
+                        + usageUsec
+                        + "\nuser_usec "
+                        + usageUsec * 3 / 4
+                        + "\nsystem_usec "
+                        + usageUsec / 4
+                        + "\nnr_periods 20\nnr_throttled 3\nthrottled_usec 50000\n");
+        files.content.put(target.resolve("cpu.max"), "max 100000\n");
+        files.content.put(target.resolve("cpu.pressure"), psi(15, 0));
     }
 
     private void fixtureGroup(

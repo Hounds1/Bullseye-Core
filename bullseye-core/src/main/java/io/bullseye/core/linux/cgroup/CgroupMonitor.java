@@ -71,6 +71,42 @@ public final class CgroupMonitor {
         }
     }
 
+    public record CpuCollectionResult(
+            Status status,
+            List<CgroupCpuSnapshot> snapshots,
+            Map<String, CgroupCpuSnapshot> previousSnapshots,
+            Coverage coverage,
+            long collectedAt) {
+
+        public CpuCollectionResult {
+            Objects.requireNonNull(status, "status");
+            snapshots = List.copyOf(Objects.requireNonNull(snapshots, "snapshots"));
+            previousSnapshots =
+                    Map.copyOf(Objects.requireNonNull(previousSnapshots, "previousSnapshots"));
+            Objects.requireNonNull(coverage, "coverage");
+            if (collectedAt < 0) {
+                throw new IllegalArgumentException("collectedAt must not be negative");
+            }
+        }
+
+        public CpuCollectionResult(
+                Status status,
+                List<CgroupCpuSnapshot> snapshots,
+                Map<String, CgroupCpuSnapshot> previousSnapshots) {
+            this(
+                    status,
+                    snapshots,
+                    previousSnapshots,
+                    Coverage.complete(snapshots.size()),
+                    snapshots.stream().mapToLong(CgroupCpuSnapshot::collectedAt).max().orElse(0));
+        }
+
+        public static CpuCollectionResult unavailable(Status status) {
+            return new CpuCollectionResult(
+                    status, List.of(), Map.of(), new Coverage(0, 0, true, false), 0);
+        }
+    }
+
     public interface FileAccess {
         boolean exists(Path path);
 
@@ -84,6 +120,7 @@ public final class CgroupMonitor {
     private final Clock clock;
     private final BullseyeLogger logger;
     private final Map<String, CgroupMemorySnapshot> previousSnapshots = new HashMap<>();
+    private final Map<String, CgroupCpuSnapshot> previousCpuSnapshots = new HashMap<>();
     private List<Path> cachedGroups = List.of();
     private long nextDiscoveryAt;
     private boolean discoveryComplete;
@@ -182,7 +219,7 @@ public final class CgroupMonitor {
         List<CgroupMemorySnapshot> collected = new ArrayList<>(cachedGroups.size());
         Map<String, CgroupMemorySnapshot> currentByPath = new LinkedHashMap<>();
         for (Path group : cachedGroups) {
-            String component = "cgroup:" + cgroupPath(group);
+            String component = "cgroup-memory:" + cgroupPath(group);
             try {
                 CgroupMemorySnapshot snapshot = collectGroup(group, now);
                 collected.add(snapshot);
@@ -212,6 +249,52 @@ public final class CgroupMonitor {
         return new CollectionResult(Status.AVAILABLE, collected, previous, coverage, now);
     }
 
+    public synchronized CpuCollectionResult collectCpu() {
+        initialize();
+        long now = clock.millis();
+        if (status != Status.AVAILABLE) {
+            previousCpuSnapshots.clear();
+            return new CpuCollectionResult(
+                    status, List.of(), Map.of(), new Coverage(0, 0, true, false), now);
+        }
+
+        if (!discoveryComplete || now >= nextDiscoveryAt) {
+            discover(now);
+        }
+        boolean accessDenied = discoveryDenied;
+        int failedGroups = 0;
+        List<CgroupCpuSnapshot> collected = new ArrayList<>(cachedGroups.size());
+        Map<String, CgroupCpuSnapshot> currentByPath = new LinkedHashMap<>();
+        for (Path group : cachedGroups) {
+            String component = "cgroup-cpu:" + cgroupPath(group);
+            try {
+                CgroupCpuSnapshot snapshot = collectCpuGroup(group, now);
+                collected.add(snapshot);
+                currentByPath.put(snapshot.workload().cgroupPath(), snapshot);
+                logger.componentRestored(component);
+            } catch (AccessDeniedException failure) {
+                accessDenied = true;
+                failedGroups++;
+                logger.componentInterrupted(component, failure);
+            } catch (Exception failure) {
+                failedGroups++;
+                logger.componentInterrupted(component, failure);
+            }
+        }
+
+        Map<String, CgroupCpuSnapshot> previous = Map.copyOf(previousCpuSnapshots);
+        previousCpuSnapshots.clear();
+        previousCpuSnapshots.putAll(currentByPath);
+        Coverage coverage =
+                new Coverage(collected.size(), failedGroups, discoveryFailed, discoveryLimited);
+        if (failedGroups > 0) {
+            discoveryComplete = false;
+        }
+        Status resultStatus =
+                collected.isEmpty() && accessDenied ? Status.ACCESS_DENIED : Status.AVAILABLE;
+        return new CpuCollectionResult(resultStatus, collected, previous, coverage, now);
+    }
+
     public synchronized Status status() {
         initialize();
         return status;
@@ -219,6 +302,11 @@ public final class CgroupMonitor {
 
     public synchronized void clearHistory() {
         previousSnapshots.clear();
+        discoveryComplete = false;
+    }
+
+    public synchronized void clearCpuHistory() {
+        previousCpuSnapshots.clear();
         discoveryComplete = false;
     }
 
@@ -267,6 +355,7 @@ public final class CgroupMonitor {
             Set<String> active = new HashSet<>();
             leaves.forEach(path -> active.add(cgroupPath(path)));
             previousSnapshots.keySet().retainAll(active);
+            previousCpuSnapshots.keySet().retainAll(active);
         }
         discoveryComplete = true;
         discoveryFailed = failed;
@@ -291,6 +380,60 @@ public final class CgroupMonitor {
                 events.oom(),
                 events.oomKill(),
                 now);
+    }
+
+    private CgroupCpuSnapshot collectCpuGroup(Path group, long now) throws IOException {
+        Map<String, Long> counters = cpuCounters(files.read(group.resolve("cpu.stat")));
+        String maximum = optionalRead(group.resolve("cpu.max"));
+        Long quota = null;
+        Long period = null;
+        if (maximum != null) {
+            String[] parts = maximum.trim().split("\\s+");
+            if (parts.length != 2) {
+                throw new IllegalArgumentException("Malformed cpu.max");
+            }
+            quota = "max".equals(parts[0]) ? null : Long.parseLong(parts[0]);
+            period = Long.parseLong(parts[1]);
+        }
+        PsiParser.Snapshot pressure = pressure(group.resolve("cpu.pressure"));
+        return new CgroupCpuSnapshot(
+                WorkloadIdentity.fromCgroupPath(cgroupPath(group)),
+                requiredCounter(counters, "usage_usec"),
+                requiredCounter(counters, "user_usec"),
+                requiredCounter(counters, "system_usec"),
+                quota,
+                period,
+                counters.get("nr_periods"),
+                counters.get("nr_throttled"),
+                counters.get("throttled_usec"),
+                some(pressure),
+                now);
+    }
+
+    private static Map<String, Long> cpuCounters(String raw) {
+        Map<String, Long> counters = new HashMap<>();
+        for (String line : raw.lines().toList()) {
+            if (line.isBlank()) {
+                continue;
+            }
+            String[] parts = line.trim().split("\\s+");
+            if (parts.length != 2) {
+                throw new IllegalArgumentException("Malformed cpu.stat line");
+            }
+            long value = Long.parseLong(parts[1]);
+            if (value < 0 || counters.put(parts[0], value) != null) {
+                throw new IllegalArgumentException("Invalid cpu.stat counter: " + parts[0]);
+            }
+        }
+        return counters;
+    }
+
+    private static long requiredCounter(Map<String, Long> counters, String key) {
+        Long value = counters.get(key);
+        if (value == null) {
+            throw new IllegalArgumentException("Missing cpu.stat counter: " + key);
+        }
+        return value;
     }
 
     private Long memoryMax(Path path) throws IOException {
