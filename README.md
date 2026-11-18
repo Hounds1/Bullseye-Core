@@ -119,7 +119,12 @@ for a smoke test, but it is not a substitute for the real Linux host validation 
     {"metric": "score.usage", "value": 8.125, "unit": "points"},
     {"metric": "score.growth", "value": 21.875, "unit": "points"},
     {"metric": "score.pressure", "value": 0.0, "unit": "points"},
-    {"metric": "score.events", "value": 0.0, "unit": "points"}
+    {"metric": "score.events", "value": 0.0, "unit": "points"},
+    {"metric": "confidence.observations", "value": 3.0, "unit": "count"},
+    {"metric": "confidence.duration", "value": 10.0, "unit": "s"},
+    {"metric": "confidence.margin", "value": 20.0, "unit": "points"},
+    {"metric": "confidence.runner-score", "value": 10.0, "unit": "points"},
+    {"metric": "confidence.confirmations-remaining", "value": 0.0, "unit": "count"}
   ],
   "evidence": [
     {"metric": "usage", "value": 88.1, "unit": "%"},
@@ -183,19 +188,20 @@ The host logical CPU count is also tracked when available. It is required for CP
 but not for the host CPU pressure rule. Its source is the `cpuN` rows in the same `/proc/stat`
 read as CPU usage, rather than the JVM's potentially quota-limited processor count.
 Changes to that count or rollback of aggregate CPU ticks skip one host CPU usage sample to
-establish a new baseline; CPU count, memory, and load metrics continue to be published.
+establish a new baseline; CPU count and memory metrics continue to be published.
 Aggregate status is stale if any configured resource is stale, otherwise initializing if any
 resource is initializing. `lastSampleAt` is the oldest latest timestamp across that resource's
 tracked inputs, not the most recent sample of any metric. It is null until all required inputs
 are available. A fresh CPU sample therefore cannot conceal missing memory or IO observations.
 
 Collection outages preserve the last diagnosis instead of reporting a false recovery. Memory
-attribution is not refreshed while its required host usage/PSI inputs or a previously observed
-host PSI full input are expired. CPU attribution requires fresh host usage and CPU count and
-also pauses when previously observed host CPU PSI expires. It discards its CPU measurement
-baseline while retaining the last explanation until a new attempt. IO attribution similarly
-requires fresh host PSI some and pauses if previously observed host PSI full expires, clearing
-its measurement baseline. A resumed sample can restore
+attribution pauses while required host usage/PSI inputs or previously observed host PSI full
+are expired. CPU attribution requires fresh host usage and CPU count and also pauses when
+previously observed host CPU PSI expires. Both discard their confirmation history; any identified
+source is retained with its original evidence and collection time, but confidence drops to LOW.
+CPU also discards its measurement baseline. Fresh observations must confirm confidence again.
+IO attribution requires fresh host PSI some and pauses if previously observed host PSI full
+expires, clearing its measurement baseline. A resumed sample can restore
 observation freshness immediately, but each applicable recovery condition still needs its full
 continuous observation period. Samples before a collection gap cannot complete that period.
 
@@ -208,6 +214,14 @@ Failed writes retry every second without requiring a new transition; newer snaps
 older pending values. Failure/restoration logs are emitted once per outage. Shutdown attempts
 to flush pending state within its timeout, then interrupts the writer. Publisher, PSI, and
 individual cgroup failures are isolated from host telemetry.
+
+Host CPU (`/proc/stat`) and memory (`/proc/meminfo`) collection are independent. A read or
+parse failure omits only that resource's samples, which age through the existing freshness
+policy. All metrics from a single proc file are accepted together. A CPU failure also clears
+its tick baseline: the first successful read restores CPU count, and the next comparable read
+restores usage. Memory collection continues during CPU failures, and CPU collection continues
+during memory failures. Component interruption and restoration logs are emitted once per
+outage, separately for CPU, memory, and failures of an entire collector.
 
 ## Diagnostic policy
 
@@ -230,12 +244,18 @@ individual cgroup failures are isolated from host telemetry.
   CPU and IO need two snapshots to measure activity: `INSUFFICIENT_DATA` retries on the next
   fresh host sample instead of waiting for the refresh interval. Repeated evaluations of the
   same host CPU usage or IO PSI some sample do not collect another snapshot for that resource.
+  CPU and memory can make bounded extra confirmation attempts on new host usage samples;
+  the confidence settings below control this burst without changing the regular refresh policy.
   Actual execution is aligned to diagnostic evaluations, so shorter settings do not increase
   the host sampling rate. Stale host inputs defer attempts without advancing the refresh timer.
 - Recovery below HIGH clears that resource's attribution, previous cgroup samples, and refresh
   timer. All three histories/timers are independent and remain active while their own severity
   is HIGH/CRITICAL, even if another resource is selected as primary.
 - cgroup discovery is cached and bounded. No background cgroup sampling executor is used.
+  `CgroupMonitor` uses one collection loop and a typed `CollectionResult<T>` for CPU, memory,
+  and IO. Discovery, failure isolation, coverage, and collection timestamps share the same
+  implementation; each resource keeps its own parser and snapshot history. Rediscovery
+  prunes disappeared groups from all three histories.
 - Memory attribution ranks host memory share and growth rate. Memory limits, PSI, and events
   explain the selected workload's condition without increasing its contribution score. CPU
   attribution ranks actual CPU consumption relative to host capacity. Similar candidates are
@@ -285,9 +305,10 @@ Growth uses byte delta divided by elapsed observation time. The same growth rate
 receives the same growth score at different refresh intervals. Negative growth remains visible
 but contributes zero growth points. Event deltas report counts since the previous comparable
 snapshot; `observation.duration` makes that interval explicit. Reset event counters contribute
-zero delta. Without an earlier timestamp for the same workload, growth/event deltas and the
-interval are omitted, and growth contributes zero points. Current usage can still qualify a
-workload on its first snapshot.
+zero delta. Without an earlier timestamp for the same workload, or when the observation gap
+exceeds the refresh interval plus host sample freshness, growth/event deltas and the interval
+are omitted. A host memory capacity change also discards previous growth history. Current usage
+can still select a workload on its first snapshot, initially at LOW confidence.
 
 | Supporting evidence | Meaning |
 | --- | --- |
@@ -398,11 +419,42 @@ and [PSI semantics](https://docs.kernel.org/accounting/psi.html).
 
 ### Confidence and collection coverage
 
-Complete CPU/memory investigations retain the score/runner-up confidence policy: HIGH requires score >=45
-and a winner/runner ratio >=max(2, configured dominance ratio); MEDIUM requires score >=20 and
-the configured ratio; otherwise LOW. Tied scores use cgroup path order for stable selection.
-Confidence expresses the strength of this heuristic ranking and collection coverage; it is
-not a probability that the selected workload is the root cause.
+CPU/memory candidates initially report LOW confidence. The score thresholds still determine
+the eligible level: HIGH requires score >=45 and winner/runner ratio >=max(2, configured
+dominance ratio); MEDIUM requires score >=20 and the configured ratio. By default, promotion
+requires the same winner and eligible level across at least three distinct, complete observations
+spanning ten seconds, with a winner/runner score margin of at least five points. Tied scores use
+cgroup path order for stable selection. IO remains LOW regardless of these settings.
+
+The following keys use the `bullseye.cgroup.attribution.confidence.` prefix:
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `minimum-observations` | `3` | Consecutive qualifying observations; minimum 2 |
+| `minimum-duration` | `10s` | Time from the first qualifying observation to the latest; minimum 1ms |
+| `maximum-confirmation-collections` | `3` | Extra collection attempts per confirmation burst; 0 uses regular attempts only |
+| `minimum-margin` | `5` | Required winner/runner score difference, from 0 to 100 points |
+
+Extra attempts stop when confidence is confirmed, collection quality fails, or the budget is
+exhausted. Regular HIGH refreshes and CRITICAL checks can still complete confirmation later.
+Duplicate collection timestamps do not add observations or duration, but consume an extra
+attempt when confirmation is pending. Winner or eligible-level changes restart the observation
+sequence without replenishing an active burst's budget.
+
+Partial/failed collections, missing candidates, backward timestamps, CPU usage counter or memory
+event resets, host capacity changes, and gaps longer than the refresh interval plus host sample
+freshness break confirmation.
+CPU additionally requires every collected candidate to have a usable delta, and successive winner
+intervals must join at the previous observation; baseline-only snapshots do not count. Memory may
+confirm stable usage without growth.
+Confirmed confidence drops immediately when these conditions no longer hold; a new qualifying
+sequence is required. Confidence describes ranking strength and observed consistency, not a
+probability that the selected workload is the root cause.
+
+CPU/memory attribution evidence includes `confidence.observations` (count), `confidence.duration`
+(seconds), `confidence.margin` and `confidence.runner-score` (points), and
+`confidence.confirmations-remaining` (count). These fields explain the current confirmation state;
+as with other attribution evidence, retained stale results describe the last collection.
 
 `attributionCoverage` reports successful and failed group reads, discovery failure, and discovery
 truncation at the depth/group bounds. Any incomplete investigation caps confidence at LOW.

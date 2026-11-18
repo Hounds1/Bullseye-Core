@@ -10,7 +10,9 @@ import io.bullseye.common.diagnostic.Severity;
 import io.bullseye.common.metric.MetricSample;
 import io.bullseye.common.metric.MetricType;
 import io.bullseye.common.workload.WorkloadAttribution;
+import io.bullseye.common.workload.WorkloadAttribution.Coverage;
 import io.bullseye.common.workload.WorkloadIdentity;
+import io.bullseye.core.config.BullseyeConfiguration;
 import io.bullseye.core.diagnostic.rule.DiagnosticRule;
 import io.bullseye.core.linux.cgroup.CgroupMemorySnapshot;
 import io.bullseye.core.linux.cgroup.CgroupMonitor;
@@ -30,6 +32,8 @@ import java.util.concurrent.atomic.AtomicReference;
 class DiagnosticAttributionStateTest {
 
     private static final long GIB = 1_024L * 1_024 * 1_024;
+    private static final BullseyeConfiguration.AttributionConfidence PERIODIC_ONLY =
+            new BullseyeConfiguration.AttributionConfidence(3, Duration.ofSeconds(10), 0, 5);
 
     @Test
     void attributesOnHighEntryButNotRepeatedHighEvaluation() {
@@ -40,8 +44,16 @@ class DiagnosticAttributionStateTest {
                 new MemoryPressureAttributor(
                         () -> {
                             collections.incrementAndGet();
-                            return new CgroupMonitor.CollectionResult(
-                                    CgroupMonitor.Status.AVAILABLE, snapshots.get(), Map.of());
+                            var current = snapshots.get();
+                            return new CgroupMonitor.CollectionResult<>(
+                                    CgroupMonitor.Status.AVAILABLE,
+                                    current,
+                                    Map.of(),
+                                    Coverage.complete(current.size()),
+                                    current.stream()
+                                            .mapToLong(CgroupMemorySnapshot::collectedAt)
+                                            .max()
+                                            .orElse(0));
                         },
                         5,
                         1.2);
@@ -156,7 +168,7 @@ class DiagnosticAttributionStateTest {
 
     @Test
     void staleInputsDeferRefreshWithoutPostponingTheNextFreshAttempt() {
-        RefreshScenario scenario = new RefreshScenario();
+        RefreshScenario scenario = new RefreshScenario(Duration.ofSeconds(2));
         scenario.observeAt(1_000);
         scenario.snapshots.set(List.of(memorySnapshot("replacement.service", 8, 40)));
 
@@ -171,7 +183,7 @@ class DiagnosticAttributionStateTest {
 
     @Test
     void lostMemoryFullPsiDefersAttributionWithoutAdvancingTheRefreshTimer() {
-        RefreshScenario scenario = new RefreshScenario();
+        RefreshScenario scenario = new RefreshScenario(Duration.ofSeconds(2));
         scenario.window.append(new MetricSample(
                 MetricType.HOST_MEMORY_PSI_FULL_AVG10, 5, 1_000));
         scenario.observeAt(1_000);
@@ -202,7 +214,7 @@ class DiagnosticAttributionStateTest {
 
     @Test
     void recoveryClearsRefreshTimerBeforeTheNextPressureEpisode() {
-        RefreshScenario scenario = new RefreshScenario();
+        RefreshScenario scenario = new RefreshScenario(Duration.ofSeconds(2));
         scenario.observeAt(1_000);
         scenario.rule.severity = Severity.NORMAL;
         scenario.coordinator.evaluate(2_000).orElseThrow();
@@ -226,8 +238,16 @@ class DiagnosticAttributionStateTest {
                 new MemoryPressureAttributor(
                         () -> {
                             collections.incrementAndGet();
-                            return new CgroupMonitor.CollectionResult(
-                                    CgroupMonitor.Status.AVAILABLE, snapshots.get(), Map.of());
+                            var current = snapshots.get();
+                            return new CgroupMonitor.CollectionResult<>(
+                                    CgroupMonitor.Status.AVAILABLE,
+                                    current,
+                                    Map.of(),
+                                    Coverage.complete(current.size()),
+                                    current.stream()
+                                            .mapToLong(CgroupMemorySnapshot::collectedAt)
+                                            .max()
+                                            .orElse(0));
                         },
                         5,
                         1.2);
@@ -285,10 +305,12 @@ class DiagnosticAttributionStateTest {
                 new MemoryPressureAttributor(
                         () -> {
                             collections.incrementAndGet();
-                            return new CgroupMonitor.CollectionResult(
+                            return new CgroupMonitor.CollectionResult<>(
                                     CgroupMonitor.Status.AVAILABLE,
                                     List.of(memorySnapshot("order-api.service", 7, 35)),
-                                    Map.of());
+                                    Map.of(),
+                                    Coverage.complete(1),
+                                    1_000);
                         },
                         5,
                         1.2);
@@ -311,6 +333,122 @@ class DiagnosticAttributionStateTest {
 
         assertEquals(ResourceType.HOST_CPU, transition.current().resource());
         assertEquals(1, collections.get());
+    }
+
+    @Test
+    void confirmationUsesNewHostInputsAndStopsAfterItsCollectionBudget() {
+        RefreshScenario scenario = new RefreshScenario(
+                Duration.ofSeconds(2), Duration.ofSeconds(30),
+                BullseyeConfiguration.AttributionConfidence.defaults());
+        scenario.observeAt(1_000);
+        assertEquals(WorkloadAttribution.Confidence.LOW,
+                scenario.repository.current().attribution().confidence());
+
+        assertTrue(scenario.coordinator.evaluate(1_500).isEmpty());
+        assertEquals(1, scenario.collections.get());
+        for (int second = 2; second <= 4; second++) {
+            scenario.observeAt(second * 1_000L);
+            assertEquals(second, scenario.collections.get());
+        }
+        for (int second = 5; second <= 33; second++) {
+            scenario.observeAt(second * 1_000L);
+            assertEquals(4, scenario.collections.get());
+        }
+        scenario.observeAt(34_000);
+        assertEquals(5, scenario.collections.get());
+    }
+
+    @Test
+    void changingMemoryWinnerDoesNotExtendTheConfirmationBurst() {
+        RefreshScenario scenario = new RefreshScenario(
+                Duration.ofSeconds(2), Duration.ofSeconds(30),
+                BullseyeConfiguration.AttributionConfidence.defaults());
+        for (int second = 1; second <= 4; second++) {
+            String winner = "worker-" + second + ".service";
+            scenario.snapshots.set(List.of(memorySnapshot(winner, 12, 35)));
+            scenario.observeAt(second * 1_000L);
+            assertEquals(winner, scenario.workload());
+            assertEquals(WorkloadAttribution.Confidence.LOW,
+                    scenario.repository.current().attribution().confidence());
+        }
+
+        scenario.snapshots.set(List.of(memorySnapshot("replacement.service", 12, 35)));
+        scenario.observeAt(5_000);
+        assertEquals(4, scenario.collections.get());
+        assertEquals("worker-4.service", scenario.workload());
+    }
+
+    @Test
+    void failedConfirmationWaitsForPeriodicRetryBeforeStartingAgain() {
+        RefreshScenario scenario = new RefreshScenario(
+                Duration.ofSeconds(2), Duration.ofSeconds(30),
+                BullseyeConfiguration.AttributionConfidence.defaults());
+        scenario.observeAt(1_000);
+        scenario.status.set(CgroupMonitor.Status.ACCESS_DENIED);
+        scenario.observeAt(2_000);
+        assertEquals(WorkloadAttribution.Status.ACCESS_DENIED,
+                scenario.repository.current().attribution().status());
+        scenario.status.set(CgroupMonitor.Status.AVAILABLE);
+        for (int second = 3; second <= 31; second++) {
+            scenario.observeAt(second * 1_000L);
+            assertEquals(2, scenario.collections.get());
+        }
+
+        scenario.observeAt(32_000);
+        assertEquals(3, scenario.collections.get());
+        assertEquals(WorkloadAttribution.Confidence.LOW,
+                scenario.repository.current().attribution().confidence());
+    }
+
+    @Test
+    void staleConfirmedMemorySourceRemainsVisibleAtLowConfidenceUntilReconfirmed() {
+        RefreshScenario scenario = new RefreshScenario(
+                Duration.ofSeconds(2), Duration.ofSeconds(30),
+                new BullseyeConfiguration.AttributionConfidence(2, Duration.ofSeconds(1), 3, 5));
+        scenario.snapshots.set(List.of(memorySnapshot("large.service", 12, 35)));
+        scenario.observeAt(1_000);
+        scenario.observeAt(2_000);
+        assertEquals(WorkloadAttribution.Confidence.HIGH,
+                scenario.repository.current().attribution().confidence());
+
+        scenario.coordinator.evaluate(5_000).orElseThrow();
+        assertEquals("large.service", scenario.workload());
+        assertEquals(2_000, scenario.repository.current().attribution().collectedAt());
+        assertEquals(WorkloadAttribution.Confidence.LOW,
+                scenario.repository.current().attribution().confidence());
+        assertEquals(2, scenario.collections.get());
+
+        scenario.observeAt(6_000);
+        assertEquals(WorkloadAttribution.Confidence.LOW,
+                scenario.repository.current().attribution().confidence());
+        scenario.observeAt(7_000);
+        assertEquals(WorkloadAttribution.Confidence.HIGH,
+                scenario.repository.current().attribution().confidence());
+    }
+
+    @Test
+    void missedMemoryInputsAndCapacityChangesRestartConfidenceConfirmation() {
+        RefreshScenario scenario = new RefreshScenario(
+                Duration.ofSeconds(2), Duration.ofSeconds(30),
+                new BullseyeConfiguration.AttributionConfidence(2, Duration.ofSeconds(1), 3, 5));
+        scenario.snapshots.set(List.of(memorySnapshot("large.service", 12, 35)));
+        scenario.observeAt(1_000);
+        scenario.observeAt(2_000);
+        assertEquals(WorkloadAttribution.Confidence.HIGH,
+                scenario.repository.current().attribution().confidence());
+
+        scenario.observeAt(6_000);
+        assertEquals(WorkloadAttribution.Confidence.LOW,
+                scenario.repository.current().attribution().confidence());
+        scenario.observeAt(7_000);
+        assertEquals(WorkloadAttribution.Confidence.HIGH,
+                scenario.repository.current().attribution().confidence());
+
+        scenario.hostMemoryTotal = 32 * GIB;
+        scenario.observeAt(8_000);
+        assertEquals(WorkloadAttribution.Confidence.LOW,
+                scenario.repository.current().attribution().confidence());
+        assertEquals(5, scenario.collections.get());
     }
 
     private static void appendHostMemory(InMemoryRollingMetricWindow window, long timestamp) {
@@ -347,8 +485,23 @@ class DiagnosticAttributionStateTest {
                 new InMemoryDiagnosticStateRepository(
                         DiagnosticSnapshot.initial("host", "test", 0));
         private final MutableMemoryRule rule = new MutableMemoryRule();
-        private final DiagnosticCoordinator coordinator =
-                new DiagnosticCoordinator(
+        private final DiagnosticCoordinator coordinator;
+        private long inputAt;
+        private long hostMemoryTotal = 16 * GIB;
+
+        private RefreshScenario() {
+            this(Duration.ofSeconds(10));
+        }
+
+        private RefreshScenario(Duration freshness) {
+            this(freshness, Duration.ofSeconds(5), PERIODIC_ONLY);
+        }
+
+        private RefreshScenario(
+                Duration freshness,
+                Duration refreshInterval,
+                BullseyeConfiguration.AttributionConfidence confidence) {
+            coordinator = new DiagnosticCoordinator(
                         window,
                         new DiagnosticEngine(List.of(rule)),
                         repository,
@@ -360,16 +513,43 @@ class DiagnosticAttributionStateTest {
                                         return CgroupMonitor.CollectionResult.unavailable(
                                                 status.get());
                                     }
-                                    return new CgroupMonitor.CollectionResult(
-                                            status.get(), snapshots.get(), Map.of());
+                                    var current = snapshots.get().stream()
+                                            .map(snapshot -> new CgroupMemorySnapshot(
+                                                    snapshot.workload(),
+                                                    snapshot.currentBytes(),
+                                                    snapshot.highBytes(),
+                                                    snapshot.maxBytes(),
+                                                    snapshot.psiSome(),
+                                                    snapshot.psiFull(),
+                                                    snapshot.highEvents(),
+                                                    snapshot.maxEvents(),
+                                                    snapshot.oomEvents(),
+                                                    snapshot.oomKillEvents(),
+                                                    inputAt))
+                                            .toList();
+                                    return new CgroupMonitor.CollectionResult<>(
+                                            status.get(),
+                                            current,
+                                            Map.of(),
+                                            Coverage.complete(current.size()),
+                                            current.stream()
+                                                    .mapToLong(CgroupMemorySnapshot::collectedAt)
+                                                    .max()
+                                                    .orElse(0));
                                 },
                                 5,
-                                1.2),
-                        Duration.ofSeconds(2),
-                        Duration.ofSeconds(5));
+                                1.2,
+                                refreshInterval.plus(freshness),
+                                confidence),
+                        freshness,
+                        refreshInterval);
+        }
 
         private Optional<DiagnosticTransition> observeAt(long timestamp) {
-            appendHostMemory(window, timestamp);
+            inputAt = timestamp;
+            window.append(new MetricSample(MetricType.HOST_MEMORY_TOTAL_BYTES, hostMemoryTotal, timestamp));
+            window.append(new MetricSample(MetricType.HOST_MEMORY_USAGE, 95, timestamp));
+            window.append(new MetricSample(MetricType.HOST_MEMORY_PSI_SOME_AVG10, 45, timestamp));
             return coordinator.evaluate(timestamp);
         }
 

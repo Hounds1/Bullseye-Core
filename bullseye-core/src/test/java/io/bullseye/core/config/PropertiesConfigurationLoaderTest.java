@@ -38,6 +38,10 @@ class PropertiesConfigurationLoaderTest {
                 bullseye.cgroup.discovery-interval=90s
                 bullseye.cgroup.maximum-groups=128
                 bullseye.cgroup.attribution.refresh-interval=15s
+                bullseye.cgroup.attribution.confidence.minimum-observations=4
+                bullseye.cgroup.attribution.confidence.minimum-duration=15s
+                bullseye.cgroup.attribution.confidence.maximum-confirmation-collections=5
+                bullseye.cgroup.attribution.confidence.minimum-margin=7.5
                 """);
 
         BullseyeConfiguration configuration =
@@ -53,16 +57,77 @@ class PropertiesConfigurationLoaderTest {
         assertEquals(Duration.ofSeconds(90), configuration.cgroup().discoveryInterval());
         assertEquals(128, configuration.cgroup().maximumGroups());
         assertEquals(Duration.ofSeconds(15), configuration.cgroup().attributionRefreshInterval());
+        assertEquals(
+                new BullseyeConfiguration.AttributionConfidence(4, Duration.ofSeconds(15), 5, 7.5),
+                configuration.cgroup().attributionConfidence());
     }
 
     @Test
-    void defaultsAttributionRefreshToThirtySeconds() throws Exception {
+    void defaultsAttributionRefreshAndConfidence() throws Exception {
         BullseyeConfiguration configuration = new PropertiesConfigurationLoader()
                 .load(temporaryDirectory.resolve("missing.properties"));
 
         assertEquals(Duration.ofSeconds(30), configuration.cgroup().attributionRefreshInterval());
         assertEquals(Duration.ofSeconds(30),
                 BullseyeConfiguration.Cgroup.defaults().attributionRefreshInterval());
+        var confidence = new BullseyeConfiguration.AttributionConfidence(
+                3, Duration.ofSeconds(10), 3, 5);
+        assertEquals(confidence, configuration.cgroup().attributionConfidence());
+        assertEquals(confidence, BullseyeConfiguration.AttributionConfidence.defaults());
+        assertEquals(confidence, BullseyeConfiguration.Cgroup.defaults().attributionConfidence());
+        assertEquals(confidence, new BullseyeConfiguration.Cgroup(
+                true, Path.of("/sys/fs/cgroup"), Duration.ofSeconds(60),
+                8, 512, 5, 1.2, Duration.ofSeconds(15)).attributionConfidence());
+    }
+
+    @Test
+    void acceptsConfidenceBoundariesAndDisablingExtraCollections() throws Exception {
+        for (double margin : List.of(0.0, 100.0)) {
+            Path configurationPath = writeConfiguration("""
+                    bullseye.cgroup.attribution.confidence.minimum-observations=2
+                    bullseye.cgroup.attribution.confidence.minimum-duration=1ms
+                    bullseye.cgroup.attribution.confidence.maximum-confirmation-collections=0
+                    bullseye.cgroup.attribution.confidence.minimum-margin=%s
+                    """.formatted(margin));
+
+            var configuration = new PropertiesConfigurationLoader().load(configurationPath);
+
+            assertEquals(new BullseyeConfiguration.AttributionConfidence(
+                    2, Duration.ofMillis(1), 0, margin), configuration.cgroup().attributionConfidence());
+        }
+    }
+
+    @Test
+    void rejectsInvalidAttributionConfidenceProperties() throws Exception {
+        for (String setting : List.of(
+                "minimum-observations=1",
+                "minimum-observations=-1",
+                "minimum-observations=1.5",
+                "minimum-duration=0ms",
+                "maximum-confirmation-collections=-1",
+                "minimum-margin=-0.1",
+                "minimum-margin=100.1",
+                "minimum-margin=NaN",
+                "minimum-margin=Infinity")) {
+            Path configurationPath = writeConfiguration(
+                    "bullseye.cgroup.attribution.confidence." + setting);
+
+            assertThrows(IllegalArgumentException.class,
+                    () -> new PropertiesConfigurationLoader().load(configurationPath), setting);
+        }
+    }
+
+    @Test
+    void rejectsConfidenceDurationsThatCannotRepresentPositiveMilliseconds() {
+        for (Duration duration : List.of(
+                Duration.ZERO,
+                Duration.ofNanos(1),
+                Duration.ofMillis(-1),
+                Duration.ofSeconds(Long.MAX_VALUE))) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> new BullseyeConfiguration.AttributionConfidence(3, duration, 3, 5),
+                    duration.toString());
+        }
     }
 
     @Test

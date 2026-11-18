@@ -10,9 +10,10 @@ import io.bullseye.common.workload.WorkloadAttribution.Confidence;
 import io.bullseye.common.workload.WorkloadAttribution.Coverage;
 import io.bullseye.common.workload.WorkloadAttribution.Status;
 import io.bullseye.common.workload.WorkloadIdentity;
+import io.bullseye.core.config.BullseyeConfiguration.AttributionConfidence;
 import io.bullseye.core.linux.cgroup.CgroupCpuSnapshot;
 import io.bullseye.core.linux.cgroup.CgroupMonitor;
-import io.bullseye.core.linux.cgroup.CgroupMonitor.CpuCollectionResult;
+import io.bullseye.core.linux.cgroup.CgroupMonitor.CollectionResult;
 
 import org.junit.jupiter.api.Test;
 
@@ -38,7 +39,7 @@ class CpuPressureAttributorTest {
 
         assertEquals("worker.service", result.workload().name());
         assertEquals(50, result.score());
-        assertEquals(Confidence.HIGH, result.confidence());
+        assertEquals(Confidence.LOW, result.confidence());
         assertEquals(2, value(result, "cpu.usage.cores"));
         assertEquals(4, value(result, "host.cpu.count"));
         assertEquals(50, value(result, "host.share"));
@@ -68,7 +69,7 @@ class CpuPressureAttributorTest {
 
         assertEquals("worker.service", result.workload().name());
         assertEquals(50, result.score());
-        assertEquals(Confidence.HIGH, result.confidence());
+        assertEquals(Confidence.LOW, result.confidence());
     }
 
     @Test
@@ -228,7 +229,7 @@ class CpuPressureAttributorTest {
                 new Coverage(1, 1, false, false),
                 new Coverage(1, 0, true, false),
                 new Coverage(1, 0, false, true))) {
-            var collection = new CpuCollectionResult(
+            var collection = new CollectionResult<>(
                     CgroupMonitor.Status.AVAILABLE,
                     List.of(current), Map.of(path("api.service"), before), coverage, 1_000);
             var result = new CpuPressureAttributor(() -> collection, 5, 1.2, MAXIMUM_GAP)
@@ -297,7 +298,7 @@ class CpuPressureAttributorTest {
         var coverage = new Coverage(0, 1, true, false);
         for (CgroupMonitor.Status status : List.of(
                 CgroupMonitor.Status.ACCESS_DENIED, CgroupMonitor.Status.CGROUP_V2_NOT_AVAILABLE)) {
-            var collection = new CpuCollectionResult(
+            var collection = new CollectionResult<CgroupCpuSnapshot>(
                     status, List.of(), Map.of(), coverage, 1_000);
             var result = new CpuPressureAttributor(() -> collection, 5, 1.2, MAXIMUM_GAP)
                     .attribute(4);
@@ -320,8 +321,210 @@ class CpuPressureAttributorTest {
                 () -> new CpuPressureAttributor(() -> empty, 5, 1.2, Duration.ZERO));
     }
 
+    @Test
+    void confidenceRequiresNewMeasuredIntervalsAndTheFullConfirmationDuration() {
+        var collections = new AtomicReference<>(observedCpu(5_000, 2_000_000, 200_000));
+        var attributor = attributor(collections);
+
+        var first = attributor.attribute(4);
+        assertEquals(Confidence.LOW, first.confidence());
+        assertEquals(50, first.score());
+        assertEquals(1, value(first, "confidence.observations"));
+        assertEquals(0, value(first, "confidence.duration"));
+        assertEquals(45, value(first, "confidence.margin"));
+        assertEquals(5, value(first, "confidence.runner-score"));
+        assertEquals(3, value(first, "confidence.confirmations-remaining"));
+        assertTrue(attributor.needsConfirmation());
+
+        collections.set(observedCpu(10_000, 2_000_000, 200_000));
+        assertEquals(Confidence.LOW, attributor.attribute(4).confidence());
+        collections.set(observedCpu(14_999, 10_000, 2_000_000, 200_000));
+        var tooEarly = attributor.attribute(4);
+        assertEquals(3, value(tooEarly, "confidence.observations"));
+        assertEquals(9.999, value(tooEarly, "confidence.duration"), 0.000001);
+        assertEquals(Confidence.LOW, tooEarly.confidence());
+
+        collections.set(observedCpu(15_000, 14_999, 2_000_000, 200_000));
+        var confirmed = attributor.attribute(4);
+        assertEquals(Confidence.HIGH, confirmed.confidence());
+        assertEquals(50, confirmed.score());
+        assertEquals(4, value(confirmed, "confidence.observations"));
+        assertEquals(10, value(confirmed, "confidence.duration"));
+        assertFalse(attributor.needsConfirmation());
+    }
+
+    @Test
+    void repeatedCpuCollectionConsumesAttemptsWithoutAdvancingConfidence() {
+        var collections = new AtomicReference<>(observedCpu(5_000, 2_000_000, 200_000));
+        var attributor = attributor(collections);
+        var first = attributor.attribute(4);
+        assertEquals(3, value(first, "confidence.confirmations-remaining"));
+
+        for (int remaining = 2; remaining >= 0; remaining--) {
+            assertTrue(attributor.needsConfirmation());
+            var repeated = attributor.attribute(4);
+            assertEquals(Confidence.LOW, repeated.confidence());
+            assertEquals(1, value(repeated, "confidence.observations"));
+            assertEquals(0, value(repeated, "confidence.duration"));
+            assertEquals(remaining, value(repeated, "confidence.confirmations-remaining"));
+        }
+
+        assertFalse(attributor.needsConfirmation());
+    }
+
+    @Test
+    void mediumConfidenceAlsoRequiresRepeatedObservations() {
+        var collections = new AtomicReference<>(observedCpu(5_000, 1_000_000, 200_000));
+        var attributor = attributor(collections);
+        assertEquals(Confidence.LOW, attributor.attribute(4).confidence());
+        collections.set(observedCpu(10_000, 1_000_000, 200_000));
+        assertEquals(Confidence.LOW, attributor.attribute(4).confidence());
+        collections.set(observedCpu(15_000, 1_000_000, 200_000));
+
+        var confirmed = attributor.attribute(4);
+        assertEquals(Confidence.MEDIUM, confirmed.confidence());
+        assertEquals(25, confirmed.score());
+        assertFalse(attributor.needsConfirmation());
+    }
+
+    @Test
+    void winnerAndBaseGradeChangesRestartContinuityWithoutRefillingConfirmationBudget() {
+        var collections = new AtomicReference<>(observedCpu(5_000, 2_000_000, 200_000));
+        var attributor = attributor(collections);
+        assertEquals(Confidence.LOW, attributor.attribute(4).confidence());
+
+        collections.set(observedCpu(10_000, 1_000_000, 200_000));
+        var changedGrade = attributor.attribute(4);
+        assertEquals(Confidence.LOW, changedGrade.confidence());
+        assertEquals(1, value(changedGrade, "confidence.observations"));
+        assertEquals(2, value(changedGrade, "confidence.confirmations-remaining"));
+
+        collections.set(observedCpu(15_000, 200_000, 2_000_000));
+        var changedWinner = attributor.attribute(4);
+        assertEquals("runner.service", changedWinner.workload().name());
+        assertEquals(1, value(changedWinner, "confidence.observations"));
+        assertEquals(1, value(changedWinner, "confidence.confirmations-remaining"));
+
+        collections.set(observedCpu(20_000, 2_000_000, 200_000));
+        var exhausted = attributor.attribute(4);
+        assertEquals(Confidence.LOW, exhausted.confidence());
+        assertEquals(1, value(exhausted, "confidence.observations"));
+        assertEquals(0, value(exhausted, "confidence.confirmations-remaining"));
+        assertFalse(attributor.needsConfirmation());
+    }
+
+    @Test
+    void partialCollectionDropsConfirmedConfidenceAndStartsFreshConfirmation() {
+        var collections = new AtomicReference<>(observedCpu(5_000, 2_000_000, 200_000));
+        var attributor = attributor(collections);
+        confirmHigh(attributor, collections);
+
+        var complete = observedCpu(20_000, 2_000_000, 200_000);
+        collections.set(new CollectionResult<>(
+                complete.status(), complete.snapshots(), complete.previousSnapshots(),
+                new Coverage(2, 1, false, false), complete.collectedAt()));
+        var partial = attributor.attribute(4);
+        assertEquals(Confidence.LOW, partial.confidence());
+        assertEquals(50, partial.score());
+
+        collections.set(observedCpu(25_000, 2_000_000, 200_000));
+        var recovered = attributor.attribute(4);
+        assertEquals(Confidence.LOW, recovered.confidence());
+        assertEquals(1, value(recovered, "confidence.observations"));
+    }
+
+    @Test
+    void resetCapacityChangeAndCollectionGapDiscardConfirmedHistory() {
+        var collections = new AtomicReference<>(observedCpu(5_000, 2_000_000, 200_000));
+        var attributor = attributor(collections);
+        confirmHigh(attributor, collections);
+
+        attributor.reset();
+        assertFalse(attributor.needsConfirmation());
+        collections.set(observedCpu(20_000, 2_000_000, 200_000));
+        assertEquals(Confidence.LOW, attributor.attribute(4).confidence());
+        assertEquals(Status.INSUFFICIENT_DATA, attributor.attribute(8).status());
+        collections.set(observedCpu(25_000, 4_000_000, 400_000));
+        var resized = attributor.attribute(8);
+        assertEquals(Confidence.LOW, resized.confidence());
+        assertEquals(1, value(resized, "confidence.observations"));
+
+        collections.set(observedCpu(60_000, 4_000_000, 400_000));
+        var afterGap = attributor.attribute(8);
+        assertEquals(Confidence.LOW, afterGap.confidence());
+        assertEquals(1, value(afterGap, "confidence.observations"));
+    }
+
+    @Test
+    void reversedCollectionTimeCannotConfirmAnOlderCandidate() {
+        var collections = new AtomicReference<>(observedCpu(5_000, 2_000_000, 200_000));
+        var attributor = attributor(collections);
+        attributor.attribute(4);
+
+        collections.set(observedCpu(4_000, 2_000_000, 200_000));
+        var reversed = attributor.attribute(4);
+        assertEquals(Confidence.LOW, reversed.confidence());
+        assertTrue(value(reversed, "confidence.observations") <= 1);
+    }
+
+    @Test
+    void absoluteMarginMustQualifyBeforeConfidenceCanBeConfirmed() {
+        var collections = new AtomicReference<>(observedCpu(5_000, 1_000_000, 820_000));
+        var defaults = attributor(collections);
+        var smallerMargin = new CpuPressureAttributor(
+                collections::get, 5, 1.2, MAXIMUM_GAP,
+                new AttributionConfidence(3, Duration.ofSeconds(10), 3, 4));
+        WorkloadAttribution defaultResult = null;
+        WorkloadAttribution configuredResult = null;
+        for (long time : List.of(5_000L, 10_000L, 15_000L)) {
+            collections.set(observedCpu(time, 1_000_000, 820_000));
+            defaultResult = defaults.attribute(4);
+            configuredResult = smallerMargin.attribute(4);
+        }
+
+        assertEquals(25, defaultResult.score());
+        assertEquals(4.5, value(defaultResult, "confidence.margin"), 0.000001);
+        assertEquals(Confidence.LOW, defaultResult.confidence());
+        assertFalse(defaults.needsConfirmation());
+        assertEquals(25, configuredResult.score());
+        assertEquals(Confidence.MEDIUM, configuredResult.confidence());
+    }
+
+    private static void confirmHigh(
+            CpuPressureAttributor attributor,
+            AtomicReference<CollectionResult<CgroupCpuSnapshot>> collections) {
+        WorkloadAttribution result = null;
+        for (long time : List.of(5_000L, 10_000L, 15_000L)) {
+            collections.set(observedCpu(time, 2_000_000, 200_000));
+            result = attributor.attribute(4);
+        }
+        assertEquals(Confidence.HIGH, result.confidence());
+    }
+
+    private static CollectionResult<CgroupCpuSnapshot> observedCpu(
+            long timestamp, long workerUsecPerSecond, long runnerUsecPerSecond) {
+        return observedCpu(
+                timestamp, Math.max(0, timestamp - 5_000),
+                workerUsecPerSecond, runnerUsecPerSecond);
+    }
+
+    private static CollectionResult<CgroupCpuSnapshot> observedCpu(
+            long timestamp, long previousAt, long workerUsecPerSecond, long runnerUsecPerSecond) {
+        return collection(
+                List.of(
+                        snapshot("worker.service", timestamp * workerUsecPerSecond / 1_000, timestamp),
+                        snapshot("runner.service", timestamp * runnerUsecPerSecond / 1_000, timestamp)),
+                Map.of(
+                        path("worker.service"), snapshot(
+                                "worker.service", previousAt * workerUsecPerSecond / 1_000,
+                                previousAt),
+                        path("runner.service"), snapshot(
+                                "runner.service", previousAt * runnerUsecPerSecond / 1_000,
+                                previousAt)));
+    }
+
     private static CpuPressureAttributor attributor(
-            AtomicReference<CpuCollectionResult> collections) {
+            AtomicReference<CollectionResult<CgroupCpuSnapshot>> collections) {
         return new CpuPressureAttributor(collections::get, 5, 1.2, MAXIMUM_GAP);
     }
 
@@ -334,9 +537,9 @@ class CpuPressureAttributorTest {
                 .attribute(hostCpuCount);
     }
 
-    private static CpuCollectionResult collection(
+    private static CollectionResult<CgroupCpuSnapshot> collection(
             List<CgroupCpuSnapshot> current, Map<String, CgroupCpuSnapshot> previous) {
-        return new CpuCollectionResult(
+        return new CollectionResult<>(
                 CgroupMonitor.Status.AVAILABLE,
                 current,
                 previous,

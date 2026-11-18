@@ -133,12 +133,13 @@ public final class BullseyeRuntime implements AutoCloseable {
 
     private void collectSafely() {
         for (MetricCollector collector : collectors) {
+            String component = "collector-" + collector.name();
             try {
                 Collection<MetricSample> normalized = normalizer.normalize(collector.collect());
                 normalized.forEach(metricWindow::append);
+                logger.componentRestored(component);
             } catch (Exception failure) {
-                logger.interrupted(
-                        "Host telemetry interrupted. collector=" + collector.name(), failure);
+                logger.componentInterrupted(component, failure);
             }
         }
         requestDiagnostics();

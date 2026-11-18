@@ -2,9 +2,11 @@ package io.bullseye.core.diagnostic;
 
 import io.bullseye.common.diagnostic.DiagnosticEvidence;
 import io.bullseye.common.workload.WorkloadAttribution;
+import io.bullseye.core.config.BullseyeConfiguration.AttributionConfidence;
 import io.bullseye.core.linux.cgroup.CgroupMemorySnapshot;
 import io.bullseye.core.linux.cgroup.CgroupMonitor;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -19,32 +21,59 @@ public final class MemoryPressureAttributor {
     // Same scale as 10% of host memory gained in the original five-second sample interval.
     private static final double HOST_GROWTH_PER_SECOND_SATURATION = 0.02;
 
-    private final Supplier<CgroupMonitor.CollectionResult> collections;
+    private final Supplier<CgroupMonitor.CollectionResult<CgroupMemorySnapshot>> collections;
     private final Runnable historyReset;
     private final double minimumScore;
-    private final double dominanceRatio;
+    private final long maximumObservationGapMillis;
+    private final AttributionConfidenceTracker confidenceTracker;
+    private Long previousHostTotalBytes;
+    private boolean discardPrevious;
 
     public MemoryPressureAttributor(
             CgroupMonitor monitor, double minimumScore, double dominanceRatio) {
+        this(monitor, minimumScore, dominanceRatio, Duration.ofSeconds(40),
+                AttributionConfidence.defaults());
+    }
+
+    public MemoryPressureAttributor(
+            CgroupMonitor monitor,
+            double minimumScore,
+            double dominanceRatio,
+            Duration maximumObservationGap,
+            AttributionConfidence confidence) {
         this(
                 Objects.requireNonNull(monitor, "monitor")::collectMemory,
-                monitor::clearHistory,
+                monitor::clearMemoryHistory,
                 minimumScore,
-                dominanceRatio);
+                dominanceRatio,
+                maximumObservationGap,
+                confidence);
     }
 
     MemoryPressureAttributor(
-            Supplier<CgroupMonitor.CollectionResult> collections,
+            Supplier<CgroupMonitor.CollectionResult<CgroupMemorySnapshot>> collections,
             double minimumScore,
             double dominanceRatio) {
-        this(collections, () -> {}, minimumScore, dominanceRatio);
+        this(collections, minimumScore, dominanceRatio, Duration.ofSeconds(40),
+                AttributionConfidence.defaults());
+    }
+
+    MemoryPressureAttributor(
+            Supplier<CgroupMonitor.CollectionResult<CgroupMemorySnapshot>> collections,
+            double minimumScore,
+            double dominanceRatio,
+            Duration maximumObservationGap,
+            AttributionConfidence confidence) {
+        this(collections, () -> {}, minimumScore, dominanceRatio, maximumObservationGap, confidence);
     }
 
     private MemoryPressureAttributor(
-            Supplier<CgroupMonitor.CollectionResult> collections,
+            Supplier<CgroupMonitor.CollectionResult<CgroupMemorySnapshot>> collections,
             Runnable historyReset,
             double minimumScore,
-            double dominanceRatio) {
+            double dominanceRatio,
+            Duration maximumObservationGap,
+            AttributionConfidence confidence) {
         this.collections = Objects.requireNonNull(collections, "collections");
         this.historyReset = Objects.requireNonNull(historyReset, "historyReset");
         if (!Double.isFinite(minimumScore) || minimumScore < 0) {
@@ -54,11 +83,17 @@ public final class MemoryPressureAttributor {
             throw new IllegalArgumentException("dominanceRatio must be greater than 1");
         }
         this.minimumScore = minimumScore;
-        this.dominanceRatio = dominanceRatio;
+        Objects.requireNonNull(maximumObservationGap, "maximumObservationGap");
+        maximumObservationGapMillis = maximumObservationGap.toMillis();
+        if (maximumObservationGapMillis < 1) {
+            throw new IllegalArgumentException("maximumObservationGap must be at least 1ms");
+        }
+        confidenceTracker =
+                new AttributionConfidenceTracker(confidence, dominanceRatio, maximumObservationGap);
     }
 
     public WorkloadAttribution attribute(long hostTotalBytes) {
-        CgroupMonitor.CollectionResult collection = collections.get();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> collection = collections.get();
         if (collection.status() == CgroupMonitor.Status.CGROUP_V2_NOT_AVAILABLE) {
             return unavailable(WorkloadAttribution.Status.CGROUP_V2_NOT_AVAILABLE, collection);
         }
@@ -69,13 +104,20 @@ public final class MemoryPressureAttributor {
             return unavailable(WorkloadAttribution.Status.INSUFFICIENT_DATA, collection);
         }
 
+        boolean capacityChanged =
+                previousHostTotalBytes != null && previousHostTotalBytes != hostTotalBytes;
+        previousHostTotalBytes = hostTotalBytes;
+        Map<String, CgroupMemorySnapshot> previous =
+                capacityChanged || discardPrevious ? Map.of() : collection.previousSnapshots();
+        discardPrevious = false;
+
         List<Candidate> candidates =
                 collection.snapshots().stream()
                         .map(
                                 snapshot ->
                                         candidate(
                                                 snapshot,
-                                                collection.previousSnapshots(),
+                                                previous,
                                                 hostTotalBytes))
                         .sorted(
                                 Comparator.comparingDouble(Candidate::score)
@@ -90,22 +132,37 @@ public final class MemoryPressureAttributor {
 
         Candidate winner = candidates.getFirst();
         double runnerScore = candidates.size() > 1 ? candidates.get(1).score() : 0;
-        double ratio = runnerScore == 0 ? Double.POSITIVE_INFINITY : winner.score() / runnerScore;
-        WorkloadAttribution.Confidence confidence = confidence(winner.score(), ratio);
-        if (!collection.coverage().complete()) {
-            confidence = WorkloadAttribution.Confidence.LOW;
-        }
+        CgroupMemorySnapshot snapshot = winner.snapshot();
+        CgroupMemorySnapshot before = previous.get(snapshot.workload().cgroupPath());
+        boolean countersReset = before != null
+                && (snapshot.highEvents() < before.highEvents()
+                        || snapshot.maxEvents() < before.maxEvents()
+                        || snapshot.oomEvents() < before.oomEvents()
+                        || snapshot.oomKillEvents() < before.oomKillEvents());
+        List<DiagnosticEvidence> evidence = new ArrayList<>(winner.evidence());
+        WorkloadAttribution.Confidence confidence = confidenceTracker.observe(
+                snapshot.workload(), winner.score(), runnerScore, collection.collectedAt(), null,
+                collection.coverage().complete() && !capacityChanged && !countersReset
+                        && snapshot.collectedAt() == collection.collectedAt(),
+                evidence);
         return WorkloadAttribution.identified(
                 winner.snapshot().workload(),
                 winner.score(),
                 confidence,
-                winner.evidence(),
+                evidence,
                 collection.coverage(),
                 collection.collectedAt());
     }
 
     public void reset() {
+        confidenceTracker.reset();
+        previousHostTotalBytes = null;
+        discardPrevious = true;
         historyReset.run();
+    }
+
+    public boolean needsConfirmation() {
+        return confidenceTracker.needsConfirmation();
     }
 
     private Candidate candidate(
@@ -116,7 +173,8 @@ public final class MemoryPressureAttributor {
         boolean comparable =
                 previous != null
                         && current.workload().equals(previous.workload())
-                        && current.collectedAt() > previous.collectedAt();
+                        && current.collectedAt() > previous.collectedAt()
+                        && current.collectedAt() - previous.collectedAt() <= maximumObservationGapMillis;
         double hostShare = (double) current.currentBytes() / hostTotalBytes;
         List<DiagnosticEvidence> evidence = new ArrayList<>();
         evidence.add(metric("memory.current", current.currentBytes(), "bytes"));
@@ -147,16 +205,6 @@ public final class MemoryPressureAttributor {
         evidence.add(metric("score.pressure", 0, "points"));
         evidence.add(metric("score.events", 0, "points"));
         return new Candidate(current, usage + growth, List.copyOf(evidence));
-    }
-
-    private WorkloadAttribution.Confidence confidence(double score, double ratio) {
-        if (ratio >= Math.max(2, dominanceRatio) && score >= 45) {
-            return WorkloadAttribution.Confidence.HIGH;
-        }
-        if (ratio >= dominanceRatio && score >= 20) {
-            return WorkloadAttribution.Confidence.MEDIUM;
-        }
-        return WorkloadAttribution.Confidence.LOW;
     }
 
     private static double usageScore(double hostShare) {
@@ -211,8 +259,11 @@ public final class MemoryPressureAttributor {
         return new DiagnosticEvidence(name, value, unit);
     }
 
-    private static WorkloadAttribution unavailable(
-            WorkloadAttribution.Status status, CgroupMonitor.CollectionResult collection) {
+    private WorkloadAttribution unavailable(
+            WorkloadAttribution.Status status,
+            CgroupMonitor.CollectionResult<CgroupMemorySnapshot> collection) {
+        confidenceTracker.reset();
+        discardPrevious = true;
         return WorkloadAttribution.unavailable(
                 status, collection.coverage(), collection.collectedAt());
     }

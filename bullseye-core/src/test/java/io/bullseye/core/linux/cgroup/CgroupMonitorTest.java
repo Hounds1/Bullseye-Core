@@ -52,7 +52,7 @@ class CgroupMonitorTest {
 
     @Test
     void collectsMemoryPressureAndEventCounters() {
-        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> result = monitor(512).collectMemory();
         CgroupMemorySnapshot snapshot = result.snapshots().getFirst();
 
         assertEquals(800, snapshot.currentBytes());
@@ -72,7 +72,7 @@ class CgroupMonitorTest {
     void collectsMemoryHighSeparatelyFromHardLimit() {
         files.content.put(group.resolve("memory.high"), "900\n");
 
-        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> result = monitor(512).collectMemory();
         CgroupMemorySnapshot snapshot = result.snapshots().getFirst();
 
         assertEquals(900, snapshot.highBytes());
@@ -82,12 +82,12 @@ class CgroupMonitorTest {
 
     @Test
     void unlimitedAndMissingMemoryHighRemainUnavailableWithoutCollectionFailure() {
-        CgroupMonitor.CollectionResult missing = monitor(512).collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> missing = monitor(512).collectMemory();
         assertNull(missing.snapshots().getFirst().highBytes());
         assertTrue(missing.coverage().complete());
 
         files.content.put(group.resolve("memory.high"), "max\n");
-        CgroupMonitor.CollectionResult unlimited = monitor(512).collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> unlimited = monitor(512).collectMemory();
 
         assertNull(unlimited.snapshots().getFirst().highBytes());
         assertEquals(1_000, unlimited.snapshots().getFirst().maxBytes());
@@ -98,7 +98,7 @@ class CgroupMonitorTest {
     void zeroMemoryHighIsAValidConfiguredBoundary() {
         files.content.put(group.resolve("memory.high"), "0\n");
 
-        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> result = monitor(512).collectMemory();
 
         assertEquals(0, result.snapshots().getFirst().highBytes());
         assertTrue(result.coverage().complete());
@@ -109,7 +109,7 @@ class CgroupMonitorTest {
         for (String high : List.of("broken", "-1", "900 extra", "")) {
             files.content.put(group.resolve("memory.high"), high);
 
-            CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+            CgroupMonitor.CollectionResult<CgroupMemorySnapshot> result = monitor(512).collectMemory();
 
             assertTrue(result.snapshots().isEmpty());
             assertEquals(1, result.coverage().failedGroups());
@@ -124,7 +124,7 @@ class CgroupMonitorTest {
         fixtureGroup(second, "400", "max", 2, 0, "high 0\n");
         files.denied.add(group.resolve("memory.high"));
 
-        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> result = monitor(512).collectMemory();
 
         assertEquals(CgroupMonitor.Status.AVAILABLE, result.status());
         assertEquals("batch.service", result.snapshots().getFirst().workload().name());
@@ -176,7 +176,7 @@ class CgroupMonitorTest {
         files.content.put(group.resolve("memory.current"), "1200\n");
         clock.millis = 5_000;
 
-        CgroupMonitor.CollectionResult second = monitor.collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> second = monitor.collectMemory();
 
         assertEquals(
                 800,
@@ -203,7 +203,7 @@ class CgroupMonitorTest {
     void skipsCgroupThatDisappearsDuringCollection() {
         files.missingDuringRead.add(group.resolve("memory.current"));
 
-        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> result = monitor(512).collectMemory();
 
         assertEquals(CgroupMonitor.Status.AVAILABLE, result.status());
         assertTrue(result.snapshots().isEmpty());
@@ -215,7 +215,7 @@ class CgroupMonitorTest {
     void returnsAccessDeniedWithoutThrowing() {
         files.denied.add(group.resolve("memory.pressure"));
 
-        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> result = monitor(512).collectMemory();
 
         assertEquals(CgroupMonitor.Status.ACCESS_DENIED, result.status());
         assertTrue(result.snapshots().isEmpty());
@@ -227,7 +227,7 @@ class CgroupMonitorTest {
         files.directories.put(root, List.of(group, second));
         fixtureGroup(second, "400", "max", 2, 0, "high 0\n");
 
-        CgroupMonitor.CollectionResult result = monitor(1).collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> result = monitor(1).collectMemory();
 
         assertEquals(1, result.snapshots().size());
         assertEquals("order-api.service", result.snapshots().getFirst().workload().name());
@@ -238,7 +238,7 @@ class CgroupMonitorTest {
     void unsupportedCgroupV2ReturnsExplicitStatus() {
         files.content.remove(root.resolve("cgroup.controllers"));
 
-        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> result = monitor(512).collectMemory();
 
         assertEquals(CgroupMonitor.Status.CGROUP_V2_NOT_AVAILABLE, result.status());
         assertTrue(result.snapshots().isEmpty());
@@ -248,7 +248,7 @@ class CgroupMonitorTest {
     void deniedCgroupControllerReturnsAccessDeniedStatus() {
         files.denied.add(root.resolve("cgroup.controllers"));
 
-        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> result = monitor(512).collectMemory();
 
         assertEquals(CgroupMonitor.Status.ACCESS_DENIED, result.status());
         assertTrue(result.snapshots().isEmpty());
@@ -273,7 +273,7 @@ class CgroupMonitorTest {
         fixtureGroup(second, "400", "max", 2, 0, "high 0\n");
         files.denied.add(second.resolve("memory.pressure"));
 
-        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> result = monitor(512).collectMemory();
 
         assertEquals(CgroupMonitor.Status.AVAILABLE, result.status());
         assertEquals(1, result.coverage().collectedGroups());
@@ -287,7 +287,7 @@ class CgroupMonitorTest {
         files.denied.add(group.resolve("memory.pressure"));
         files.content.remove(group.resolve("memory.pressure"));
 
-        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> result = monitor(512).collectMemory();
 
         assertEquals(CgroupMonitor.Status.ACCESS_DENIED, result.status());
         assertEquals(1, result.coverage().failedGroups());
@@ -297,7 +297,7 @@ class CgroupMonitorTest {
     void malformedGroupIsIncludedInFailureCount() {
         files.content.put(group.resolve("memory.current"), "not-a-counter");
 
-        CgroupMonitor.CollectionResult result = monitor(512).collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> result = monitor(512).collectMemory();
 
         assertEquals(1, result.coverage().failedGroups());
         assertTrue(result.snapshots().isEmpty());
@@ -308,19 +308,19 @@ class CgroupMonitorTest {
     void cachedDiscoveryRetainsFailureUntilSuccessfulRediscovery() {
         files.deniedDirectories.add(group);
         CgroupMonitor monitor = monitor(512);
-        CgroupMonitor.CollectionResult first = monitor.collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> first = monitor.collectMemory();
         assertTrue(first.coverage().discoveryFailed());
         assertEquals(1, first.snapshots().size());
         int directoryReads = files.directoryReads;
 
         files.deniedDirectories.clear();
         clock.millis = 5_000;
-        CgroupMonitor.CollectionResult cached = monitor.collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> cached = monitor.collectMemory();
         assertEquals(directoryReads, files.directoryReads);
         assertTrue(cached.coverage().discoveryFailed());
 
         clock.millis = 60_000;
-        CgroupMonitor.CollectionResult recovered = monitor.collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> recovered = monitor.collectMemory();
         assertTrue(recovered.coverage().complete());
         assertEquals(60_000, recovered.collectedAt());
     }
@@ -331,7 +331,7 @@ class CgroupMonitorTest {
         files.directories.put(group, List.of(child));
         fixtureGroup(child, "100", "max", 0, 0, "high 0\n");
 
-        CgroupMonitor.CollectionResult result = monitor(512, 1, true).collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> result = monitor(512, 1, true).collectMemory();
 
         assertEquals(1, result.snapshots().size());
         assertTrue(result.coverage().discoveryLimited());
@@ -340,7 +340,7 @@ class CgroupMonitorTest {
 
     @Test
     void exactGroupAndDepthLimitsWithoutOmittedChildrenRemainComplete() {
-        CgroupMonitor.CollectionResult result = monitor(1, 1, true).collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> result = monitor(1, 1, true).collectMemory();
 
         assertEquals(1, result.snapshots().size());
         assertTrue(result.coverage().complete());
@@ -355,7 +355,7 @@ class CgroupMonitorTest {
 
         files.denied.clear();
         clock.millis = 5_000;
-        CgroupMonitor.CollectionResult recovered = monitor.collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> recovered = monitor.collectMemory();
 
         assertEquals(CgroupMonitor.Status.AVAILABLE, recovered.status());
         assertEquals(1, recovered.snapshots().size());
@@ -388,7 +388,7 @@ class CgroupMonitorTest {
         files.directories.put(root, List.of(replacement));
         fixtureGroup(replacement, "400", "max", 2, 0, "high 0\n");
         clock.millis = 10_000;
-        CgroupMonitor.CollectionResult refreshed = monitor.collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> refreshed = monitor.collectMemory();
 
         assertTrue(refreshed.coverage().complete());
         assertEquals("replacement.service", refreshed.snapshots().getFirst().workload().name());
@@ -403,9 +403,9 @@ class CgroupMonitorTest {
         files.directories.put(root, List.of(replacement));
         fixtureGroup(replacement, "400", "max", 2, 0, "high 0\n");
 
-        monitor.clearHistory();
+        monitor.clearMemoryHistory();
         clock.millis = 5_000;
-        CgroupMonitor.CollectionResult nextEpisode = monitor.collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> nextEpisode = monitor.collectMemory();
 
         assertEquals("replacement.service", nextEpisode.snapshots().getFirst().workload().name());
         assertTrue(nextEpisode.previousSnapshots().isEmpty());
@@ -417,7 +417,7 @@ class CgroupMonitorTest {
         files.content.put(group.resolve("cpu.max"), "200000 100000\n");
         clock.millis = 2_000;
 
-        CgroupMonitor.CpuCollectionResult result = monitor(512).collectCpu();
+        CgroupMonitor.CollectionResult<CgroupCpuSnapshot> result = monitor(512).collectCpu();
         CgroupCpuSnapshot snapshot = result.snapshots().getFirst();
 
         assertEquals(4_000_000, snapshot.usageUsec());
@@ -441,7 +441,7 @@ class CgroupMonitorTest {
                 group.resolve("cpu.stat"),
                 "usage_usec 100\nuser_usec 80\nsystem_usec 20\n");
 
-        CgroupMonitor.CpuCollectionResult result = monitor(512).collectCpu();
+        CgroupMonitor.CollectionResult<CgroupCpuSnapshot> result = monitor(512).collectCpu();
         CgroupCpuSnapshot snapshot = result.snapshots().getFirst();
 
         assertNull(snapshot.quotaUsec());
@@ -472,7 +472,7 @@ class CgroupMonitorTest {
                 "usage_usec broken\nuser_usec 80\nsystem_usec 20\n")) {
             files.content.put(group.resolve("cpu.stat"), counters);
 
-            CgroupMonitor.CpuCollectionResult result = monitor(512).collectCpu();
+            CgroupMonitor.CollectionResult<CgroupCpuSnapshot> result = monitor(512).collectCpu();
 
             assertTrue(result.snapshots().isEmpty());
             assertEquals(1, result.coverage().failedGroups());
@@ -486,7 +486,7 @@ class CgroupMonitorTest {
         for (String maximum : List.of("max", "max 0", "0 100000", "100000 broken")) {
             files.content.put(group.resolve("cpu.max"), maximum);
 
-            CgroupMonitor.CpuCollectionResult result = monitor(512).collectCpu();
+            CgroupMonitor.CollectionResult<CgroupCpuSnapshot> result = monitor(512).collectCpu();
 
             assertTrue(result.snapshots().isEmpty());
             assertEquals(1, result.coverage().failedGroups());
@@ -495,7 +495,7 @@ class CgroupMonitorTest {
         files.content.put(group.resolve("cpu.max"), "max 100000");
         files.content.remove(group.resolve("cpu.pressure"));
         files.denied.add(group.resolve("cpu.pressure"));
-        CgroupMonitor.CpuCollectionResult denied = monitor(512).collectCpu();
+        CgroupMonitor.CollectionResult<CgroupCpuSnapshot> denied = monitor(512).collectCpu();
 
         assertEquals(CgroupMonitor.Status.ACCESS_DENIED, denied.status());
         assertEquals(1, denied.coverage().failedGroups());
@@ -511,7 +511,7 @@ class CgroupMonitorTest {
         files.denied.add(second.resolve("cpu.stat"));
         CgroupMonitor monitor = monitor(512);
 
-        CgroupMonitor.CpuCollectionResult partialCpu = monitor.collectCpu();
+        CgroupMonitor.CollectionResult<CgroupCpuSnapshot> partialCpu = monitor.collectCpu();
         assertEquals(CgroupMonitor.Status.AVAILABLE, partialCpu.status());
         assertEquals(1, partialCpu.coverage().collectedGroups());
         assertEquals(1, partialCpu.coverage().failedGroups());
@@ -530,11 +530,11 @@ class CgroupMonitorTest {
         CgroupMonitor monitor = monitor(512);
         monitor.collectCpu();
         monitor.collectMemory();
-        monitor.clearHistory();
+        monitor.clearMemoryHistory();
         clock.millis = 1_000;
         fixtureCpu(group, 8_000_000);
 
-        CgroupMonitor.CpuCollectionResult secondCpu = monitor.collectCpu();
+        CgroupMonitor.CollectionResult<CgroupCpuSnapshot> secondCpu = monitor.collectCpu();
         assertEquals(
                 4_000_000,
                 secondCpu.previousSnapshots().get("/system.slice/order-api.service").usageUsec());
@@ -560,7 +560,7 @@ class CgroupMonitorTest {
         files.missingDuringRead.clear();
         fixtureCpu(group, 12_000_000);
         clock.millis = 2_000;
-        CgroupMonitor.CpuCollectionResult recovered = monitor.collectCpu();
+        CgroupMonitor.CollectionResult<CgroupCpuSnapshot> recovered = monitor.collectCpu();
         assertTrue(recovered.coverage().complete());
         assertTrue(recovered.previousSnapshots().isEmpty());
     }
@@ -574,9 +574,9 @@ class CgroupMonitorTest {
         fixtureGroup(child, "400", "max", 2, 0, "high 0\n");
         CgroupMonitor monitor = monitor(512);
 
-        CgroupMonitor.CpuCollectionResult cpu = monitor.collectCpu();
+        CgroupMonitor.CollectionResult<CgroupCpuSnapshot> cpu = monitor.collectCpu();
         int discoveryReads = files.directoryReads;
-        CgroupMonitor.CollectionResult memory = monitor.collectMemory();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> memory = monitor.collectMemory();
 
         assertEquals(1, cpu.snapshots().size());
         assertEquals(
@@ -593,13 +593,13 @@ class CgroupMonitorTest {
         fixtureCpu(group, 4_000_000);
         files.directories.put(group, List.of(group.resolve("worker")));
 
-        CgroupMonitor.CpuCollectionResult limited = monitor(512, 1, true).collectCpu();
+        CgroupMonitor.CollectionResult<CgroupCpuSnapshot> limited = monitor(512, 1, true).collectCpu();
 
         assertTrue(limited.coverage().discoveryLimited());
         assertFalse(limited.coverage().complete());
 
         files.content.remove(root.resolve("cgroup.controllers"));
-        CgroupMonitor.CpuCollectionResult unsupported = monitor(512).collectCpu();
+        CgroupMonitor.CollectionResult<CgroupCpuSnapshot> unsupported = monitor(512).collectCpu();
         assertEquals(CgroupMonitor.Status.CGROUP_V2_NOT_AVAILABLE, unsupported.status());
         assertTrue(unsupported.snapshots().isEmpty());
         assertTrue(unsupported.coverage().discoveryFailed());
@@ -640,7 +640,7 @@ class CgroupMonitorTest {
         files.content.put(group.resolve("io.pressure"), psi(20, 3));
         clock.millis = 2_000;
 
-        CgroupMonitor.IoCollectionResult result = monitor(512).collectIo();
+        CgroupMonitor.CollectionResult<CgroupIoSnapshot> result = monitor(512).collectIo();
         CgroupIoSnapshot snapshot = result.snapshots().getFirst();
 
         assertEquals(new CgroupIoSnapshot.DeviceStats(100, 200, 3, 4), snapshot.devices().get("8:0"));
@@ -662,7 +662,7 @@ class CgroupMonitorTest {
         files.content.put(group.resolve("io.stat"), "\n");
         files.content.put(group.resolve("io.max"), "\n");
 
-        CgroupMonitor.IoCollectionResult result = monitor(512).collectIo();
+        CgroupMonitor.CollectionResult<CgroupIoSnapshot> result = monitor(512).collectIo();
         CgroupIoSnapshot snapshot = result.snapshots().getFirst();
 
         assertTrue(snapshot.devices().isEmpty());
@@ -683,7 +683,7 @@ class CgroupMonitorTest {
         files.content.remove(group.resolve("io.max"));
         files.content.put(group.resolve("io.pressure"), "some avg10=5 avg60=1 avg300=1 total=10\n");
 
-        CgroupMonitor.IoCollectionResult result = monitor(512).collectIo();
+        CgroupMonitor.CollectionResult<CgroupIoSnapshot> result = monitor(512).collectIo();
         CgroupIoSnapshot snapshot = result.snapshots().getFirst();
 
         assertEquals(5, snapshot.psiSome());
@@ -700,7 +700,7 @@ class CgroupMonitorTest {
                         + "8:1\n"
                         + "259:0 cost.usage=0 cost.vrate=100.00 future=text\n");
 
-        CgroupMonitor.IoCollectionResult result = monitor(512).collectIo();
+        CgroupMonitor.CollectionResult<CgroupIoSnapshot> result = monitor(512).collectIo();
         CgroupIoSnapshot snapshot = result.snapshots().getFirst();
 
         assertEquals(new CgroupIoSnapshot.DeviceStats(100, 200, 3, 4), snapshot.devices().get("8:0"));
@@ -727,7 +727,7 @@ class CgroupMonitorTest {
                 valid + " dios=broken")) {
             files.content.put(group.resolve("io.stat"), stat);
 
-            CgroupMonitor.IoCollectionResult result = monitor(512).collectIo();
+            CgroupMonitor.CollectionResult<CgroupIoSnapshot> result = monitor(512).collectIo();
 
             assertTrue(result.snapshots().isEmpty(), stat);
             assertEquals(1, result.coverage().failedGroups(), stat);
@@ -736,7 +736,7 @@ class CgroupMonitorTest {
 
     @Test
     void missingRequiredIoStatMarksCollectionAsFailed() {
-        CgroupMonitor.IoCollectionResult result = monitor(512).collectIo();
+        CgroupMonitor.CollectionResult<CgroupIoSnapshot> result = monitor(512).collectIo();
 
         assertEquals(CgroupMonitor.Status.AVAILABLE, result.status());
         assertTrue(result.snapshots().isEmpty());
@@ -757,7 +757,7 @@ class CgroupMonitorTest {
                 "8:0")) {
             files.content.put(group.resolve("io.max"), maximum);
 
-            CgroupMonitor.IoCollectionResult result = monitor(512).collectIo();
+            CgroupMonitor.CollectionResult<CgroupIoSnapshot> result = monitor(512).collectIo();
 
             assertTrue(result.snapshots().isEmpty(), maximum);
             assertEquals(1, result.coverage().failedGroups(), maximum);
@@ -773,7 +773,7 @@ class CgroupMonitorTest {
         for (String file : List.of("io.max", "io.pressure")) {
             files.denied.add(group.resolve(file));
 
-            CgroupMonitor.IoCollectionResult result = monitor(512).collectIo();
+            CgroupMonitor.CollectionResult<CgroupIoSnapshot> result = monitor(512).collectIo();
 
             assertEquals(CgroupMonitor.Status.ACCESS_DENIED, result.status());
             assertEquals(1, result.coverage().failedGroups());
@@ -793,7 +793,7 @@ class CgroupMonitorTest {
         files.denied.add(second.resolve("io.stat"));
         CgroupMonitor monitor = monitor(512);
 
-        CgroupMonitor.IoCollectionResult result = monitor.collectIo();
+        CgroupMonitor.CollectionResult<CgroupIoSnapshot> result = monitor.collectIo();
 
         assertEquals(CgroupMonitor.Status.AVAILABLE, result.status());
         assertEquals(1, result.coverage().collectedGroups());
@@ -812,11 +812,11 @@ class CgroupMonitorTest {
         monitor.collectCpu();
         monitor.collectMemory();
         monitor.clearCpuHistory();
-        monitor.clearHistory();
+        monitor.clearMemoryHistory();
         clock.millis = 1_000;
         fixtureIo(group, 300);
 
-        CgroupMonitor.IoCollectionResult secondIo = monitor.collectIo();
+        CgroupMonitor.CollectionResult<CgroupIoSnapshot> secondIo = monitor.collectIo();
         assertEquals(
                 100,
                 secondIo.previousSnapshots().get("/system.slice/order-api.service")
@@ -844,7 +844,7 @@ class CgroupMonitorTest {
         files.missingDuringRead.clear();
         fixtureIo(group, 300);
         clock.millis = 2_000;
-        CgroupMonitor.IoCollectionResult recovered = monitor.collectIo();
+        CgroupMonitor.CollectionResult<CgroupIoSnapshot> recovered = monitor.collectIo();
 
         assertTrue(recovered.coverage().complete());
         assertTrue(recovered.previousSnapshots().isEmpty());
@@ -859,7 +859,7 @@ class CgroupMonitorTest {
         fixtureCpu(child, 2_000);
         CgroupMonitor monitor = monitor(512);
 
-        CgroupMonitor.IoCollectionResult initial = monitor.collectIo();
+        CgroupMonitor.CollectionResult<CgroupIoSnapshot> initial = monitor.collectIo();
         assertEquals(1, initial.snapshots().size());
         assertEquals(200, initial.snapshots().getFirst().devices().get("8:0").readBytes());
         int discoveryReads = files.directoryReads;
@@ -868,7 +868,7 @@ class CgroupMonitorTest {
 
         files.directories.put(group, List.of());
         clock.millis = 60_000;
-        CgroupMonitor.IoCollectionResult removed = monitor.collectIo();
+        CgroupMonitor.CollectionResult<CgroupIoSnapshot> removed = monitor.collectIo();
         assertTrue(removed.previousSnapshots().isEmpty());
         assertEquals(100, removed.snapshots().getFirst().devices().get("8:0").readBytes());
 
@@ -886,12 +886,12 @@ class CgroupMonitorTest {
         files.content.remove(root.resolve("cgroup.controllers"));
         CgroupMonitor monitor = monitor(512);
 
-        CgroupMonitor.IoCollectionResult unavailable = monitor.collectIo();
+        CgroupMonitor.CollectionResult<CgroupIoSnapshot> unavailable = monitor.collectIo();
         assertEquals(CgroupMonitor.Status.CGROUP_V2_NOT_AVAILABLE, unavailable.status());
         assertTrue(unavailable.coverage().discoveryFailed());
 
         files.content.put(root.resolve("cgroup.controllers"), "cpu memory io");
-        CgroupMonitor.IoCollectionResult recovered = monitor.collectIo();
+        CgroupMonitor.CollectionResult<CgroupIoSnapshot> recovered = monitor.collectIo();
         assertEquals(CgroupMonitor.Status.AVAILABLE, recovered.status());
         assertTrue(recovered.previousSnapshots().isEmpty());
         assertTrue(recovered.coverage().complete());
@@ -918,6 +918,98 @@ class CgroupMonitorTest {
         files.denied.clear();
         monitor.collectIo();
         assertTrue(output.toString().contains("cgroup-io:"));
+    }
+
+    @Test
+    void collectionResultDefensivelyCopiesSnapshotsAndHistory() {
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> collected = monitor(512).collectMemory();
+        CgroupMemorySnapshot snapshot = collected.snapshots().getFirst();
+        List<CgroupMemorySnapshot> snapshots = new ArrayList<>(collected.snapshots());
+        Map<String, CgroupMemorySnapshot> history = new HashMap<>();
+        history.put(snapshot.workload().cgroupPath(), snapshot);
+
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> result =
+                new CgroupMonitor.CollectionResult<>(
+                        collected.status(), snapshots, history, collected.coverage(), 1_000);
+        snapshots.clear();
+        history.clear();
+
+        assertEquals(List.of(snapshot), result.snapshots());
+        assertEquals(Map.of(snapshot.workload().cgroupPath(), snapshot), result.previousSnapshots());
+        assertEquals(1_000, result.collectedAt());
+        assertThrows(UnsupportedOperationException.class, () -> result.snapshots().clear());
+        assertThrows(UnsupportedOperationException.class, () -> result.previousSnapshots().clear());
+    }
+
+    @Test
+    void eachResourceUsesItsOwnCollectionTimestampForEverySnapshot() {
+        Path second = root.resolve("batch.service");
+        files.directories.put(root, List.of(group, second));
+        fixtureGroup(second, "400", "max", 2, 0, "high 0\n");
+        fixtureCpu(group, 1_000);
+        fixtureCpu(second, 2_000);
+        fixtureIo(group, 100);
+        fixtureIo(second, 200);
+        CgroupMonitor monitor = monitor(512);
+
+        clock.millis = 1_000;
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> memory = monitor.collectMemory();
+        clock.millis = 2_000;
+        CgroupMonitor.CollectionResult<CgroupCpuSnapshot> cpu = monitor.collectCpu();
+        clock.millis = 3_000;
+        CgroupMonitor.CollectionResult<CgroupIoSnapshot> io = monitor.collectIo();
+
+        assertEquals(1_000, memory.collectedAt());
+        assertEquals(
+                List.of(1_000L, 1_000L),
+                memory.snapshots().stream().map(CgroupMemorySnapshot::collectedAt).toList());
+        assertEquals(2_000, cpu.collectedAt());
+        assertEquals(
+                List.of(2_000L, 2_000L),
+                cpu.snapshots().stream().map(CgroupCpuSnapshot::collectedAt).toList());
+        assertEquals(3_000, io.collectedAt());
+        assertEquals(
+                List.of(3_000L, 3_000L),
+                io.snapshots().stream().map(CgroupIoSnapshot::collectedAt).toList());
+    }
+
+    @Test
+    void rediscoveryAfterIoFailurePreservesCpuAndMemoryHistory() {
+        fixtureCpu(group, 1_000);
+        fixtureIo(group, 100);
+        CgroupMonitor monitor = monitor(512);
+        CgroupMemorySnapshot initialMemory = monitor.collectMemory().snapshots().getFirst();
+        CgroupCpuSnapshot initialCpu = monitor.collectCpu().snapshots().getFirst();
+        monitor.collectIo();
+
+        Path second = root.resolve("batch.service");
+        files.directories.put(root, List.of(group, second));
+        fixtureGroup(second, "400", "max", 2, 0, "high 0\n");
+        fixtureCpu(second, 2_000);
+        fixtureIo(second, 200);
+        files.denied.add(group.resolve("io.stat"));
+        clock.millis = 1_000;
+
+        CgroupMonitor.CollectionResult<CgroupIoSnapshot> denied = monitor.collectIo();
+        assertEquals(CgroupMonitor.Status.ACCESS_DENIED, denied.status());
+        assertEquals(1, denied.coverage().failedGroups());
+
+        CgroupMonitor.CollectionResult<CgroupCpuSnapshot> cpu = monitor.collectCpu();
+        CgroupMonitor.CollectionResult<CgroupMemorySnapshot> memory = monitor.collectMemory();
+        assertEquals(2, cpu.coverage().collectedGroups());
+        assertTrue(cpu.coverage().complete());
+        assertEquals(Map.of(initialCpu.workload().cgroupPath(), initialCpu), cpu.previousSnapshots());
+        assertEquals(2, memory.coverage().collectedGroups());
+        assertTrue(memory.coverage().complete());
+        assertEquals(
+                Map.of(initialMemory.workload().cgroupPath(), initialMemory),
+                memory.previousSnapshots());
+
+        files.denied.clear();
+        CgroupMonitor.CollectionResult<CgroupIoSnapshot> recovered = monitor.collectIo();
+        assertEquals(2, recovered.coverage().collectedGroups());
+        assertTrue(recovered.coverage().complete());
+        assertTrue(recovered.previousSnapshots().isEmpty());
     }
 
     private void fixtureIo(Path target, long readBytes) {
@@ -1010,11 +1102,6 @@ class CgroupMonitorTest {
         private final Set<Path> deniedDirectories = new HashSet<>();
         private int directoryReads;
         private int fileReads;
-
-        @Override
-        public boolean exists(Path path) {
-            return content.containsKey(path) || directories.containsKey(path);
-        }
 
         @Override
         public String read(Path path) throws IOException {

@@ -34,6 +34,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
@@ -97,6 +98,12 @@ class BullseyeRuntimeTest {
                     stale.observations().get(ResourceType.HOST_CPU).lastSampleAt().longValue());
             assertTrue(stale.observations().get(ResourceType.HOST_CPU).metrics().isEmpty());
 
+            harness.collector.failAt(6_500);
+            harness.await(snapshot -> snapshot.evaluatedAt() == 6_500);
+            assertEquals(1, harness.errors().lines()
+                    .filter(line -> line.contains("component=collector-runtime-test")).count());
+            assertFalse(harness.output().contains("Telemetry component restored."));
+
             harness.collector.observe(7_000, 20);
             DiagnosticSnapshot fresh = harness.awaitObserved(7_000, 20);
             assertEquals(ObservationStatus.FRESH, fresh.observationStatus());
@@ -113,11 +120,53 @@ class BullseyeRuntimeTest {
             assertEquals(ObservationStatus.FRESH, recovered.observationStatus());
             assertEquals(critical.version() + 1, recovered.version());
             assertEquals(8_000, recovered.since());
+
+            harness.collector.failAt(9_000);
+            harness.await(snapshot -> snapshot.evaluatedAt() == 9_000);
+            harness.collector.failAt(9_500);
+            harness.await(snapshot -> snapshot.evaluatedAt() == 9_500);
             assertTimeout(Duration.ofSeconds(3), harness.runtime::close);
             assertEquals(
                     2,
                     harness.output().lines().filter(line -> line.contains(" previous=")).count());
-            assertTrue(harness.errors().contains("runtime-test"));
+            assertEquals(2, harness.errors().lines()
+                    .filter(line -> line.contains("component=collector-runtime-test")).count());
+            assertEquals(1, harness.output().lines()
+                    .filter(line -> line.contains(
+                            "Telemetry component restored. component=collector-runtime-test"))
+                    .count());
+        }
+    }
+
+    @Test
+    void failedCollectorDoesNotBlockOtherCollectionDiagnosticsOrPublication() throws Exception {
+        MetricCollector failingCollector = new MetricCollector() {
+            @Override
+            public String name() {
+                return "failed-sibling";
+            }
+
+            @Override
+            public Collection<MetricSample> collect() throws IOException {
+                throw new IOException("Independent collector unavailable");
+            }
+        };
+
+        try (Harness harness = new Harness(failingCollector)) {
+            harness.collector.observe(1_000, 95);
+            harness.runtime.start();
+            harness.awaitObserved(1_000, 95);
+
+            harness.collector.observe(2_000, 96);
+            DiagnosticSnapshot critical = harness.await(snapshot ->
+                    snapshot.evaluatedAt() == 2_000 && snapshot.severity() == Severity.CRITICAL);
+
+            assertEquals(ObservationStatus.FRESH, critical.observationStatus());
+            assertEquals(2_000L,
+                    critical.observations().get(ResourceType.HOST_CPU).lastSampleAt().longValue());
+            assertEquals(1, harness.errors().lines()
+                    .filter(line -> line.contains("component=collector-failed-sibling")).count());
+            assertFalse(harness.errors().contains("component=collector-runtime-test"));
         }
     }
 
@@ -132,7 +181,7 @@ class BullseyeRuntimeTest {
         private final ByteArrayOutputStream errors = new ByteArrayOutputStream();
         private final BullseyeRuntime runtime;
 
-        private Harness() {
+        private Harness(MetricCollector... precedingCollectors) {
             BullseyeLogger logger =
                     new BullseyeLogger(
                             new PrintStream(output, true, StandardCharsets.UTF_8),
@@ -164,9 +213,11 @@ class BullseyeRuntimeTest {
                             null,
                             FRESHNESS);
             AsyncStatePublisher publisher = new AsyncStatePublisher(published::add, logger);
+            List<MetricCollector> collectors = new ArrayList<>(List.of(precedingCollectors));
+            collectors.add(collector);
             runtime =
                     new BullseyeRuntime(
-                            List.of(collector),
+                            collectors,
                             new HostMetricNormalizer(),
                             window,
                             coordinator,

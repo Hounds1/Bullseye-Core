@@ -245,6 +245,28 @@ public record BullseyeConfiguration(
         }
     }
 
+    public record AttributionConfidence(
+            int minimumObservations,
+            Duration minimumDuration,
+            int maximumConfirmationCollections,
+            double minimumMargin) {
+
+        public AttributionConfidence {
+            if (minimumObservations < 2) {
+                throw new IllegalArgumentException("minimumObservations must be at least 2");
+            }
+            requirePositive(minimumDuration, "minimumDuration");
+            if (maximumConfirmationCollections < 0) {
+                throw new IllegalArgumentException("maximumConfirmationCollections must not be negative");
+            }
+            requirePercentage(minimumMargin, "minimumMargin");
+        }
+
+        public static AttributionConfidence defaults() {
+            return new AttributionConfidence(3, Duration.ofSeconds(10), 3, 5);
+        }
+    }
+
     public record Cgroup(
             boolean enabled,
             Path root,
@@ -253,12 +275,14 @@ public record BullseyeConfiguration(
             int maximumGroups,
             double attributionMinimumScore,
             double attributionDominanceRatio,
-            Duration attributionRefreshInterval) {
+            Duration attributionRefreshInterval,
+            AttributionConfidence attributionConfidence) {
 
         public Cgroup {
             Objects.requireNonNull(root, "root");
             requirePositive(discoveryInterval, "discoveryInterval");
             requirePositive(attributionRefreshInterval, "attributionRefreshInterval");
+            Objects.requireNonNull(attributionConfidence, "attributionConfidence");
             if (maximumDepth < 1 || maximumGroups < 1) {
                 throw new IllegalArgumentException("cgroup bounds must be positive");
             }
@@ -267,6 +291,27 @@ public record BullseyeConfiguration(
                 throw new IllegalArgumentException(
                         "attributionDominanceRatio must be greater than 1");
             }
+        }
+
+        public Cgroup(
+                boolean enabled,
+                Path root,
+                Duration discoveryInterval,
+                int maximumDepth,
+                int maximumGroups,
+                double attributionMinimumScore,
+                double attributionDominanceRatio,
+                Duration attributionRefreshInterval) {
+            this(
+                    enabled,
+                    root,
+                    discoveryInterval,
+                    maximumDepth,
+                    maximumGroups,
+                    attributionMinimumScore,
+                    attributionDominanceRatio,
+                    attributionRefreshInterval,
+                    AttributionConfidence.defaults());
         }
 
         public Cgroup(

@@ -66,6 +66,8 @@ public final class BullseyeApplication {
         InMemoryDiagnosticStateRepository stateRepository =
                 new InMemoryDiagnosticStateRepository(initialState);
         Duration sampleFreshness = configuration.samplingInterval().multipliedBy(2);
+        Duration maximumObservationGap =
+                configuration.cgroup().attributionRefreshInterval().plus(sampleFreshness);
         CgroupMonitor cgroupMonitor =
                 new CgroupMonitor(
                         configuration.cgroup(), CgroupMonitor.nioFileAccess(), clock, logger);
@@ -87,19 +89,20 @@ public final class BullseyeApplication {
                         new MemoryPressureAttributor(
                                 cgroupMonitor,
                                 configuration.cgroup().attributionMinimumScore(),
-                                configuration.cgroup().attributionDominanceRatio()),
+                                configuration.cgroup().attributionDominanceRatio(),
+                                maximumObservationGap,
+                                configuration.cgroup().attributionConfidence()),
                         new CpuPressureAttributor(
                                 cgroupMonitor,
                                 configuration.cgroup().attributionMinimumScore(),
                                 configuration.cgroup().attributionDominanceRatio(),
-                                configuration.cgroup().attributionRefreshInterval()
-                                        .plus(sampleFreshness)),
+                                maximumObservationGap,
+                                configuration.cgroup().attributionConfidence()),
                         new IoPressureAttributor(
                                 cgroupMonitor,
                                 configuration.cgroup().attributionMinimumScore(),
                                 configuration.cgroup().attributionDominanceRatio(),
-                                configuration.cgroup().attributionRefreshInterval()
-                                        .plus(sampleFreshness)),
+                                maximumObservationGap),
                         sampleFreshness,
                         configuration.cgroup().attributionRefreshInterval());
         AsyncStatePublisher publisher =
@@ -110,7 +113,7 @@ public final class BullseyeApplication {
 
         return new BullseyeRuntime(
                 List.of(
-                        new LinuxHostMetricCollector(new NioProcFileSource(), clock),
+                        new LinuxHostMetricCollector(new NioProcFileSource(), clock, logger),
                         new LinuxPsiMetricCollector(new NioProcFileSource(), clock, logger)),
                 new HostMetricNormalizer(),
                 window,
