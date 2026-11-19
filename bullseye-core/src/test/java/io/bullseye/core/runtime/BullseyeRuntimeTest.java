@@ -38,6 +38,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -170,15 +171,76 @@ class BullseyeRuntimeTest {
         }
     }
 
+    @Test
+    void commitsSamplesOnlyAfterAllCollectorsFinishTheRound() throws Exception {
+        MetricSample previousMemory = new MetricSample(MetricType.HOST_MEMORY_USAGE, 40, 1_000);
+        MetricSample nextMemory = new MetricSample(MetricType.HOST_MEMORY_USAGE, 50, 2_000);
+        MetricSample previousPsi = new MetricSample(MetricType.HOST_CPU_PSI_SOME_AVG10, 1, 1_000);
+        MetricSample nextPsi = new MetricSample(MetricType.HOST_CPU_PSI_SOME_AVG10, 2, 2_000);
+        CountDownLatch psiCollecting = new CountDownLatch(1);
+        CountDownLatch finishPsi = new CountDownLatch(1);
+        MetricCollector memoryCollector = new MetricCollector() {
+            @Override
+            public String name() {
+                return "memory-test";
+            }
+
+            @Override
+            public Collection<MetricSample> collect() {
+                return List.of(nextMemory);
+            }
+        };
+        MetricCollector psiCollector = new MetricCollector() {
+            @Override
+            public String name() {
+                return "psi-test";
+            }
+
+            @Override
+            public Collection<MetricSample> collect() throws Exception {
+                psiCollecting.countDown();
+                if (!finishPsi.await(3, TimeUnit.SECONDS)) {
+                    throw new IOException("Timed out waiting to complete the collection round");
+                }
+                return List.of(nextPsi);
+            }
+        };
+
+        try (Harness harness = new Harness(memoryCollector, psiCollector)) {
+            harness.window.append(previousMemory);
+            harness.window.append(previousPsi);
+            harness.collector.observe(2_000, 25);
+            harness.runtime.start();
+            try {
+                assertTrue(psiCollecting.await(3, TimeUnit.SECONDS));
+                assertEquals(List.of(previousMemory), harness.window.get(previousMemory.type()));
+                assertEquals(List.of(previousPsi), harness.window.get(previousPsi.type()));
+            } finally {
+                finishPsi.countDown();
+            }
+
+            DiagnosticSnapshot published = harness.awaitObserved(2_000, 25);
+            assertEquals(nextMemory, harness.window.get(nextMemory.type()).getLast());
+            assertEquals(nextPsi, harness.window.get(nextPsi.type()).getLast());
+            assertTrue(published.observations().get(ResourceType.HOST_CPU).metrics().stream()
+                    .anyMatch(metric -> metric.metric().equals(nextPsi.type().name())
+                            && metric.value() == nextPsi.value()));
+            assertTrue(harness.errors().isEmpty());
+        }
+    }
+
     private static final class Harness implements AutoCloseable {
 
         private static final Duration FRESHNESS = Duration.ofSeconds(2);
         private static final Duration INTERVAL = Duration.ofMillis(20);
+        private static final Duration WINDOW_DURATION = Duration.ofMinutes(1);
         private final MutableClock clock = new MutableClock();
         private final ControlledCollector collector = new ControlledCollector(clock);
         private final BlockingQueue<DiagnosticSnapshot> published = new LinkedBlockingQueue<>();
         private final ByteArrayOutputStream output = new ByteArrayOutputStream();
         private final ByteArrayOutputStream errors = new ByteArrayOutputStream();
+        private final InMemoryRollingMetricWindow window =
+                new InMemoryRollingMetricWindow(WINDOW_DURATION, INTERVAL);
         private final BullseyeRuntime runtime;
 
         private Harness(MetricCollector... precedingCollectors) {
@@ -186,9 +248,6 @@ class BullseyeRuntimeTest {
                     new BullseyeLogger(
                             new PrintStream(output, true, StandardCharsets.UTF_8),
                             new PrintStream(errors, true, StandardCharsets.UTF_8));
-            Duration windowDuration = Duration.ofMinutes(1);
-            InMemoryRollingMetricWindow window =
-                    new InMemoryRollingMetricWindow(windowDuration, INTERVAL);
             InMemoryDiagnosticStateRepository repository =
                     new InMemoryDiagnosticStateRepository(
                             DiagnosticSnapshot.initial("test-host", "runtime-test", 0));
@@ -226,7 +285,7 @@ class BullseyeRuntimeTest {
                             logger,
                             clock,
                             INTERVAL,
-                            windowDuration);
+                            WINDOW_DURATION);
         }
 
         private DiagnosticSnapshot awaitObserved(long timestamp, double usage) throws Exception {

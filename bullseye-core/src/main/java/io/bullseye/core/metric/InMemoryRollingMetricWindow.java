@@ -5,7 +5,7 @@ import io.bullseye.common.metric.MetricType;
 
 import java.time.Duration;
 import java.util.ArrayDeque;
-import java.util.ArrayList;
+import java.util.Collection;
 import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
@@ -30,14 +30,36 @@ public final class InMemoryRollingMetricWindow implements MetricWindow {
     @Override
     public synchronized void append(MetricSample sample) {
         Objects.requireNonNull(sample, "sample");
+        requireTimestampOrder(sample, latestTimestamp(sample.type()));
+        appendOrdered(sample);
+    }
+
+    @Override
+    public synchronized void appendAll(Collection<MetricSample> incoming) {
+        List<MetricSample> batch = List.copyOf(incoming);
+        Map<MetricType, Long> batchTimestamps = new EnumMap<>(MetricType.class);
+        for (MetricSample sample : batch) {
+            Long previous = batchTimestamps.put(sample.type(), sample.timestamp());
+            long previousTimestamp = previous == null ? latestTimestamp(sample.type()) : previous;
+            requireTimestampOrder(sample, previousTimestamp);
+        }
+        batch.forEach(this::appendOrdered);
+    }
+
+    private long latestTimestamp(MetricType type) {
+        ArrayDeque<MetricSample> metricSamples = samples.get(type);
+        return metricSamples == null ? -1 : metricSamples.getLast().timestamp();
+    }
+
+    private static void requireTimestampOrder(MetricSample sample, long previousTimestamp) {
+        if (sample.timestamp() < previousTimestamp) {
+            throw new IllegalArgumentException("Metric samples must be appended in timestamp order");
+        }
+    }
+
+    private void appendOrdered(MetricSample sample) {
         ArrayDeque<MetricSample> metricSamples =
                 samples.computeIfAbsent(sample.type(), ignored -> new ArrayDeque<>());
-        MetricSample latest = metricSamples.peekLast();
-        if (latest != null && sample.timestamp() < latest.timestamp()) {
-            throw new IllegalArgumentException(
-                    "Metric samples must be appended in timestamp order");
-        }
-
         metricSamples.addLast(sample);
         long cutoff = sample.timestamp() - windowMillis;
         while (!metricSamples.isEmpty() && metricSamples.peekFirst().timestamp() < cutoff) {
@@ -56,23 +78,13 @@ public final class InMemoryRollingMetricWindow implements MetricWindow {
     }
 
     @Override
-    public synchronized List<MetricSample> get(MetricType type, long from, long to) {
-        Objects.requireNonNull(type, "type");
-        if (from > to) {
-            throw new IllegalArgumentException("from must not be greater than to");
-        }
-        ArrayDeque<MetricSample> metricSamples = samples.get(type);
-        if (metricSamples == null) {
-            return List.of();
-        }
-
-        List<MetricSample> result = new ArrayList<>();
-        for (MetricSample sample : metricSamples) {
-            if (sample.timestamp() >= from && sample.timestamp() <= to) {
-                result.add(sample);
-            }
-        }
-        return List.copyOf(result);
+    public synchronized MetricView snapshot(long evaluatedAt) {
+        Map<MetricType, List<MetricSample>> captured = new EnumMap<>(MetricType.class);
+        samples.forEach((type, values) -> captured.put(type, values.stream()
+                .takeWhile(sample -> sample.timestamp() <= evaluatedAt)
+                .toList()));
+        Map<MetricType, List<MetricSample>> snapshot = Map.copyOf(captured);
+        return type -> snapshot.getOrDefault(Objects.requireNonNull(type, "type"), List.of());
     }
 
     private static void requirePositive(Duration duration, String name) {

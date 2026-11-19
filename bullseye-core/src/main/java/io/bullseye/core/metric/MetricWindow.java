@@ -1,15 +1,16 @@
 package io.bullseye.core.metric;
 
 import io.bullseye.common.metric.MetricSample;
-import io.bullseye.common.metric.MetricType;
 
-import java.util.List;
+import java.util.Collection;
 
-public interface MetricWindow {
+public interface MetricWindow extends MetricView {
 
     void append(MetricSample sample);
 
-    List<MetricSample> get(MetricType type);
+    /** Appends one collection cycle atomically. Invalid samples leave the window unchanged. */
+    void appendAll(Collection<MetricSample> samples);
 
-    List<MetricSample> get(MetricType type, long from, long to);
+    /** Captures the retained samples through the given timestamp, inclusive. */
+    MetricView snapshot(long evaluatedAt);
 }
