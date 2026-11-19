@@ -220,8 +220,10 @@ has arrived. Before the first evaluation, `resources` is empty. The first evalua
 configured resource entries; materializing unchanged NORMAL entries does not advance the version
 or announce a recovery. Recovery clears attribution only for the recovered resource.
 
-`evaluatedAt` records the latest completed evaluation. `observations` contains current telemetry
-for each configured resource. Top-level `evidence` remains the basis of the diagnostic decision;
+`evaluatedAt` is the time at which the latest completed evaluation captured its inputs.
+Each collection round adds its successful samples to the rolling window together. Diagnostics,
+host inputs for attribution, and `observations` all use the same fixed view of samples at or
+before `evaluatedAt`. Top-level `evidence` remains the basis of the diagnostic decision;
 it can refer to an earlier decision while hysteresis retains that diagnosis. Use
 `observations.metrics` for current values. Expired values are omitted from these metric lists.
 

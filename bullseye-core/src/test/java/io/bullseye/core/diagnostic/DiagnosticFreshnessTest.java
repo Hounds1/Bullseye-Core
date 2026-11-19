@@ -17,8 +17,11 @@ import io.bullseye.core.diagnostic.rule.IoPressureRule;
 import io.bullseye.core.diagnostic.rule.MemoryPressureRule;
 import io.bullseye.core.metric.InMemoryRollingMetricWindow;
 import io.bullseye.core.state.InMemoryDiagnosticStateRepository;
+import io.bullseye.core.state.publish.DiagnosticSnapshotJsonEncoder;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
 import java.util.List;
@@ -71,6 +74,52 @@ class DiagnosticFreshnessTest {
         assertEquals(97, current.evidence().getFirst().value());
         assertEquals(10_000, current.evaluatedAt());
         assertEquals(1, events.get());
+    }
+
+    @ParameterizedTest
+    @ValueSource(longs = {5_000, 10_000})
+    void keepsObservationsAndDiagnosisConsistentWhenCollectionAdvancesDuringEvaluation(
+            long nextSampleAt) {
+        CpuPressureRule cpuRule = cpuRule();
+        DiagnosticRule interleavedCollection = new DiagnosticRule() {
+            @Override
+            public ResourceType resource() {
+                return cpuRule.resource();
+            }
+
+            @Override
+            public Optional<DiagnosticDecision> evaluate(DiagnosticContext context) {
+                Optional<DiagnosticDecision> decision = cpuRule.evaluate(context);
+                if (context.evaluatedAt() == 5_000) {
+                    append(MetricType.HOST_CPU_USAGE, 20, nextSampleAt);
+                }
+                return decision;
+            }
+        };
+        DiagnosticCoordinator coordinator = coordinator(List.of(interleavedCollection));
+        append(MetricType.HOST_CPU_USAGE, 95, 0);
+        append(MetricType.HOST_CPU_USAGE, 96, 5_000);
+
+        DiagnosticSnapshot current = coordinator.evaluate(5_000).orElseThrow().current();
+
+        assertEquals(Severity.CRITICAL, current.severity());
+        assertEquals(96, current.evidence().getFirst().value());
+        assertEquals(ObservationStatus.FRESH, current.observationStatus());
+        var observation = current.observations().get(ResourceType.HOST_CPU);
+        assertEquals(5_000L, observation.lastSampleAt());
+        assertEquals(96, observation.metrics().getFirst().value());
+        String json = new DiagnosticSnapshotJsonEncoder().encode(current);
+        assertTrue(json.contains("\"evaluatedAt\": 5000"));
+        assertTrue(json.contains("\"observationStatus\": \"FRESH\""));
+        assertTrue(json.contains("\"lastSampleAt\": 5000"));
+        assertTrue(json.contains("\"metric\": \"HOST_CPU_USAGE\", \"value\": 96.0"));
+
+        coordinator.evaluate(10_000);
+
+        var nextObservation = repository.current().observations().get(ResourceType.HOST_CPU);
+        assertEquals(ObservationStatus.FRESH, nextObservation.status());
+        assertEquals(nextSampleAt, nextObservation.lastSampleAt());
+        assertEquals(20, nextObservation.metrics().getFirst().value());
     }
 
     @Test

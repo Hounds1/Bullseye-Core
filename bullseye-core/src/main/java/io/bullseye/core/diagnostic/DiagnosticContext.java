@@ -2,14 +2,14 @@ package io.bullseye.core.diagnostic;
 
 import io.bullseye.common.diagnostic.DiagnosticSnapshot;
 import io.bullseye.common.diagnostic.ResourceType;
-import io.bullseye.core.metric.MetricWindow;
+import io.bullseye.core.metric.MetricView;
 
 import java.util.EnumMap;
 import java.util.Map;
 import java.util.Objects;
 
 public record DiagnosticContext(
-        MetricWindow metrics,
+        MetricView metrics,
         DiagnosticSnapshot currentState,
         Map<ResourceType, DiagnosticDecision> resourceStates,
         long evaluatedAt) {
@@ -24,7 +24,7 @@ public record DiagnosticContext(
     }
 
     public DiagnosticContext(
-            MetricWindow metrics, DiagnosticSnapshot currentState, long evaluatedAt) {
+            MetricView metrics, DiagnosticSnapshot currentState, long evaluatedAt) {
         this(metrics, currentState, initialStates(currentState), evaluatedAt);
     }
 

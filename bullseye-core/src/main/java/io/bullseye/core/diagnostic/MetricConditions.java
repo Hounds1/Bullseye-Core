@@ -3,7 +3,7 @@ package io.bullseye.core.diagnostic;
 import io.bullseye.common.diagnostic.DiagnosticEvidence;
 import io.bullseye.common.metric.MetricSample;
 import io.bullseye.common.metric.MetricType;
-import io.bullseye.core.metric.MetricWindow;
+import io.bullseye.core.metric.MetricView;
 
 import java.math.BigDecimal;
 import java.time.Duration;
@@ -17,7 +17,7 @@ public final class MetricConditions {
     private MetricConditions() {}
 
     public static Optional<MetricSample> latest(
-            MetricWindow window, MetricType type, long now, Duration maximumAge) {
+            MetricView window, MetricType type, long now, Duration maximumAge) {
         List<MetricSample> samples = window.get(type);
         if (samples.isEmpty()) {
             return Optional.empty();
@@ -27,13 +27,13 @@ public final class MetricConditions {
     }
 
     public static boolean hasExpired(
-            MetricWindow window, MetricType type, long now, Duration maximumAge) {
+            MetricView window, MetricType type, long now, Duration maximumAge) {
         List<MetricSample> samples = window.get(type);
         return !samples.isEmpty() && !isFresh(samples.getLast(), now, maximumAge);
     }
 
     public static boolean sustained(
-            MetricWindow window,
+            MetricView window,
             MetricType type,
             long now,
             Duration duration,
@@ -43,7 +43,7 @@ public final class MetricConditions {
     }
 
     public static List<MetricSample> sustainedRun(
-            MetricWindow window,
+            MetricView window,
             MetricType type,
             long now,
             Duration duration,
@@ -77,7 +77,7 @@ public final class MetricConditions {
     }
 
     public static List<MetricSample> recentRun(
-            MetricWindow window,
+            MetricView window,
             MetricType type,
             long now,
             Duration duration,

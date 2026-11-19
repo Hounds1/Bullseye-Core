@@ -6,18 +6,18 @@ import io.bullseye.core.linux.cgroup.CgroupMonitor;
 import io.bullseye.core.logging.BullseyeLogger;
 import io.bullseye.core.metric.MetricCollector;
 import io.bullseye.core.metric.MetricNormalizer;
+import io.bullseye.core.metric.MetricView;
 import io.bullseye.core.metric.MetricWindow;
 import io.bullseye.core.state.DiagnosticStateRepository;
 import io.bullseye.core.state.publish.AsyncStatePublisher;
 
 import java.time.Clock;
 import java.time.Duration;
-import java.util.Collection;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class BullseyeRuntime implements AutoCloseable {
 
     private static final Duration SHUTDOWN_TIMEOUT = Duration.ofSeconds(10);
+    private static final String METRIC_WINDOW_COMPONENT = "metric-window";
 
     private final List<MetricCollector> collectors;
     private final MetricNormalizer normalizer;
@@ -132,14 +133,23 @@ public final class BullseyeRuntime implements AutoCloseable {
     }
 
     private void collectSafely() {
+        List<MetricSample> batch = new ArrayList<>();
         for (MetricCollector collector : collectors) {
             String component = "collector-" + collector.name();
             try {
-                Collection<MetricSample> normalized = normalizer.normalize(collector.collect());
-                normalized.forEach(metricWindow::append);
+                List<MetricSample> normalized = List.copyOf(normalizer.normalize(collector.collect()));
+                batch.addAll(normalized);
                 logger.componentRestored(component);
             } catch (Exception failure) {
                 logger.componentInterrupted(component, failure);
+            }
+        }
+        if (!batch.isEmpty()) {
+            try {
+                metricWindow.appendAll(batch);
+                logger.componentRestored(METRIC_WINDOW_COMPONENT);
+            } catch (RuntimeException failure) {
+                logger.componentInterrupted(METRIC_WINDOW_COMPONENT, failure);
             }
         }
         requestDiagnostics();
@@ -150,15 +160,18 @@ public final class BullseyeRuntime implements AutoCloseable {
             return;
         }
         try {
+            // Capture the committed inputs before this thread starts the next collection round.
+            long evaluatedAt = clock.millis();
+            MetricView inputs = metricWindow.snapshot(evaluatedAt);
             diagnosticExecutor.execute(
                     () -> {
                         try {
-                            diagnoseSafely();
+                            diagnoseSafely(evaluatedAt, inputs);
                         } finally {
                             diagnosticPending.set(false);
                         }
                     });
-        } catch (RejectedExecutionException failure) {
+        } catch (RuntimeException failure) {
             diagnosticPending.set(false);
             if (running.get()) {
                 logger.interrupted("Diagnostic evaluation interrupted.", failure);
@@ -166,10 +179,10 @@ public final class BullseyeRuntime implements AutoCloseable {
         }
     }
 
-    private void diagnoseSafely() {
+    private void diagnoseSafely(long evaluatedAt, MetricView inputs) {
         try {
             diagnosticCoordinator
-                    .evaluate(clock.millis())
+                    .evaluate(evaluatedAt, inputs)
                     .ifPresent(logger::transition);
             publisher.publish(stateRepository.current());
         } catch (Exception failure) {

@@ -12,6 +12,7 @@ import io.bullseye.common.diagnostic.Severity;
 import io.bullseye.common.metric.MetricSample;
 import io.bullseye.common.metric.MetricType;
 import io.bullseye.common.workload.WorkloadAttribution;
+import io.bullseye.core.metric.MetricView;
 import io.bullseye.core.metric.MetricWindow;
 import io.bullseye.core.state.DiagnosticStateRepository;
 
@@ -166,6 +167,10 @@ public final class DiagnosticCoordinator {
     }
 
     public synchronized Optional<DiagnosticTransition> evaluate(long evaluatedAt) {
+        return evaluate(evaluatedAt, metricWindow.snapshot(evaluatedAt));
+    }
+
+    public synchronized Optional<DiagnosticTransition> evaluate(long evaluatedAt, MetricView inputs) {
         DiagnosticSnapshot previous = stateRepository.current();
         if (evaluatedAt < previous.evaluatedAt()) {
             throw new IllegalArgumentException("evaluation time must not move backwards");
@@ -176,7 +181,7 @@ public final class DiagnosticCoordinator {
         DiagnosticEngine.Evaluation evaluation =
                 engine.evaluate(
                         new DiagnosticContext(
-                                metricWindow, previous, Map.copyOf(resourceStates), evaluatedAt));
+                                inputs, previous, Map.copyOf(resourceStates), evaluatedAt));
         DiagnosticDecision currentMemory = memoryState(evaluation.resourceStates());
         DiagnosticDecision currentCpu = cpuState(evaluation.resourceStates());
         DiagnosticDecision currentIo = ioState(evaluation.resourceStates());
@@ -188,16 +193,16 @@ public final class DiagnosticCoordinator {
                 primary.severity() == Severity.NORMAL ? ResourceType.UNKNOWN : primary.resource();
         ResourceState snapshotState =
                 primary.severity() == Severity.NORMAL ? ResourceState.NORMAL : primary.state();
-        updateMemoryAttribution(previousMemory, currentMemory, evaluatedAt);
-        updateCpuAttribution(previousCpu, currentCpu, evaluatedAt);
-        updateIoAttribution(previousIo, currentIo, evaluatedAt);
+        updateMemoryAttribution(previousMemory, currentMemory, inputs, evaluatedAt);
+        updateCpuAttribution(previousCpu, currentCpu, inputs, evaluatedAt);
+        updateIoAttribution(previousIo, currentIo, inputs, evaluatedAt);
         WorkloadAttribution attribution = attributionFor(snapshotResource);
         boolean primaryChanged =
                 !sameState(previous, primary, snapshotResource, snapshotState, attribution);
         Map<ResourceType, ResourceDiagnosis> resources = resourceDiagnoses(previous, evaluatedAt);
         List<ResourceType> changedResources = changedResources(previous, resources);
         boolean changed = primaryChanged || !changedResources.isEmpty();
-        Map<ResourceType, Observation> observations = observations(evaluatedAt);
+        Map<ResourceType, Observation> observations = observations(inputs, evaluatedAt);
 
         DiagnosticSnapshot current =
                 new DiagnosticSnapshot(
@@ -287,15 +292,15 @@ public final class DiagnosticCoordinator {
         return List.copyOf(changed);
     }
 
-    private Map<ResourceType, Observation> observations(long now) {
+    private Map<ResourceType, Observation> observations(MetricView inputs, long now) {
         EnumMap<ResourceType, Observation> result = new EnumMap<>(ResourceType.class);
         for (ResourceType resource : engine.resources()) {
-            result.put(resource, observe(resource, now));
+            result.put(resource, observe(resource, inputs, now));
         }
         return result;
     }
 
-    private Observation observe(ResourceType resource, long now) {
+    private Observation observe(ResourceType resource, MetricView inputs, long now) {
         List<MetricType> required = requiredMetrics(resource);
         List<MetricType> optional = optionalMetrics(resource);
         List<DiagnosticEvidence> metrics = new ArrayList<>();
@@ -306,7 +311,7 @@ public final class DiagnosticCoordinator {
             if (!required.contains(type) && !optional.contains(type)) {
                 continue;
             }
-            List<MetricSample> samples = metricWindow.get(type);
+            List<MetricSample> samples = inputs.get(type);
             if (samples.isEmpty()) {
                 missing |= required.contains(type);
                 continue;
@@ -374,6 +379,7 @@ public final class DiagnosticCoordinator {
     private void updateMemoryAttribution(
             DiagnosticDecision previousMemory,
             DiagnosticDecision currentMemory,
+            MetricView inputs,
             long evaluatedAt) {
         if (memoryAttributor == null
                 || currentMemory.severity().ordinal() < Severity.HIGH.ordinal()) {
@@ -387,17 +393,17 @@ public final class DiagnosticCoordinator {
         }
 
         Optional<MetricSample> usage = MetricConditions.latest(
-                metricWindow, MetricType.HOST_MEMORY_USAGE, evaluatedAt, maximumSampleAge);
+                inputs, MetricType.HOST_MEMORY_USAGE, evaluatedAt, maximumSampleAge);
         boolean fresh =
                 usage.isPresent()
                         && MetricConditions.latest(
-                                        metricWindow,
+                                        inputs,
                                         MetricType.HOST_MEMORY_PSI_SOME_AVG10,
                                         evaluatedAt,
                                         maximumSampleAge)
                                 .isPresent()
                         && !MetricConditions.hasExpired(
-                                metricWindow,
+                                inputs,
                                 MetricType.HOST_MEMORY_PSI_FULL_AVG10,
                                 evaluatedAt,
                                 maximumSampleAge);
@@ -410,7 +416,7 @@ public final class DiagnosticCoordinator {
         }
 
         long inputAt = usage.orElseThrow().timestamp();
-        long hostMemoryTotal = latestHostMemoryTotal(evaluatedAt);
+        long hostMemoryTotal = latestHostMemoryTotal(inputs, evaluatedAt);
         boolean inputGap = lastMemoryInputAt != null
                 && inputAt - lastMemoryInputAt > maximumSampleAge.toMillis();
         boolean capacityChanged = previousHostMemoryTotal > 0
@@ -440,6 +446,7 @@ public final class DiagnosticCoordinator {
     private void updateCpuAttribution(
             DiagnosticDecision previousCpu,
             DiagnosticDecision currentCpu,
+            MetricView inputs,
             long evaluatedAt) {
         if (cpuAttributor == null || currentCpu.severity().ordinal() < Severity.HIGH.ordinal()) {
             if (cpuAttributor != null
@@ -451,12 +458,12 @@ public final class DiagnosticCoordinator {
         }
 
         Optional<MetricSample> usage = MetricConditions.latest(
-                metricWindow, MetricType.HOST_CPU_USAGE, evaluatedAt, maximumSampleAge);
-        int hostCpuCount = latestHostCpuCount(evaluatedAt);
+                inputs, MetricType.HOST_CPU_USAGE, evaluatedAt, maximumSampleAge);
+        int hostCpuCount = latestHostCpuCount(inputs, evaluatedAt);
         if (usage.isEmpty()
                 || hostCpuCount == 0
                 || MetricConditions.hasExpired(
-                        metricWindow,
+                        inputs,
                         MetricType.HOST_CPU_PSI_SOME_AVG10,
                         evaluatedAt,
                         maximumSampleAge)) {
@@ -498,6 +505,7 @@ public final class DiagnosticCoordinator {
     private void updateIoAttribution(
             DiagnosticDecision previousIo,
             DiagnosticDecision currentIo,
+            MetricView inputs,
             long evaluatedAt) {
         if (ioAttributor == null || currentIo.severity().ordinal() < Severity.HIGH.ordinal()) {
             if (ioAttributor != null
@@ -509,10 +517,10 @@ public final class DiagnosticCoordinator {
         }
 
         Optional<MetricSample> pressure = MetricConditions.latest(
-                metricWindow, MetricType.HOST_IO_PSI_SOME_AVG10, evaluatedAt, maximumSampleAge);
+                inputs, MetricType.HOST_IO_PSI_SOME_AVG10, evaluatedAt, maximumSampleAge);
         if (pressure.isEmpty()
                 || MetricConditions.hasExpired(
-                        metricWindow,
+                        inputs,
                         MetricType.HOST_IO_PSI_FULL_AVG10,
                         evaluatedAt,
                         maximumSampleAge)) {
@@ -579,9 +587,9 @@ public final class DiagnosticCoordinator {
                 attribution.collectedAt());
     }
 
-    private int latestHostCpuCount(long evaluatedAt) {
+    private int latestHostCpuCount(MetricView inputs, long evaluatedAt) {
         return MetricConditions.latest(
-                        metricWindow,
+                        inputs,
                         MetricType.HOST_CPU_LOGICAL_COUNT,
                         evaluatedAt,
                         maximumSampleAge)
@@ -592,9 +600,9 @@ public final class DiagnosticCoordinator {
                 .orElse(0);
     }
 
-    private long latestHostMemoryTotal(long evaluatedAt) {
+    private long latestHostMemoryTotal(MetricView inputs, long evaluatedAt) {
         return MetricConditions.latest(
-                        metricWindow,
+                        inputs,
                         MetricType.HOST_MEMORY_TOTAL_BYTES,
                         evaluatedAt,
                         maximumSampleAge)
