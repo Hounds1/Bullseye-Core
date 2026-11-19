@@ -564,3 +564,7 @@ Before release, run the agent on a disposable Linux VM or server and verify CPU,
 stress transitions, cgroup attribution, recovery, SIGTERM shutdown, and idle/stress overhead. Do
 not run stress tools on production hosts. Docker Desktop smoke results alone do not complete this
 check.
+
+## License
+
+Bullseye Core is licensed under the [MIT License](LICENSE).
