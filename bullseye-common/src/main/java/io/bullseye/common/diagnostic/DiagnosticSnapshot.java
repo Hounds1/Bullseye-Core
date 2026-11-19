@@ -19,7 +19,8 @@ public record DiagnosticSnapshot(
         long evaluatedAt,
         ObservationStatus observationStatus,
         Map<ResourceType, Observation> observations,
-        Map<ResourceType, ResourceDiagnosis> resources) {
+        Map<ResourceType, ResourceDiagnosis> resources,
+        long wallClockAt) {
 
     public enum ObservationStatus {
         INITIALIZING,
@@ -105,6 +106,37 @@ public record DiagnosticSnapshot(
             long version,
             long evaluatedAt,
             ObservationStatus observationStatus,
+            Map<ResourceType, Observation> observations,
+            Map<ResourceType, ResourceDiagnosis> resources) {
+        this(
+                host,
+                application,
+                severity,
+                resource,
+                state,
+                attribution,
+                evidence,
+                since,
+                version,
+                evaluatedAt,
+                observationStatus,
+                observations,
+                resources,
+                evaluatedAt);
+    }
+
+    public DiagnosticSnapshot(
+            String host,
+            String application,
+            Severity severity,
+            ResourceType resource,
+            ResourceState state,
+            WorkloadAttribution attribution,
+            List<DiagnosticEvidence> evidence,
+            long since,
+            long version,
+            long evaluatedAt,
+            ObservationStatus observationStatus,
             Map<ResourceType, Observation> observations) {
         this(
                 host,
@@ -168,6 +200,10 @@ public record DiagnosticSnapshot(
     }
 
     public static DiagnosticSnapshot initial(String host, String application, long now) {
+        return initial(host, application, now, now);
+    }
+
+    public static DiagnosticSnapshot initial(String host, String application, long now, long wallClockAt) {
         return new DiagnosticSnapshot(
                 host,
                 application,
@@ -177,7 +213,12 @@ public record DiagnosticSnapshot(
                 WorkloadAttribution.unresolved(),
                 List.of(),
                 now,
-                1);
+                1,
+                now,
+                ObservationStatus.INITIALIZING,
+                Map.of(),
+                Map.of(),
+                wallClockAt);
     }
 
     public ResourceDiagnosis diagnosis(ResourceType requestedResource) {

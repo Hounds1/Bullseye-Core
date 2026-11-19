@@ -171,6 +171,11 @@ public final class DiagnosticCoordinator {
     }
 
     public synchronized Optional<DiagnosticTransition> evaluate(long evaluatedAt, MetricView inputs) {
+        return evaluate(evaluatedAt, evaluatedAt, inputs);
+    }
+
+    public synchronized Optional<DiagnosticTransition> evaluate(
+            long evaluatedAt, long wallClockAt, MetricView inputs) {
         DiagnosticSnapshot previous = stateRepository.current();
         if (evaluatedAt < previous.evaluatedAt()) {
             throw new IllegalArgumentException("evaluation time must not move backwards");
@@ -218,7 +223,8 @@ public final class DiagnosticCoordinator {
                         evaluatedAt,
                         observationStatus(observations),
                         observations,
-                        resources);
+                        resources,
+                        wallClockAt);
         stateRepository.update(current);
         if (!changed) {
             return Optional.empty();

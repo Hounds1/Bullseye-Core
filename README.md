@@ -135,6 +135,7 @@ example below abbreviates the per-resource evidence and attribution fields for r
     {"metric": "psi.some.avg10", "value": 24.3, "unit": "%"}
   ],
   "evaluatedAt": 1788526810000,
+  "wallClockAt": 1788526810000,
   "observationStatus": "FRESH",
   "observations": {
     "HOST_CPU": {
@@ -221,6 +222,10 @@ configured resource entries; materializing unchanged NORMAL entries does not adv
 or announce a recovery. Recovery clears attribution only for the recovered resource.
 
 `evaluatedAt` is the time at which the latest completed evaluation captured its inputs.
+It advances with monotonic elapsed time from the UTC epoch timestamp sampled at process startup.
+`since`, `lastSampleAt`, and `attributionCollectedAt` use the same timeline. System clock
+corrections during the run leave pressure durations, freshness, and attribution intervals
+unaffected. A restart establishes a new timeline.
 Each collection round adds its successful samples to the rolling window together. Diagnostics,
 host inputs for attribution, and `observations` all use the same fixed view of samples at or
 before `evaluatedAt`. Top-level `evidence` remains the basis of the diagnostic decision;
@@ -261,9 +266,13 @@ expires, clearing its measurement baseline. A resumed sample can restore
 observation freshness immediately, but each applicable recovery condition still needs its full
 continuous observation period. Samples before a collection gap cannot complete that period.
 
-Consumers must also check the age of `evaluatedAt` against their heartbeat timeout (for example,
-a few sampling intervals). A stopped or blocked agent cannot rewrite its last `FRESH` file to
-`STALE`. The timestamp is an evaluation heartbeat, not a successful disk-write timestamp.
+`wallClockAt` is the system UTC epoch timestamp captured with the evaluation inputs, in
+milliseconds. It can move forward or backward when the system clock changes, and a publication
+retry preserves the captured value. Use it to place an evaluation on the system clock.
+A stopped or blocked agent leaves its last snapshot in place. Consumers polling the state file
+can use their own monotonic timeout (for example, a few sampling intervals) to detect when
+`evaluatedAt` stops advancing. Both timestamps describe the evaluation, independent of when
+the file write completes.
 
 The publisher retains only the newest pending snapshot, plus any write already in progress.
 Failed writes retry every second without requiring a new transition; newer snapshots replace

@@ -22,6 +22,7 @@ import io.bullseye.core.metric.InMemoryRollingMetricWindow;
 import io.bullseye.core.metric.MetricCollector;
 import io.bullseye.core.state.InMemoryDiagnosticStateRepository;
 import io.bullseye.core.state.publish.AsyncStatePublisher;
+import io.bullseye.core.state.publish.DiagnosticSnapshotJsonEncoder;
 
 import org.junit.jupiter.api.Test;
 
@@ -43,6 +44,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.LongConsumer;
 import java.util.function.Predicate;
 
 class BullseyeRuntimeTest {
@@ -136,6 +138,61 @@ class BullseyeRuntimeTest {
                     .filter(line -> line.contains(
                             "Telemetry component restored. component=collector-runtime-test"))
                     .count());
+        }
+    }
+
+    @Test
+    void wallClockAdjustmentsDoNotInterruptPublicationOrChangePressureDurations() throws Exception {
+        MutableClock wallClock = new MutableClock();
+        wallClock.now.set(120_000);
+        AtomicLong nanos = new AtomicLong();
+        Clock timeline = new MonotonicClock(wallClock, nanos::get);
+        ControlledCollector collector = new ControlledCollector(
+                timeline, wallClock, millis -> nanos.set(TimeUnit.MILLISECONDS.toNanos(millis)));
+
+        try (Harness harness = new Harness(collector)) {
+            collector.observe(1_000, 121_000, 20);
+            harness.runtime.start();
+            DiagnosticSnapshot normal = harness.awaitObserved(121_000, 20);
+            assertEquals(Severity.NORMAL, normal.severity());
+            assertEquals(121_000, normal.wallClockAt());
+
+            collector.observe(2_000, 62_000, 95);
+            DiagnosticSnapshot afterRollback = harness.awaitObserved(122_000, 95);
+            assertEquals(62_000, afterRollback.wallClockAt());
+            assertEquals(Severity.NORMAL, afterRollback.severity());
+            assertEquals(normal.since(), afterRollback.since());
+            assertEquals(normal.version(), afterRollback.version());
+            String json = new DiagnosticSnapshotJsonEncoder().encode(afterRollback);
+            assertTrue(json.contains("\"evaluatedAt\": 122000"));
+            assertTrue(json.contains("\"wallClockAt\": 62000"));
+
+            collector.observe(3_000, 63_000, 96);
+            DiagnosticSnapshot critical = harness.awaitObserved(123_000, 96);
+            assertEquals(Severity.CRITICAL, critical.severity());
+            assertEquals(123_000, critical.since());
+            assertEquals(63_000, critical.wallClockAt());
+            assertEquals(normal.version() + 1, critical.version());
+
+            collector.observe(4_000, 64_000, 20);
+            DiagnosticSnapshot recovering = harness.awaitObserved(124_000, 20);
+            assertEquals(Severity.CRITICAL, recovering.severity());
+            assertEquals(critical.since(), recovering.since());
+            assertEquals(critical.version(), recovering.version());
+
+            collector.observe(4_500, 124_500, 20);
+            DiagnosticSnapshot afterForwardAdjustment = harness.awaitObserved(124_500, 20);
+            assertEquals(124_500, afterForwardAdjustment.wallClockAt());
+            assertEquals(Severity.CRITICAL, afterForwardAdjustment.severity());
+            assertEquals(critical.since(), afterForwardAdjustment.since());
+            assertEquals(critical.version(), afterForwardAdjustment.version());
+
+            collector.observe(5_000, 125_000, 20);
+            DiagnosticSnapshot recovered = harness.awaitObserved(125_000, 20);
+            assertEquals(Severity.NORMAL, recovered.severity());
+            assertEquals(125_000, recovered.since());
+            assertEquals(critical.version() + 1, recovered.version());
+            assertTrue(harness.errors().isEmpty());
         }
     }
 
@@ -234,8 +291,7 @@ class BullseyeRuntimeTest {
         private static final Duration FRESHNESS = Duration.ofSeconds(2);
         private static final Duration INTERVAL = Duration.ofMillis(20);
         private static final Duration WINDOW_DURATION = Duration.ofMinutes(1);
-        private final MutableClock clock = new MutableClock();
-        private final ControlledCollector collector = new ControlledCollector(clock);
+        private final ControlledCollector collector;
         private final BlockingQueue<DiagnosticSnapshot> published = new LinkedBlockingQueue<>();
         private final ByteArrayOutputStream output = new ByteArrayOutputStream();
         private final ByteArrayOutputStream errors = new ByteArrayOutputStream();
@@ -244,13 +300,19 @@ class BullseyeRuntimeTest {
         private final BullseyeRuntime runtime;
 
         private Harness(MetricCollector... precedingCollectors) {
+            this(new ControlledCollector(new MutableClock()), precedingCollectors);
+        }
+
+        private Harness(ControlledCollector collector, MetricCollector... precedingCollectors) {
+            this.collector = collector;
             BullseyeLogger logger =
                     new BullseyeLogger(
                             new PrintStream(output, true, StandardCharsets.UTF_8),
                             new PrintStream(errors, true, StandardCharsets.UTF_8));
             InMemoryDiagnosticStateRepository repository =
                     new InMemoryDiagnosticStateRepository(
-                            DiagnosticSnapshot.initial("test-host", "runtime-test", 0));
+                            DiagnosticSnapshot.initial(
+                                    "test-host", "runtime-test", collector.clock.millis()));
             BullseyeConfiguration.CpuDiagnostics configuration =
                     new BullseyeConfiguration.CpuDiagnostics(
                             70,
@@ -283,9 +345,11 @@ class BullseyeRuntimeTest {
                             repository,
                             publisher,
                             logger,
-                            clock,
+                            collector.clock,
+                            collector.wallClock,
                             INTERVAL,
-                            WINDOW_DURATION);
+                            WINDOW_DURATION,
+                            null);
         }
 
         private DiagnosticSnapshot awaitObserved(long timestamp, double usage) throws Exception {
@@ -334,19 +398,31 @@ class BullseyeRuntimeTest {
 
     private static final class ControlledCollector implements MetricCollector {
 
-        private final MutableClock clock;
-        private final AtomicReference<Step> next = new AtomicReference<>(new Step(0, 0, false));
+        private final Clock clock;
+        private final MutableClock wallClock;
+        private final LongConsumer setElapsedMillis;
+        private final AtomicReference<Step> next = new AtomicReference<>(new Step(0, 0, 0, false));
 
         private ControlledCollector(MutableClock clock) {
+            this(clock, clock, millis -> {});
+        }
+
+        private ControlledCollector(Clock clock, MutableClock wallClock, LongConsumer setElapsedMillis) {
             this.clock = clock;
+            this.wallClock = wallClock;
+            this.setElapsedMillis = setElapsedMillis;
         }
 
         private void observe(long timestamp, double usage) {
-            next.set(new Step(timestamp, usage, false));
+            observe(timestamp, timestamp, usage);
+        }
+
+        private void observe(long elapsedMillis, long wallClockAt, double usage) {
+            next.set(new Step(elapsedMillis, wallClockAt, usage, false));
         }
 
         private void failAt(long timestamp) {
-            next.set(new Step(timestamp, 0, true));
+            next.set(new Step(timestamp, timestamp, 0, true));
         }
 
         @Override
@@ -357,15 +433,16 @@ class BullseyeRuntimeTest {
         @Override
         public Collection<MetricSample> collect() throws IOException {
             Step step = next.get();
-            clock.now.set(step.timestamp());
+            setElapsedMillis.accept(step.elapsedMillis());
+            wallClock.now.set(step.wallClockAt());
             if (step.failing()) {
                 throw new IOException("Simulated collection outage");
             }
             return List.of(
-                    new MetricSample(MetricType.HOST_CPU_USAGE, step.usage(), step.timestamp()));
+                    new MetricSample(MetricType.HOST_CPU_USAGE, step.usage(), clock.millis()));
         }
 
-        private record Step(long timestamp, double usage, boolean failing) {}
+        private record Step(long elapsedMillis, long wallClockAt, double usage, boolean failing) {}
     }
 
     private static final class MutableClock extends Clock {
