@@ -19,6 +19,7 @@ import io.bullseye.core.logging.BullseyeLogger;
 import io.bullseye.core.metric.HostMetricNormalizer;
 import io.bullseye.core.metric.InMemoryRollingMetricWindow;
 import io.bullseye.core.runtime.BullseyeRuntime;
+import io.bullseye.core.runtime.MonotonicClock;
 import io.bullseye.core.state.InMemoryDiagnosticStateRepository;
 import io.bullseye.core.state.publish.AsyncStatePublisher;
 import io.bullseye.core.state.publish.AtomicFileStatePublisher;
@@ -54,7 +55,8 @@ public final class BullseyeApplication {
 
     static BullseyeRuntime createRuntime(Path configurationPath, BullseyeLogger logger)
             throws Exception {
-        Clock clock = Clock.systemUTC();
+        Clock wallClock = Clock.systemUTC();
+        Clock timelineClock = new MonotonicClock(wallClock);
         BullseyeConfiguration configuration =
                 new PropertiesConfigurationLoader().load(configurationPath);
         InMemoryRollingMetricWindow window =
@@ -62,7 +64,10 @@ public final class BullseyeApplication {
                         configuration.windowDuration(), configuration.samplingInterval());
         DiagnosticSnapshot initialState =
                 DiagnosticSnapshot.initial(
-                        configuration.host(), configuration.application(), clock.millis());
+                        configuration.host(),
+                        configuration.application(),
+                        timelineClock.millis(),
+                        wallClock.millis());
         InMemoryDiagnosticStateRepository stateRepository =
                 new InMemoryDiagnosticStateRepository(initialState);
         Duration sampleFreshness = configuration.samplingInterval().multipliedBy(2);
@@ -70,7 +75,7 @@ public final class BullseyeApplication {
                 configuration.cgroup().attributionRefreshInterval().plus(sampleFreshness);
         CgroupMonitor cgroupMonitor =
                 new CgroupMonitor(
-                        configuration.cgroup(), CgroupMonitor.nioFileAccess(), clock, logger);
+                        configuration.cgroup(), CgroupMonitor.nioFileAccess(), timelineClock, logger);
         DiagnosticEngine engine =
                 new DiagnosticEngine(
                         List.of(
@@ -113,15 +118,16 @@ public final class BullseyeApplication {
 
         return new BullseyeRuntime(
                 List.of(
-                        new LinuxHostMetricCollector(new NioProcFileSource(), clock, logger),
-                        new LinuxPsiMetricCollector(new NioProcFileSource(), clock, logger)),
+                        new LinuxHostMetricCollector(new NioProcFileSource(), timelineClock, logger),
+                        new LinuxPsiMetricCollector(new NioProcFileSource(), timelineClock, logger)),
                 new HostMetricNormalizer(),
                 window,
                 coordinator,
                 stateRepository,
                 publisher,
                 logger,
-                clock,
+                timelineClock,
+                wallClock,
                 configuration.samplingInterval(),
                 configuration.windowDuration(),
                 cgroupMonitor);

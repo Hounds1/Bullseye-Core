@@ -34,7 +34,8 @@ public final class BullseyeRuntime implements AutoCloseable {
     private final DiagnosticStateRepository stateRepository;
     private final AsyncStatePublisher publisher;
     private final BullseyeLogger logger;
-    private final Clock clock;
+    private final Clock timelineClock;
+    private final Clock wallClock;
     private final Duration samplingInterval;
     private final Duration windowDuration;
     private final CgroupMonitor cgroupMonitor;
@@ -80,6 +81,34 @@ public final class BullseyeRuntime implements AutoCloseable {
             Duration samplingInterval,
             Duration windowDuration,
             CgroupMonitor cgroupMonitor) {
+        this(
+                collectors,
+                normalizer,
+                metricWindow,
+                diagnosticCoordinator,
+                stateRepository,
+                publisher,
+                logger,
+                clock,
+                clock,
+                samplingInterval,
+                windowDuration,
+                cgroupMonitor);
+    }
+
+    public BullseyeRuntime(
+            List<MetricCollector> collectors,
+            MetricNormalizer normalizer,
+            MetricWindow metricWindow,
+            DiagnosticCoordinator diagnosticCoordinator,
+            DiagnosticStateRepository stateRepository,
+            AsyncStatePublisher publisher,
+            BullseyeLogger logger,
+            Clock timelineClock,
+            Clock wallClock,
+            Duration samplingInterval,
+            Duration windowDuration,
+            CgroupMonitor cgroupMonitor) {
         this.collectors = List.copyOf(Objects.requireNonNull(collectors, "collectors"));
         this.normalizer = Objects.requireNonNull(normalizer, "normalizer");
         this.metricWindow = Objects.requireNonNull(metricWindow, "metricWindow");
@@ -88,7 +117,8 @@ public final class BullseyeRuntime implements AutoCloseable {
         this.stateRepository = Objects.requireNonNull(stateRepository, "stateRepository");
         this.publisher = Objects.requireNonNull(publisher, "publisher");
         this.logger = Objects.requireNonNull(logger, "logger");
-        this.clock = Objects.requireNonNull(clock, "clock");
+        this.timelineClock = Objects.requireNonNull(timelineClock, "timelineClock");
+        this.wallClock = Objects.requireNonNull(wallClock, "wallClock");
         this.samplingInterval = Objects.requireNonNull(samplingInterval, "samplingInterval");
         this.windowDuration = Objects.requireNonNull(windowDuration, "windowDuration");
         this.cgroupMonitor = cgroupMonitor;
@@ -161,12 +191,13 @@ public final class BullseyeRuntime implements AutoCloseable {
         }
         try {
             // Capture the committed inputs before this thread starts the next collection round.
-            long evaluatedAt = clock.millis();
+            long evaluatedAt = timelineClock.millis();
+            long wallClockAt = wallClock == timelineClock ? evaluatedAt : wallClock.millis();
             MetricView inputs = metricWindow.snapshot(evaluatedAt);
             diagnosticExecutor.execute(
                     () -> {
                         try {
-                            diagnoseSafely(evaluatedAt, inputs);
+                            diagnoseSafely(evaluatedAt, wallClockAt, inputs);
                         } finally {
                             diagnosticPending.set(false);
                         }
@@ -179,10 +210,10 @@ public final class BullseyeRuntime implements AutoCloseable {
         }
     }
 
-    private void diagnoseSafely(long evaluatedAt, MetricView inputs) {
+    private void diagnoseSafely(long evaluatedAt, long wallClockAt, MetricView inputs) {
         try {
             diagnosticCoordinator
-                    .evaluate(evaluatedAt, inputs)
+                    .evaluate(evaluatedAt, wallClockAt, inputs)
                     .ifPresent(logger::transition);
             publisher.publish(stateRepository.current());
         } catch (Exception failure) {
