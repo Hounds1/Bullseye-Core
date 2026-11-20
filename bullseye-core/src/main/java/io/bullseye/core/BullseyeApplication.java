@@ -24,6 +24,7 @@ import io.bullseye.core.state.InMemoryDiagnosticStateRepository;
 import io.bullseye.core.state.publish.AsyncStatePublisher;
 import io.bullseye.core.state.publish.AtomicFileStatePublisher;
 import io.bullseye.core.state.publish.DiagnosticSnapshotJsonEncoder;
+import io.bullseye.core.uog.ccc.CccClient;
 
 import java.nio.file.Path;
 import java.time.Clock;
@@ -59,6 +60,10 @@ public final class BullseyeApplication {
         Clock timelineClock = new MonotonicClock(wallClock);
         BullseyeConfiguration configuration =
                 new PropertiesConfigurationLoader().load(configurationPath);
+        BullseyeConfiguration.Ccc ccc = configuration.ccc();
+        CccClient cccClient = ccc.enabled()
+                ? new CccClient(ccc.host(), ccc.port(), ccc.nodeId(), logger)
+                : null;
         InMemoryRollingMetricWindow window =
                 new InMemoryRollingMetricWindow(
                         configuration.windowDuration(), configuration.samplingInterval());
@@ -130,7 +135,8 @@ public final class BullseyeApplication {
                 wallClock,
                 configuration.samplingInterval(),
                 configuration.windowDuration(),
-                cgroupMonitor);
+                cgroupMonitor,
+                cccClient);
     }
 
     private static boolean isLinux() {

@@ -13,7 +13,8 @@ public record BullseyeConfiguration(
         CpuDiagnostics cpuDiagnostics,
         MemoryDiagnostics memoryDiagnostics,
         IoDiagnostics ioDiagnostics,
-        Cgroup cgroup) {
+        Cgroup cgroup,
+        Ccc ccc) {
 
     public BullseyeConfiguration {
         requireText(host, "host");
@@ -25,6 +26,7 @@ public record BullseyeConfiguration(
         Objects.requireNonNull(memoryDiagnostics, "memoryDiagnostics");
         Objects.requireNonNull(ioDiagnostics, "ioDiagnostics");
         Objects.requireNonNull(cgroup, "cgroup");
+        Objects.requireNonNull(ccc, "ccc");
         if (windowDuration.compareTo(samplingInterval) < 0) {
             throw new IllegalArgumentException(
                     "windowDuration must not be shorter than samplingInterval");
@@ -53,6 +55,29 @@ public record BullseyeConfiguration(
                 ioDiagnostics.highDuration(),
                 ioDiagnostics.criticalDuration(),
                 ioDiagnostics.recoveryDuration());
+    }
+
+    public BullseyeConfiguration(
+            String host,
+            String application,
+            Duration samplingInterval,
+            Duration windowDuration,
+            Path stateOutput,
+            CpuDiagnostics cpuDiagnostics,
+            MemoryDiagnostics memoryDiagnostics,
+            IoDiagnostics ioDiagnostics,
+            Cgroup cgroup) {
+        this(
+                host,
+                application,
+                samplingInterval,
+                windowDuration,
+                stateOutput,
+                cpuDiagnostics,
+                memoryDiagnostics,
+                ioDiagnostics,
+                cgroup,
+                Ccc.disabled());
     }
 
     public BullseyeConfiguration(
@@ -336,6 +361,24 @@ public record BullseyeConfiguration(
         public static Cgroup defaults() {
             return new Cgroup(
                     true, Path.of("/sys/fs/cgroup"), Duration.ofSeconds(60), 8, 512, 5, 1.2);
+        }
+    }
+
+    public record Ccc(boolean enabled, String host, int port, String nodeId) {
+
+        public Ccc {
+            if (enabled) {
+                requireText(host, "bullseye.ccc.host");
+                requireText(nodeId, "bullseye.ccc.node-id");
+                if (port < 1 || port > 65_535) {
+                    throw new IllegalArgumentException(
+                            "bullseye.ccc.port must be between 1 and 65535");
+                }
+            }
+        }
+
+        public static Ccc disabled() {
+            return new Ccc(false, "", 0, "");
         }
     }
 

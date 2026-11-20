@@ -10,6 +10,7 @@ import io.bullseye.core.metric.MetricView;
 import io.bullseye.core.metric.MetricWindow;
 import io.bullseye.core.state.DiagnosticStateRepository;
 import io.bullseye.core.state.publish.AsyncStatePublisher;
+import io.bullseye.core.uog.ccc.CccClient;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -39,6 +40,7 @@ public final class BullseyeRuntime implements AutoCloseable {
     private final Duration samplingInterval;
     private final Duration windowDuration;
     private final CgroupMonitor cgroupMonitor;
+    private final CccClient cccClient;
     private final ScheduledExecutorService collectorExecutor;
     private final ExecutorService diagnosticExecutor;
     private final AtomicBoolean running = new AtomicBoolean();
@@ -109,6 +111,36 @@ public final class BullseyeRuntime implements AutoCloseable {
             Duration samplingInterval,
             Duration windowDuration,
             CgroupMonitor cgroupMonitor) {
+        this(
+                collectors,
+                normalizer,
+                metricWindow,
+                diagnosticCoordinator,
+                stateRepository,
+                publisher,
+                logger,
+                timelineClock,
+                wallClock,
+                samplingInterval,
+                windowDuration,
+                cgroupMonitor,
+                null);
+    }
+
+    public BullseyeRuntime(
+            List<MetricCollector> collectors,
+            MetricNormalizer normalizer,
+            MetricWindow metricWindow,
+            DiagnosticCoordinator diagnosticCoordinator,
+            DiagnosticStateRepository stateRepository,
+            AsyncStatePublisher publisher,
+            BullseyeLogger logger,
+            Clock timelineClock,
+            Clock wallClock,
+            Duration samplingInterval,
+            Duration windowDuration,
+            CgroupMonitor cgroupMonitor,
+            CccClient cccClient) {
         this.collectors = List.copyOf(Objects.requireNonNull(collectors, "collectors"));
         this.normalizer = Objects.requireNonNull(normalizer, "normalizer");
         this.metricWindow = Objects.requireNonNull(metricWindow, "metricWindow");
@@ -122,6 +154,7 @@ public final class BullseyeRuntime implements AutoCloseable {
         this.samplingInterval = Objects.requireNonNull(samplingInterval, "samplingInterval");
         this.windowDuration = Objects.requireNonNull(windowDuration, "windowDuration");
         this.cgroupMonitor = cgroupMonitor;
+        this.cccClient = cccClient;
         this.collectorExecutor =
                 Executors.newSingleThreadScheduledExecutor(
                         new NamedThreadFactory("bullseye-collector"));
@@ -145,6 +178,9 @@ public final class BullseyeRuntime implements AutoCloseable {
         if (cgroupMonitor != null) {
             cgroupMonitor.initialize();
         }
+        if (cccClient != null) {
+            cccClient.start();
+        }
     }
 
     @Override
@@ -154,6 +190,9 @@ public final class BullseyeRuntime implements AutoCloseable {
         }
 
         logger.status("Shutdown sequence initiated.");
+        if (cccClient != null) {
+            cccClient.close();
+        }
         collectorExecutor.shutdown();
         await(collectorExecutor);
         diagnosticExecutor.shutdown();

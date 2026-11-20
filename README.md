@@ -61,6 +61,21 @@ does not align with it. For example, a 30-second recovery duration with 5-second
 a window of at least 40 seconds; a 10-second window is rejected. The bundled production and
 Docker profiles already satisfy this requirement.
 
+### CCC connection
+
+Set the following properties to have Core join a UOG session. Local diagnostics
+and state publication run independently of the connection.
+
+```properties
+bullseye.ccc.enabled=true
+bullseye.ccc.host=uog.example.org
+bullseye.ccc.port=7443
+bullseye.ccc.node-id=edge-01
+```
+
+CCC connectivity is disabled by default. See the [CCC join protocol](docs/ccc-join-v1.md)
+for the frame format, TLS identity, admission, heartbeat, and retry behavior.
+
 ## Docker smoke test
 
 The Docker configuration uses a one-second sampling interval and deliberately sensitive CPU
