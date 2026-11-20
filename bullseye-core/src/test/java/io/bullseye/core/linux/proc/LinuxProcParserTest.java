@@ -9,6 +9,8 @@ import io.bullseye.common.metric.MetricType;
 import io.bullseye.core.logging.BullseyeLogger;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -65,6 +67,25 @@ class LinuxProcParserTest {
 
         assertEquals(75, MemInfoParser.parseUsagePercentage(memory));
         assertEquals(1_024_000, MemInfoParser.parseTotalBytes(memory));
+    }
+
+    @Test
+    void usesCompleteLegacyCountersWhenMemAvailableIsAbsent() {
+        String memory = """
+                MemTotal: 1000 kB
+                MemFree: 100 kB
+                Buffers: 20 kB
+                Cached: 80 kB
+                """;
+
+        assertEquals(80, MemInfoParser.parseUsagePercentage(memory));
+    }
+
+    @Test
+    void explicitZeroMemAvailableStillReportsFullUsage() {
+        String memory = "MemTotal: 1000 kB\nMemAvailable: 0 kB\n";
+
+        assertEquals(100, MemInfoParser.parseUsagePercentage(memory));
     }
 
     @Test
@@ -202,12 +223,24 @@ class LinuxProcParserTest {
 
     @Test
     void memoryReadFailureKeepsUpdatingCpuBaseline() throws Exception {
-        assertMemoryFailurePreservesCpu(true);
+        assertMemoryFailurePreservesCpu(path -> {
+            throw new IOException("Memory read failed");
+        });
     }
 
     @Test
     void memoryParseFailureKeepsUpdatingCpuBaseline() throws Exception {
-        assertMemoryFailurePreservesCpu(false);
+        assertMemoryFailurePreservesCpu(path -> "MemTotal: invalid kB\nMemAvailable: 250 kB\n");
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "MemTotal: 1000 kB\n",
+            "MemTotal: 1000 kB\nMemFree: 100 kB\nBuffers: 20 kB\n"
+    })
+    void incompleteMemoryCountersKeepUpdatingCpuWithoutPublishingMemory(String memory)
+            throws Exception {
+        assertMemoryFailurePreservesCpu(path -> memory);
     }
 
     @Test
@@ -331,7 +364,7 @@ class LinuxProcParserTest {
         assertTrue(comparable.stream().allMatch(sample -> sample.timestamp() == 5_000));
     }
 
-    private static void assertMemoryFailurePreservesCpu(boolean readFailure) throws Exception {
+    private static void assertMemoryFailurePreservesCpu(ProcFileSource failedMemory) throws Exception {
         AtomicReference<String> stat = new AtomicReference<>(cpuStat(100, 800));
         AtomicBoolean failed = new AtomicBoolean();
         ProcFileSource source = path -> {
@@ -339,10 +372,7 @@ class LinuxProcParserTest {
                 return stat.get();
             }
             if (failed.get()) {
-                if (readFailure) {
-                    throw new IOException("Memory read failed");
-                }
-                return "MemTotal: invalid kB\nMemAvailable: 250 kB\n";
+                return failedMemory.read(path);
             }
             return contentFor(path, 0);
         };

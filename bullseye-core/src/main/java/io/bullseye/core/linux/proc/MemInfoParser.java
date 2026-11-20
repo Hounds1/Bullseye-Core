@@ -10,12 +10,13 @@ public final class MemInfoParser {
     public static double parseUsagePercentage(String content) {
         Map<String, Long> values = parseValues(content);
         long total = required(values, "MemTotal");
+        Long reportedAvailable = values.get("MemAvailable");
         long available =
-                values.getOrDefault(
-                        "MemAvailable",
-                        values.getOrDefault("MemFree", 0L)
-                                + values.getOrDefault("Buffers", 0L)
-                                + values.getOrDefault("Cached", 0L));
+                reportedAvailable != null
+                        ? reportedAvailable
+                        : required(values, "MemFree")
+                                + required(values, "Buffers")
+                                + required(values, "Cached");
         if (total <= 0 || available < 0) {
             throw new IllegalArgumentException("Invalid memory counters");
         }
