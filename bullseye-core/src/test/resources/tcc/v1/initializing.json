@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "nodeId": "node-001",
+  "runId": "46e5fffd-6650-452d-8476-ac41e2453c2a",
+  "sequence": 1,
+  "snapshot": {
+    "host": "edge-01",
+    "application": "orders",
+    "severity": "NORMAL",
+    "resource": "UNKNOWN",
+    "state": "NORMAL",
+    "primaryWorkload": "UNKNOWN",
+    "workloadType": "UNKNOWN",
+    "cgroupPath": "/",
+    "attributionConfidence": "UNRESOLVED",
+    "attributionStatus": "NOT_ATTEMPTED",
+    "attributionScore": 0.0,
+    "attributionCollectedAt": null,
+    "attributionCoverage": null,
+    "attributionEvidence": [],
+    "evidence": [],
+    "evaluatedAt": 1000,
+    "wallClockAt": 1000,
+    "observationStatus": "INITIALIZING",
+    "observations": {},
+    "resources": {},
+    "since": 1000,
+    "version": 1
+  }
+}

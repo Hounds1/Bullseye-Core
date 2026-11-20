@@ -288,6 +288,32 @@ restores usage. Memory collection continues during CPU failures, and CPU collect
 during memory failures. Component interruption and restoration logs are emitted once per
 outage, separately for CPU, memory, and failures of an entire collector.
 
+### TCC snapshot format v1
+
+`TccSnapshotV1Encoder` serializes one Core diagnostic snapshot for TCC as JSON. The outbound
+wire encoding is UTF-8. The running Core publishes its local state using the file publisher
+described above.
+
+| Field | Meaning |
+| --- | --- |
+| `schemaVersion` | Integer `1`, identifying this record format. |
+| `nodeId` | Nonblank, stable identifier for the Core installation. The sender supplies the registered identity. |
+| `runId` | UUID assigned once per Core process start. |
+| `sequence` | Positive 64-bit signed integer that increases per new outbound record within a run. Gaps are valid. |
+| `snapshot` | Diagnostic object with the v1 fields from the state output above, including resource decisions, observations, workload names and cgroup paths, confidence, coverage, and evidence. |
+
+The sender uses the same `(nodeId, runId, sequence)` and JSON body when retrying a record.
+Order records by `sequence` within a run. The approved session identifies the active run across
+restarts. `snapshot.version` tracks diagnostic state changes independently of the outbound sequence,
+and `wallClockAt` is the observed UTC time, which can move backward. The timestamps
+`evaluatedAt`, `since`, `lastSampleAt`, and `attributionCollectedAt` use the Core run's
+diagnostic timeline.
+
+`INITIALIZING` and `STALE` are valid observation states. The resource and observation maps
+can be empty at startup or omit resources outside the configured set. Collection timestamps and
+attribution coverage can be `null` when unavailable. TCC decides whether to adopt a received
+record. Golden JSON fixtures in the Core tests pin the v1 payload for compatibility.
+
 ## Diagnostic policy
 
 - CPU keeps the usage-based hysteresis policy and uses PSI as corroborating evidence when present.
