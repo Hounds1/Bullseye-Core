@@ -38,7 +38,7 @@ per process and retains it across reconnects. Every attempt gets a new UUID
 
 | CCC reply | Required fields beyond the envelope | Optional fields |
 | --- | --- | --- |
-| `JOIN_ACCEPTED` | Echoed `requestId`, nonblank `sessionId`, positive signed 32-bit integer `heartbeatIntervalMs` | |
+| `JOIN_ACCEPTED` | Echoed `requestId`, nonblank `sessionId`, positive signed 32-bit integer `heartbeatIntervalMs` | `capabilities` (array of strings) |
 | `JOIN_REJECTED` | Echoed `requestId`, `reasonCode` | `retryAfterMs` |
 
 ## Approved session
@@ -46,7 +46,7 @@ per process and retains it across reconnects. Every attempt gets a new UUID
 - CCC sends `PING` frames at the specified heartbeat interval. Every `PING`
   includes a nonnegative signed 64-bit integer `sequence`. Core replies with
   `PONG` using the same sequence on the approved connection. Core disconnects
-  if it cannot read a complete session message within three heartbeat intervals.
+  if it cannot read a complete `PING` within three heartbeat intervals.
 - To end an approved session, CCC sends `SESSION_REVOKED` with a `reasonCode`
   and optional `retryAfterMs`, then closes the connection. Core closes on receipt.
 - Decision reason codes are 1–64 characters matching `[A-Z][A-Z0-9_]{0,63}`.
@@ -55,8 +55,62 @@ per process and retains it across reconnects. Every attempt gets a new UUID
   without this field stops retries until Core is restarted.
 - On an unexpected disconnect or transport failure, Core reconnects with
   backoff from 1 to 30 seconds. Each successful join resets the backoff. Core
-  uses a five-second timeout for TCP connect, TLS handshake reads, and the
-  complete join response.
+  uses five-second timeouts for TCP connect, TLS handshake reads, and reading
+  the join response.
 
-This protocol revision covers connection admission and liveness. The TCC
-diagnostic payload has its own `schemaVersion`.
+## Optional TCC snapshot delivery
+
+Core sends telemetry when `bullseye.tcc.enabled=true` and the approved session
+advertises the exact capability `tcc.snapshot.v1`. An accepted connection can
+advertise the capability as follows.
+
+```json
+{
+  "protocolVersion": 1,
+  "type": "JOIN_ACCEPTED",
+  "requestId": "e0a119f8-d44a-4ef0-9d3c-89eb836fcb54",
+  "sessionId": "session-001",
+  "heartbeatIntervalMs": 1000,
+  "capabilities": ["tcc.snapshot.v1"]
+}
+```
+
+Core sends a frame with `protocolVersion: 1`, `type: TCC_SNAPSHOT`, and
+`telemetry` containing the [TCC snapshot v1 object](../README.md#tcc-snapshot-format-v1).
+The v1 object carries its own `schemaVersion`. The receiver binds `nodeId` and
+`runId` to the approved Core on that connection and uses
+`(nodeId, runId, sequence)` to recognize a previously handled record.
+The full frame body is subject to the 65,536-byte frame limit.
+
+On the same connection, the receiver echoes the positive `sequence` of the
+record in a `TCC_ACK` frame.
+
+```json
+{
+  "protocolVersion": 1,
+  "type": "TCC_ACK",
+  "sequence": 1,
+  "status": "ACCEPTED"
+}
+```
+
+| Status | Core action |
+| --- | --- |
+| `ACCEPTED` | Complete delivery after the receiver adopts the record. |
+| `DUPLICATE` | Complete delivery for the already adopted record. |
+| `REJECTED` | Drop the rejected record and continue with the latest pending snapshot. |
+| `RETRYABLE` | Reconnect and retry the same record on the next eligible session. |
+
+Core keeps one in-flight snapshot and at most one newer pending snapshot in
+memory. New evaluations replace the pending snapshot. Core uses a five-second
+deadline from the start of a telemetry write through its acknowledgement.
+After a lost acknowledgement or interrupted connection, Core resends the same
+body and sequence on the next eligible session. A new Core process starts a
+new run. An oversized snapshot is dropped, which can leave a sequence gap.
+Durable transition history and archival acknowledgements use a separate contract.
+
+`PING`, `PONG`, and `SESSION_REVOKED` stay active during delivery. Only a
+`PING` refreshes the heartbeat deadline. The Core writer prioritizes pending
+heartbeat replies between frames. On session revocation, Core closes the
+transport and follows CCC's reconnect decision. Local diagnostic evaluation
+and file publication continue on their own execution paths.

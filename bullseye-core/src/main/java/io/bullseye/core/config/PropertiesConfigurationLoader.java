@@ -128,16 +128,17 @@ public final class PropertiesConfigurationLoader {
     }
 
     private static BullseyeConfiguration.Ccc loadCcc(Properties properties) {
-        return switch (text(properties, CCC_PREFIX + "enabled", "false").toLowerCase(Locale.ROOT)) {
-            case "false" -> BullseyeConfiguration.Ccc.disabled();
-            case "true" -> new BullseyeConfiguration.Ccc(
-                    true,
-                    text(properties, CCC_PREFIX + "host", ""),
-                    loadCccPort(properties),
-                    text(properties, CCC_PREFIX + "node-id", ""));
-            default -> throw new IllegalArgumentException(
-                    "bullseye.ccc.enabled must be true or false");
-        };
+        boolean cccEnabled = strictBoolean(properties, CCC_PREFIX + "enabled");
+        boolean tccEnabled = strictBoolean(properties, "bullseye.tcc.enabled");
+        if (!cccEnabled) {
+            return new BullseyeConfiguration.Ccc(false, "", 0, "", tccEnabled);
+        }
+        return new BullseyeConfiguration.Ccc(
+                true,
+                text(properties, CCC_PREFIX + "host", ""),
+                loadCccPort(properties),
+                text(properties, CCC_PREFIX + "node-id", ""),
+                tccEnabled);
     }
 
     private static int loadCccPort(Properties properties) {
@@ -182,6 +183,14 @@ public final class PropertiesConfigurationLoader {
     private static boolean bool(Properties properties, String key, boolean defaultValue) {
         String raw = properties.getProperty(key);
         return raw == null ? defaultValue : Boolean.parseBoolean(raw.trim());
+    }
+
+    private static boolean strictBoolean(Properties properties, String key) {
+        return switch (text(properties, key, "false").toLowerCase(Locale.ROOT)) {
+            case "false" -> false;
+            case "true" -> true;
+            default -> throw new IllegalArgumentException(key + " must be true or false");
+        };
     }
 
     private static Duration duration(Properties properties, String key, String defaultValue) {

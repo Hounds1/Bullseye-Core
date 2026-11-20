@@ -75,6 +75,10 @@ bullseye.ccc.node-id=edge-01
 
 CCC connectivity is disabled by default. See the [CCC join protocol](docs/ccc-join-v1.md)
 for the frame format, TLS identity, admission, heartbeat, and retry behavior.
+To enable TCC snapshot delivery over an approved CCC connection, also set
+`bullseye.tcc.enabled=true`. The peer advertises `tcc.snapshot.v1` to allow
+delivery. See the [snapshot delivery contract](docs/ccc-join-v1.md#optional-tcc-snapshot-delivery)
+for frame and acknowledgement examples.
 
 ## Docker smoke test
 

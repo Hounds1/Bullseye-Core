@@ -1,6 +1,7 @@
 package io.bullseye.core.config;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -91,6 +92,41 @@ class PropertiesConfigurationLoaderTest {
         assertEquals(
                 new BullseyeConfiguration.Ccc(true, "ccc.example.org", 9443, "node-01"),
                 configuration.ccc());
+        assertFalse(configuration.ccc().tccEnabled());
+    }
+
+    @Test
+    void optsIntoTccSnapshotForwardingWhenCccIsEnabled() throws Exception {
+        var configuration = new PropertiesConfigurationLoader()
+                .load(writeConfiguration(ENABLED_CCC_PROPERTIES + "bullseye.tcc.enabled=true"));
+
+        assertEquals(
+                new BullseyeConfiguration.Ccc(true, "ccc.example.org", 9443, "node-01", true),
+                configuration.ccc());
+    }
+
+    @Test
+    void rejectsTccSnapshotForwardingWithoutCcc() throws Exception {
+        var loader = new PropertiesConfigurationLoader();
+        for (String cccSetting : List.of("", "bullseye.ccc.enabled=false\n")) {
+            Path path = writeConfiguration(cccSetting + "bullseye.tcc.enabled=true");
+
+            var failure = assertThrows(IllegalArgumentException.class, () -> loader.load(path));
+            assertEquals(
+                    "bullseye.tcc.enabled requires bullseye.ccc.enabled=true",
+                    failure.getMessage());
+        }
+    }
+
+    @Test
+    void rejectsMalformedTccBooleanValues() throws Exception {
+        var loader = new PropertiesConfigurationLoader();
+        for (String value : List.of("", "yes", "1")) {
+            Path path = writeConfiguration(ENABLED_CCC_PROPERTIES + "bullseye.tcc.enabled=" + value);
+
+            var failure = assertThrows(IllegalArgumentException.class, () -> loader.load(path));
+            assertEquals("bullseye.tcc.enabled must be true or false", failure.getMessage());
+        }
     }
 
     @Test

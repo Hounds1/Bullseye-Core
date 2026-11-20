@@ -1,7 +1,10 @@
 package io.bullseye.core.uog.ccc;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.junit.jupiter.api.Test;
 
@@ -18,6 +21,9 @@ class CccProtocolTest {
 
     private static final String PING = """
             {"protocolVersion":1,"type":"PING","sequence":42}""";
+    private static final String JOIN_ACCEPTED = """
+            {"protocolVersion":1,"type":"JOIN_ACCEPTED","requestId":"request","sessionId":"session",
+            "heartbeatIntervalMs":1000}""";
 
     @Test
     void writesJoinAndPongAsFlushedBigEndianUtf8Frames() throws IOException {
@@ -141,6 +147,71 @@ class CccProtocolTest {
     }
 
     @Test
+    void negotiatesTccOnlyWithTheExactCapabilityString() throws IOException {
+        var response = CccProtocol.read(input(JOIN_ACCEPTED));
+        assertFalse(CccProtocol.supportsTcc(response));
+
+        var capabilities = response.putArray("capabilities");
+        assertFalse(CccProtocol.supportsTcc(response));
+        capabilities.add("tcc.snapshot.v2").add("TCC.SNAPSHOT.V1");
+        assertFalse(CccProtocol.supportsTcc(response));
+        capabilities.add("tcc.snapshot.v1");
+        assertTrue(CccProtocol.supportsTcc(response));
+    }
+
+    @Test
+    void rejectsMalformedCapabilityFields() throws IOException {
+        var response = CccProtocol.read(input(JOIN_ACCEPTED));
+        response.put("capabilities", "tcc.snapshot.v1");
+        assertThrows(IOException.class, () -> CccProtocol.supportsTcc(response));
+        response.putNull("capabilities");
+        assertThrows(IOException.class, () -> CccProtocol.supportsTcc(response));
+        response.putArray("capabilities").add("tcc.snapshot.v1").add(1);
+        assertThrows(IOException.class, () -> CccProtocol.supportsTcc(response));
+    }
+
+    @Test
+    void writesTccSnapshotAsAnObjectAndPreservesOriginalBody() throws IOException {
+        String telemetry = """
+                {
+                  "schemaVersion": 1,
+                  "nodeId": "\uD55C\uAE00",
+                  "sequence": 17
+                }
+                """;
+        byte[] payload = CccProtocol.encodeTccSnapshot(telemetry);
+        assertEquals("{\"protocolVersion\":1,\"type\":\"TCC_SNAPSHOT\",\"telemetry\":" + telemetry + "}",
+                new String(payload, StandardCharsets.UTF_8));
+
+        FlushedOutput out = new FlushedOutput();
+        CccProtocol.writeFrame(out, payload);
+        var message = CccProtocol.read(new ByteArrayInputStream(out.toByteArray()));
+        assertEquals("TCC_SNAPSHOT", CccProtocol.type(message));
+        assertTrue(message.path("telemetry").isObject());
+        assertEquals(17, message.path("telemetry").path("sequence").longValue());
+        assertEquals(1, out.flushCount);
+    }
+
+    @Test
+    void measuresTccSizeUsingFullEnvelopeUtf8Bytes() throws IOException {
+        String telemetry = "{\"nodeId\":\"\uD55C\"}";
+        int minimumBytes = CccProtocol.encodeTccSnapshot(telemetry).length;
+        String atLimit = telemetry + " ".repeat(65_536 - minimumBytes);
+
+        assertEquals(65_536, CccProtocol.encodeTccSnapshot(atLimit).length);
+        assertNull(CccProtocol.encodeTccSnapshot(atLimit + " "));
+    }
+
+    @Test
+    void rejectsInvalidTccBodyBeforeEncoding() {
+        for (String telemetry : new String[] {
+            "null", "[]", "{}{}", "{\"sequence\":1,\"sequence\":2}", "{\"s\":\"\uD800\"}"
+        }) {
+            assertThrows(IOException.class, () -> CccProtocol.encodeTccSnapshot(telemetry));
+        }
+    }
+
+    @Test
     void rejectsInvalidOutboundFramesBeforeWriting() {
         FlushedOutput out = new FlushedOutput();
         UUID id = UUID.randomUUID();
@@ -148,6 +219,8 @@ class CccProtocolTest {
         assertThrows(IOException.class, () -> CccProtocol.writePong(out, -1));
         assertThrows(IOException.class, () -> CccProtocol.writeJoin(out, id, " ", id));
         assertThrows(IOException.class, () -> CccProtocol.writeJoin(out, id, "x".repeat(65_536), id));
+        assertThrows(IOException.class, () -> CccProtocol.writeFrame(out, new byte[0]));
+        assertThrows(IOException.class, () -> CccProtocol.writeFrame(out, new byte[65_537]));
         assertEquals(0, out.size());
         assertEquals(0, out.flushCount);
     }

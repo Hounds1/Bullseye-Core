@@ -1,5 +1,6 @@
 package io.bullseye.core.runtime;
 
+import io.bullseye.common.diagnostic.DiagnosticSnapshot;
 import io.bullseye.common.metric.MetricSample;
 import io.bullseye.core.diagnostic.DiagnosticCoordinator;
 import io.bullseye.core.linux.cgroup.CgroupMonitor;
@@ -170,7 +171,7 @@ public final class BullseyeRuntime implements AutoCloseable {
         logger.status("Bullseye diagnostic system activated.");
         logger.status("Host telemetry online.");
         logger.status("Rolling metric window online. duration=" + format(windowDuration));
-        publisher.publish(stateRepository.current());
+        publishCurrentSnapshot();
 
         long intervalMillis = samplingInterval.toMillis();
         collectorExecutor.scheduleWithFixedDelay(
@@ -254,9 +255,17 @@ public final class BullseyeRuntime implements AutoCloseable {
             diagnosticCoordinator
                     .evaluate(evaluatedAt, wallClockAt, inputs)
                     .ifPresent(logger::transition);
-            publisher.publish(stateRepository.current());
+            publishCurrentSnapshot();
         } catch (Exception failure) {
             logger.interrupted("Diagnostic evaluation interrupted.", failure);
+        }
+    }
+
+    private void publishCurrentSnapshot() {
+        DiagnosticSnapshot snapshot = stateRepository.current();
+        publisher.publish(snapshot);
+        if (cccClient != null) {
+            cccClient.offerSnapshot(snapshot);
         }
     }
 

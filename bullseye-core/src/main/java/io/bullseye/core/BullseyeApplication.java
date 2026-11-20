@@ -63,7 +63,7 @@ public final class BullseyeApplication {
                 new PropertiesConfigurationLoader().load(configurationPath);
         BullseyeConfiguration.Ccc ccc = configuration.ccc();
         CccClient cccClient = ccc.enabled()
-                ? new CccClient(ccc.host(), ccc.port(), ccc.nodeId(), logger)
+                ? new CccClient(ccc.host(), ccc.port(), ccc.nodeId(), logger, ccc.tccEnabled())
                 : null;
         InMemoryRollingMetricWindow window =
                 new InMemoryRollingMetricWindow(
