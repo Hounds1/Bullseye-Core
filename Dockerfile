@@ -1,7 +1,7 @@
 FROM eclipse-temurin:25-jdk AS build
 
 WORKDIR /workspace
-COPY gradlew gradlew.bat settings.gradle.kts build.gradle.kts ./
+COPY gradlew gradlew.bat settings.gradle.kts build.gradle.kts LICENSE ./
 COPY gradle ./gradle
 COPY bullseye-common ./bullseye-common
 COPY bullseye-core ./bullseye-core

@@ -30,7 +30,7 @@ can be added with `jlink` without changing the domain or runtime boundaries.
 ```
 
 The generated distribution is under `bullseye-core/build/install/bullseye-core` and includes
-`bin`, `lib`, and `config` directories.
+`bin`, `lib`, and `config` directories alongside the `LICENSE` file.
 
 ## Run
 

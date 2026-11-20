@@ -19,6 +19,7 @@ application {
 distributions {
     main {
         contents {
+            from(rootProject.file("LICENSE"))
             from(rootProject.file("config/bullseye.properties")) {
                 into("config")
             }
