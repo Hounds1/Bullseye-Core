@@ -19,6 +19,13 @@ import java.util.List;
 
 class PropertiesConfigurationLoaderTest {
 
+    private static final String ENABLED_CCC_PROPERTIES = """
+            bullseye.ccc.enabled=true
+            bullseye.ccc.host=ccc.example.org
+            bullseye.ccc.port=9443
+            bullseye.ccc.node-id=node-01
+            """;
+
     @TempDir Path temporaryDirectory;
 
     @Test
@@ -60,6 +67,44 @@ class PropertiesConfigurationLoaderTest {
         assertEquals(
                 new BullseyeConfiguration.AttributionConfidence(4, Duration.ofSeconds(15), 5, 7.5),
                 configuration.cgroup().attributionConfidence());
+    }
+
+    @Test
+    void leavesCccDisabledWithoutOptIn() throws Exception {
+        PropertiesConfigurationLoader loader = new PropertiesConfigurationLoader();
+
+        var defaults = loader.load(temporaryDirectory.resolve("missing.properties"));
+        var disabled = loader.load(writeConfiguration("""
+                bullseye.ccc.enabled=false
+                bullseye.ccc.port=unused
+                """));
+
+        assertEquals(BullseyeConfiguration.Ccc.disabled(), defaults.ccc());
+        assertEquals(BullseyeConfiguration.Ccc.disabled(), disabled.ccc());
+    }
+
+    @Test
+    void loadsCccEndpointAndNodeIdentityWhenEnabled() throws Exception {
+        var configuration = new PropertiesConfigurationLoader()
+                .load(writeConfiguration(ENABLED_CCC_PROPERTIES));
+
+        assertEquals(
+                new BullseyeConfiguration.Ccc(true, "ccc.example.org", 9443, "node-01"),
+                configuration.ccc());
+    }
+
+    @Test
+    void rejectsInvalidCccSettings() throws Exception {
+        PropertiesConfigurationLoader loader = new PropertiesConfigurationLoader();
+        for (String setting : List.of(
+                "enabled=yes", "enabled=", "host=", "port=", "port=0", "port=65536",
+                "port=unused", "node-id=")) {
+            Path path = writeConfiguration(ENABLED_CCC_PROPERTIES + "bullseye.ccc." + setting);
+
+            var failure = assertThrows(IllegalArgumentException.class, () -> loader.load(path));
+            String key = setting.substring(0, setting.indexOf('='));
+            assertTrue(failure.getMessage().contains("bullseye.ccc." + key), setting);
+        }
     }
 
     @Test

@@ -19,6 +19,7 @@ public final class PropertiesConfigurationLoader {
     private static final String MEMORY_PREFIX = "bullseye.diagnostics.memory.";
     private static final String IO_PREFIX = "bullseye.diagnostics.io.";
     private static final String CGROUP_PREFIX = "bullseye.cgroup.";
+    private static final String CCC_PREFIX = "bullseye.ccc.";
     private static final String ATTRIBUTION_CONFIDENCE_PREFIX =
             CGROUP_PREFIX + "attribution.confidence.";
 
@@ -34,7 +35,8 @@ public final class PropertiesConfigurationLoader {
                 loadCpuDiagnostics(properties),
                 loadMemoryDiagnostics(properties),
                 loadIoDiagnostics(properties),
-                loadCgroup(properties));
+                loadCgroup(properties),
+                loadCcc(properties));
     }
 
     private static Properties read(Path path) throws IOException {
@@ -123,6 +125,27 @@ public final class PropertiesConfigurationLoader {
                         defaults.maximumConfirmationCollections()),
                 decimal(properties, ATTRIBUTION_CONFIDENCE_PREFIX + "minimum-margin",
                         defaults.minimumMargin()));
+    }
+
+    private static BullseyeConfiguration.Ccc loadCcc(Properties properties) {
+        return switch (text(properties, CCC_PREFIX + "enabled", "false").toLowerCase(Locale.ROOT)) {
+            case "false" -> BullseyeConfiguration.Ccc.disabled();
+            case "true" -> new BullseyeConfiguration.Ccc(
+                    true,
+                    text(properties, CCC_PREFIX + "host", ""),
+                    loadCccPort(properties),
+                    text(properties, CCC_PREFIX + "node-id", ""));
+            default -> throw new IllegalArgumentException(
+                    "bullseye.ccc.enabled must be true or false");
+        };
+    }
+
+    private static int loadCccPort(Properties properties) {
+        try {
+            return integer(properties, CCC_PREFIX + "port", 0);
+        } catch (NumberFormatException invalidPort) {
+            throw new IllegalArgumentException("bullseye.ccc.port must be an integer", invalidPort);
+        }
     }
 
     static Duration parseDuration(String raw) {

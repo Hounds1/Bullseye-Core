@@ -5,6 +5,7 @@ plugins {
 dependencies {
     implementation(project(":bullseye-common"))
     implementation(project(":bullseye-native"))
+    implementation("com.fasterxml.jackson.core:jackson-databind:2.21.2")
 
     testImplementation(platform("org.junit:junit-bom:6.0.0"))
     testImplementation("org.junit.jupiter:junit-jupiter")
