@@ -206,7 +206,7 @@ public final class DiagnosticSnapshotJsonEncoder {
         return json.append('}').toString();
     }
 
-    private static String escape(String value) {
+    static String escape(String value) {
         StringBuilder result = new StringBuilder(value.length() + 8);
         for (int index = 0; index < value.length(); index++) {
             char character = value.charAt(index);

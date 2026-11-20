@@ -1,0 +1,127 @@
+{
+  "schemaVersion": 1,
+  "nodeId": "node-001",
+  "runId": "46e5fffd-6650-452d-8476-ac41e2453c2a",
+  "sequence": 2,
+  "snapshot": {
+    "host": "edge-01",
+    "application": "orders",
+    "severity": "HIGH",
+    "resource": "HOST_MEMORY",
+    "state": "SATURATION_RISK",
+    "primaryWorkload": "orders.service",
+    "workloadType": "SYSTEMD_SERVICE",
+    "cgroupPath": "/system.slice/orders.service",
+    "attributionConfidence": "LOW",
+    "attributionStatus": "IDENTIFIED",
+    "attributionScore": 53.0,
+    "attributionCollectedAt": 1900,
+    "attributionCoverage": {
+      "complete": false,
+      "collectedGroups": 2,
+      "failedGroups": 1,
+      "discoveryFailed": false,
+      "discoveryLimited": true
+    },
+    "attributionEvidence": [
+      {"metric": "memory.current", "value": 1048576.0, "unit": "B"}
+    ],
+    "evidence": [
+      {"metric": "usage", "value": 88.5, "unit": "%"}
+    ],
+    "evaluatedAt": 2000,
+    "wallClockAt": 2000,
+    "observationStatus": "STALE",
+    "observations": {
+      "HOST_CPU": {
+        "status": "FRESH",
+        "lastSampleAt": 1950,
+        "metrics": [
+          {"metric": "HOST_CPU_USAGE", "value": 15.25, "unit": "%"}
+        ]
+      },
+      "HOST_MEMORY": {
+        "status": "FRESH",
+        "lastSampleAt": 1950,
+        "metrics": [
+          {"metric": "HOST_MEMORY_USAGE", "value": 88.5, "unit": "%"}
+        ]
+      },
+      "DISK_IO": {
+        "status": "STALE",
+        "lastSampleAt": 1200,
+        "metrics": []
+      }
+    },
+    "resources": {
+      "HOST_CPU": {
+        "severity": "NORMAL",
+        "state": "NORMAL",
+        "reason": "System status nominal.",
+        "since": 1000,
+        "evidence": [],
+        "primaryWorkload": "UNKNOWN",
+        "workloadType": "UNKNOWN",
+        "cgroupPath": "/",
+        "attributionConfidence": "UNRESOLVED",
+        "attributionStatus": "NOT_ATTEMPTED",
+        "attributionScore": 0.0,
+        "attributionCollectedAt": null,
+        "attributionCoverage": null,
+        "attributionEvidence": []
+      },
+      "HOST_MEMORY": {
+        "severity": "HIGH",
+        "state": "SATURATION_RISK",
+        "reason": "Critical memory pressure detected.",
+        "since": 1800,
+        "evidence": [
+          {"metric": "usage", "value": 88.5, "unit": "%"}
+        ],
+        "primaryWorkload": "orders.service",
+        "workloadType": "SYSTEMD_SERVICE",
+        "cgroupPath": "/system.slice/orders.service",
+        "attributionConfidence": "LOW",
+        "attributionStatus": "IDENTIFIED",
+        "attributionScore": 53.0,
+        "attributionCollectedAt": 1900,
+        "attributionCoverage": {
+          "complete": false,
+          "collectedGroups": 2,
+          "failedGroups": 1,
+          "discoveryFailed": false,
+          "discoveryLimited": true
+        },
+        "attributionEvidence": [
+          {"metric": "memory.current", "value": 1048576.0, "unit": "B"}
+        ]
+      },
+      "DISK_IO": {
+        "severity": "ELEVATED",
+        "state": "PRESSURE",
+        "reason": "I/O pressure detected.",
+        "since": 1600,
+        "evidence": [
+          {"metric": "psi.some.avg10", "value": 12.5, "unit": "%"}
+        ],
+        "primaryWorkload": "UNKNOWN",
+        "workloadType": "UNKNOWN",
+        "cgroupPath": "/",
+        "attributionConfidence": "UNRESOLVED",
+        "attributionStatus": "NO_CANDIDATE",
+        "attributionScore": 0.0,
+        "attributionCollectedAt": 1700,
+        "attributionCoverage": {
+          "complete": true,
+          "collectedGroups": 2,
+          "failedGroups": 0,
+          "discoveryFailed": false,
+          "discoveryLimited": false
+        },
+        "attributionEvidence": []
+      }
+    },
+    "since": 1800,
+    "version": 7
+  }
+}
