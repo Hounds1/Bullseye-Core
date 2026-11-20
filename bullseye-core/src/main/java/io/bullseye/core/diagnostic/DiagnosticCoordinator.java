@@ -19,10 +19,12 @@ import io.bullseye.core.state.DiagnosticStateRepository;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.EnumMap;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 
 public final class DiagnosticCoordinator {
@@ -34,11 +36,14 @@ public final class DiagnosticCoordinator {
     private final MemoryPressureAttributor memoryAttributor;
     private final CpuPressureAttributor cpuAttributor;
     private final IoPressureAttributor ioAttributor;
+    private final AttributionWorker attributionWorker;
     private final Duration maximumSampleAge;
     private final long attributionRefreshMillis;
+    private final long maximumAttributionAgeMillis;
     private final long startedAt;
     private final EnumMap<ResourceType, DiagnosticDecision> resourceStates =
             new EnumMap<>(ResourceType.class);
+    private final EnumSet<ResourceType> attributionConfirmations = EnumSet.noneOf(ResourceType.class);
     private WorkloadAttribution memoryAttribution = WorkloadAttribution.unresolved();
     private WorkloadAttribution cpuAttribution = WorkloadAttribution.unresolved();
     private WorkloadAttribution ioAttribution = WorkloadAttribution.unresolved();
@@ -141,6 +146,21 @@ public final class DiagnosticCoordinator {
             IoPressureAttributor ioAttributor,
             Duration maximumSampleAge,
             Duration attributionRefreshInterval) {
+        this(metricWindow, engine, stateRepository, eventIdSupplier, memoryAttributor, cpuAttributor,
+                ioAttributor, maximumSampleAge, attributionRefreshInterval, null);
+    }
+
+    public DiagnosticCoordinator(
+            MetricWindow metricWindow,
+            DiagnosticEngine engine,
+            DiagnosticStateRepository stateRepository,
+            Supplier<String> eventIdSupplier,
+            MemoryPressureAttributor memoryAttributor,
+            CpuPressureAttributor cpuAttributor,
+            IoPressureAttributor ioAttributor,
+            Duration maximumSampleAge,
+            Duration attributionRefreshInterval,
+            AttributionWorker attributionWorker) {
         this.metricWindow = Objects.requireNonNull(metricWindow, "metricWindow");
         this.engine = Objects.requireNonNull(engine, "engine");
         this.stateRepository = Objects.requireNonNull(stateRepository, "stateRepository");
@@ -148,6 +168,7 @@ public final class DiagnosticCoordinator {
         this.memoryAttributor = memoryAttributor;
         this.cpuAttributor = cpuAttributor;
         this.ioAttributor = ioAttributor;
+        this.attributionWorker = attributionWorker;
         this.maximumSampleAge = Objects.requireNonNull(maximumSampleAge, "maximumSampleAge");
         if (maximumSampleAge.toMillis() < 1) {
             throw new IllegalArgumentException("maximumSampleAge must be positive");
@@ -157,6 +178,9 @@ public final class DiagnosticCoordinator {
         if (attributionRefreshMillis < 1) {
             throw new IllegalArgumentException("attributionRefreshInterval must be at least 1ms");
         }
+        maximumAttributionAgeMillis = attributionWorker == null
+                ? 0
+                : maximumSampleAge.plus(attributionRefreshInterval).toMillis();
         DiagnosticSnapshot current = stateRepository.current();
         this.startedAt = current.evaluatedAt();
         resourceStates.putAll(DiagnosticContext.initialStates(current));
@@ -164,6 +188,20 @@ public final class DiagnosticCoordinator {
         memoryAttribution = current.diagnosis(ResourceType.HOST_MEMORY).attribution();
         cpuAttribution = current.diagnosis(ResourceType.HOST_CPU).attribution();
         ioAttribution = current.diagnosis(ResourceType.DISK_IO).attribution();
+    }
+
+    public void startAttribution(Runnable initialize) {
+        if (attributionWorker == null) {
+            initialize.run();
+        } else {
+            attributionWorker.start(initialize);
+        }
+    }
+
+    public void closeAttribution() {
+        if (attributionWorker != null) {
+            attributionWorker.close();
+        }
     }
 
     public synchronized Optional<DiagnosticTransition> evaluate(long evaluatedAt) {
@@ -425,12 +463,13 @@ public final class DiagnosticCoordinator {
         long hostMemoryTotal = latestHostMemoryTotal(inputs, evaluatedAt);
         boolean inputGap = lastMemoryInputAt != null
                 && inputAt - lastMemoryInputAt > maximumSampleAge.toMillis();
-        boolean capacityChanged = previousHostMemoryTotal > 0
+        boolean capacityChanged = lastMemoryInputAt != null
                 && previousHostMemoryTotal != hostMemoryTotal;
         if (inputGap || capacityChanged) {
             resetMemoryHistory();
             memoryAttribution = retainedLowConfidence(memoryAttribution);
         }
+        memoryAttribution = takeAttribution(ResourceType.HOST_MEMORY, memoryAttribution, evaluatedAt);
         boolean newInput = lastMemoryInputAt == null || inputAt > lastMemoryInputAt;
         lastMemoryInputAt = inputAt;
         previousHostMemoryTotal = hostMemoryTotal;
@@ -442,10 +481,19 @@ public final class DiagnosticCoordinator {
         boolean refreshDue =
                 lastMemoryAttributionAt == null
                         || evaluatedAt - lastMemoryAttributionAt >= attributionRefreshMillis;
-        boolean confirmationDue = newInput && memoryAttributor.needsConfirmation();
-        if (highEntry || critical || refreshDue || confirmationDue) {
+        boolean regularCollection = highEntry || critical || refreshDue;
+        boolean confirmationDue =
+                newInput && needsConfirmation(ResourceType.HOST_MEMORY, memoryAttributor::needsConfirmation);
+        if (!regularCollection && !confirmationDue) {
+            return;
+        }
+        if (attributionWorker == null) {
             lastMemoryAttributionAt = evaluatedAt;
             memoryAttribution = memoryAttributor.attribute(hostMemoryTotal);
+        } else if (attributionWorker.request(ResourceType.HOST_MEMORY, memoryAttributor::reset,
+                () -> memoryAttributor.attribute(hostMemoryTotal), memoryAttributor::needsConfirmation,
+                regularCollection)) {
+            lastMemoryAttributionAt = evaluatedAt;
         }
     }
 
@@ -489,6 +537,7 @@ public final class DiagnosticCoordinator {
             resetCpuHistory();
             cpuAttribution = retainedLowConfidence(cpuAttribution);
         }
+        cpuAttribution = takeAttribution(ResourceType.HOST_CPU, cpuAttribution, evaluatedAt);
         boolean newInput = lastCpuInputAt == null || inputAt > lastCpuInputAt;
         lastCpuInputAt = inputAt;
         previousHostCpuCount = hostCpuCount;
@@ -500,11 +549,18 @@ public final class DiagnosticCoordinator {
                 || evaluatedAt - lastCpuAttributionAt >= attributionRefreshMillis;
         boolean baselineNeeded =
                 cpuAttribution.status() == WorkloadAttribution.Status.INSUFFICIENT_DATA;
-        if (newInput
-                && (highEntry || critical || refreshDue || baselineNeeded
-                        || cpuAttributor.needsConfirmation())) {
+        boolean regularCollection = highEntry || critical || refreshDue;
+        if (!newInput || !(regularCollection || baselineNeeded
+                || needsConfirmation(ResourceType.HOST_CPU, cpuAttributor::needsConfirmation))) {
+            return;
+        }
+        if (attributionWorker == null) {
             lastCpuAttributionAt = evaluatedAt;
             cpuAttribution = cpuAttributor.attribute(hostCpuCount);
+        } else if (attributionWorker.request(ResourceType.HOST_CPU, cpuAttributor::reset,
+                () -> cpuAttributor.attribute(hostCpuCount), cpuAttributor::needsConfirmation,
+                regularCollection)) {
+            lastCpuAttributionAt = evaluatedAt;
         }
     }
 
@@ -542,6 +598,7 @@ public final class DiagnosticCoordinator {
                 && inputAt - lastIoInputAt > maximumSampleAge.toMillis()) {
             resetIoHistory();
         }
+        ioAttribution = takeAttribution(ResourceType.DISK_IO, ioAttribution, evaluatedAt);
         boolean newInput = lastIoInputAt == null || inputAt > lastIoInputAt;
         lastIoInputAt = inputAt;
 
@@ -552,27 +609,71 @@ public final class DiagnosticCoordinator {
                 || evaluatedAt - lastIoAttributionAt >= attributionRefreshMillis;
         boolean baselineNeeded =
                 ioAttribution.status() == WorkloadAttribution.Status.INSUFFICIENT_DATA;
-        if (newInput && (highEntry || critical || refreshDue || baselineNeeded)) {
+        boolean regularCollection = highEntry || critical || refreshDue;
+        if (!newInput || !(regularCollection || baselineNeeded)) {
+            return;
+        }
+        if (attributionWorker == null) {
             lastIoAttributionAt = evaluatedAt;
             ioAttribution = ioAttributor.attribute();
+        } else if (attributionWorker.request(ResourceType.DISK_IO, ioAttributor::reset,
+                ioAttributor::attribute, () -> false, regularCollection)) {
+            lastIoAttributionAt = evaluatedAt;
+        }
+    }
+
+    private WorkloadAttribution takeAttribution(
+            ResourceType resource, WorkloadAttribution current, long evaluatedAt) {
+        if (attributionWorker == null) {
+            return current;
+        }
+        var completed = attributionWorker.take(resource, evaluatedAt);
+        if (completed != null && evaluatedAt - completed.observedAt() <= maximumAttributionAgeMillis) {
+            if (completed.needsConfirmation()) {
+                attributionConfirmations.add(resource);
+            } else {
+                attributionConfirmations.remove(resource);
+            }
+            return completed.attribution();
+        }
+        if (current.collectedAt() != null
+                && evaluatedAt - current.collectedAt() > maximumAttributionAgeMillis) {
+            attributionConfirmations.remove(resource);
+            return WorkloadAttribution.unresolved();
+        }
+        return current;
+    }
+
+    private boolean needsConfirmation(ResourceType resource, BooleanSupplier synchronousConfirmation) {
+        return attributionWorker == null
+                ? synchronousConfirmation.getAsBoolean()
+                : attributionConfirmations.contains(resource);
+    }
+
+    private void resetAttribution(ResourceType resource, Runnable reset) {
+        if (attributionWorker == null) {
+            reset.run();
+        } else {
+            attributionConfirmations.remove(resource);
+            attributionWorker.invalidate(resource);
         }
     }
 
     private void resetIoHistory() {
-        ioAttributor.reset();
+        resetAttribution(ResourceType.DISK_IO, ioAttributor::reset);
         lastIoAttributionAt = null;
         lastIoInputAt = null;
     }
 
     private void resetMemoryHistory() {
-        memoryAttributor.reset();
+        resetAttribution(ResourceType.HOST_MEMORY, memoryAttributor::reset);
         lastMemoryAttributionAt = null;
         lastMemoryInputAt = null;
         previousHostMemoryTotal = 0;
     }
 
     private void resetCpuHistory() {
-        cpuAttributor.reset();
+        resetAttribution(ResourceType.HOST_CPU, cpuAttributor::reset);
         lastCpuAttributionAt = null;
         lastCpuInputAt = null;
         previousHostCpuCount = 0;

@@ -352,12 +352,20 @@ record. Golden JSON fixtures in the Core tests pin the v1 payload for compatibil
   same host CPU usage or IO PSI some sample do not collect another snapshot for that resource.
   CPU and memory can make bounded extra confirmation attempts on new host usage samples;
   the confidence settings below control this burst without changing the regular refresh policy.
-  Actual execution is aligned to diagnostic evaluations, so shorter settings do not increase
-  the host sampling rate. Stale host inputs defer attempts without advancing the refresh timer.
+  Diagnostic evaluations request collection, so shorter settings do not increase the host
+  sampling rate. Stale host inputs defer attempts without advancing the refresh timer.
 - Recovery below HIGH clears that resource's attribution, previous cgroup samples, and refresh
   timer. All three histories/timers are independent and remain active while their own severity
   is HIGH/CRITICAL, even if another resource is selected as primary.
-- cgroup discovery is cached and bounded. No background cgroup sampling executor is used.
+- One worker handles cgroup collection and history resets. It keeps at most one pending
+  request per resource. A new request for that resource replaces the pending request.
+  Host diagnostics and JSON publication proceed while cgroup work runs. Evaluations use
+  the latest completed result from the current pressure episode once its collection time
+  is at or before the evaluation time. Recovery, host observation gaps, and capacity
+  changes invalidate pending results and reset the corresponding baseline.
+  With fresh host inputs, evaluations ignore results older than the attribution refresh
+  interval plus the host observation freshness window.
+- cgroup discovery is cached and bounded.
   `CgroupMonitor` uses one collection loop and a typed `CollectionResult<T>` for CPU, memory,
   and IO. Discovery, failure isolation, coverage, and collection timestamps share the same
   implementation; each resource keeps its own parser and snapshot history. Rediscovery

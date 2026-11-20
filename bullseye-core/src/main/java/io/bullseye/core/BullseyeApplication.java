@@ -3,6 +3,7 @@ package io.bullseye.core;
 import io.bullseye.common.diagnostic.DiagnosticSnapshot;
 import io.bullseye.core.config.BullseyeConfiguration;
 import io.bullseye.core.config.PropertiesConfigurationLoader;
+import io.bullseye.core.diagnostic.AttributionWorker;
 import io.bullseye.core.diagnostic.CpuPressureAttributor;
 import io.bullseye.core.diagnostic.DiagnosticCoordinator;
 import io.bullseye.core.diagnostic.DiagnosticEngine;
@@ -114,7 +115,8 @@ public final class BullseyeApplication {
                                 configuration.cgroup().attributionDominanceRatio(),
                                 maximumObservationGap),
                         sampleFreshness,
-                        configuration.cgroup().attributionRefreshInterval());
+                        configuration.cgroup().attributionRefreshInterval(),
+                        new AttributionWorker(timelineClock, logger));
         AsyncStatePublisher publisher =
                 new AsyncStatePublisher(
                         new AtomicFileStatePublisher(
