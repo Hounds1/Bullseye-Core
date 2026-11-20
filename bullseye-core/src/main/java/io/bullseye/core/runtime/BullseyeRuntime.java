@@ -175,9 +175,8 @@ public final class BullseyeRuntime implements AutoCloseable {
         long intervalMillis = samplingInterval.toMillis();
         collectorExecutor.scheduleWithFixedDelay(
                 this::collectSafely, 0, intervalMillis, TimeUnit.MILLISECONDS);
-        if (cgroupMonitor != null) {
-            cgroupMonitor.initialize();
-        }
+        diagnosticCoordinator.startAttribution(
+                cgroupMonitor == null ? () -> {} : cgroupMonitor::initialize);
         if (cccClient != null) {
             cccClient.start();
         }
@@ -193,6 +192,7 @@ public final class BullseyeRuntime implements AutoCloseable {
         if (cccClient != null) {
             cccClient.close();
         }
+        diagnosticCoordinator.closeAttribution();
         collectorExecutor.shutdown();
         await(collectorExecutor);
         diagnosticExecutor.shutdown();
