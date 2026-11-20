@@ -364,9 +364,13 @@ public record BullseyeConfiguration(
         }
     }
 
-    public record Ccc(boolean enabled, String host, int port, String nodeId) {
+    public record Ccc(boolean enabled, String host, int port, String nodeId, boolean tccEnabled) {
 
         public Ccc {
+            if (tccEnabled && !enabled) {
+                throw new IllegalArgumentException(
+                        "bullseye.tcc.enabled requires bullseye.ccc.enabled=true");
+            }
             if (enabled) {
                 requireText(host, "bullseye.ccc.host");
                 requireText(nodeId, "bullseye.ccc.node-id");
@@ -375,6 +379,10 @@ public record BullseyeConfiguration(
                             "bullseye.ccc.port must be between 1 and 65535");
                 }
             }
+        }
+
+        public Ccc(boolean enabled, String host, int port, String nodeId) {
+            this(enabled, host, port, nodeId, false);
         }
 
         public static Ccc disabled() {

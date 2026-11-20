@@ -1,6 +1,7 @@
 package io.bullseye.core.uog.ccc;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.bullseye.common.diagnostic.DiagnosticSnapshot;
 import io.bullseye.core.logging.BullseyeLogger;
 
 import javax.net.ssl.SSLSocket;
@@ -29,6 +30,7 @@ public final class CccClient implements AutoCloseable {
     private final int timeoutMillis;
     private final int initialRetryMillis;
     private final UUID runId = UUID.randomUUID();
+    private final TccSnapshotSender telemetry;
     private final Thread worker = Thread.ofPlatform().daemon().name("bullseye-ccc").unstarted(this::run);
 
     private volatile boolean closed;
@@ -37,11 +39,20 @@ public final class CccClient implements AutoCloseable {
     private boolean interrupted;
 
     public CccClient(String host, int port, String nodeId, BullseyeLogger logger) {
-        this(host, port, nodeId, logger, null, TIMEOUT_MILLIS, INITIAL_RETRY_MILLIS);
+        this(host, port, nodeId, logger, false);
+    }
+
+    public CccClient(String host, int port, String nodeId, BullseyeLogger logger, boolean tccEnabled) {
+        this(host, port, nodeId, logger, null, TIMEOUT_MILLIS, INITIAL_RETRY_MILLIS, tccEnabled);
     }
 
     CccClient(String host, int port, String nodeId, BullseyeLogger logger,
             SSLSocketFactory tlsFactory, int timeoutMillis, int initialRetryMillis) {
+        this(host, port, nodeId, logger, tlsFactory, timeoutMillis, initialRetryMillis, false);
+    }
+
+    CccClient(String host, int port, String nodeId, BullseyeLogger logger,
+            SSLSocketFactory tlsFactory, int timeoutMillis, int initialRetryMillis, boolean tccEnabled) {
         this.host = host;
         this.port = port;
         this.nodeId = nodeId;
@@ -50,6 +61,13 @@ public final class CccClient implements AutoCloseable {
         this.timeoutMillis = timeoutMillis;
         this.initialRetryMillis = initialRetryMillis;
         this.retryMillis = initialRetryMillis;
+        telemetry = tccEnabled ? new TccSnapshotSender(nodeId, runId, logger) : null;
+    }
+
+    public void offerSnapshot(DiagnosticSnapshot snapshot) {
+        if (!closed && telemetry != null) {
+            telemetry.offer(snapshot);
+        }
     }
 
     public synchronized void start() {
@@ -109,7 +127,7 @@ public final class CccClient implements AutoCloseable {
                 if (closed) {
                     throw new SocketException("Cluster connection is closing");
                 }
-                return join(tls);
+                return join(tls, connection);
             }
         } finally {
             synchronized (this) {
@@ -137,7 +155,7 @@ public final class CccClient implements AutoCloseable {
         return tls;
     }
 
-    private long join(SSLSocket tls) throws IOException {
+    private long join(SSLSocket tls, Socket transport) throws IOException {
         UUID requestId = UUID.randomUUID();
         CccProtocol.writeJoin(tls.getOutputStream(), requestId, nodeId, runId);
         ObjectNode response = readFrame(tls, timeoutMillis);
@@ -151,6 +169,9 @@ public final class CccClient implements AutoCloseable {
                 interrupted = false;
                 retryMillis = initialRetryMillis;
                 logger.status("Cluster connection authorized.");
+                if (telemetry != null && CccProtocol.supportsTcc(response)) {
+                    yield maintainTelemetrySession(tls, transport, heartbeatMillis);
+                }
                 yield maintainSession(tls, heartbeatMillis);
             }
             case "JOIN_REJECTED" -> endSession(response, "denied");
@@ -169,6 +190,28 @@ public final class CccClient implements AutoCloseable {
                     return endSession(message, "revoked");
                 }
                 default -> throw new IOException("Unexpected cluster session message");
+            }
+        }
+        return -1;
+    }
+
+    private long maintainTelemetrySession(SSLSocket tls, Socket transport, int heartbeatMillis)
+            throws IOException {
+        tls.setSoTimeout(0);
+        var input = tls.getInputStream();
+        try (var session = telemetry.open(
+                transport, tls.getOutputStream(), timeoutMillis, heartbeatMillis)) {
+            while (!closed) {
+                ObjectNode message = CccProtocol.read(input);
+                switch (CccProtocol.type(message)) {
+                    case "PING" -> session.pong(CccProtocol.nonnegativeLong(message, "sequence"));
+                    case "TCC_ACK" -> session.acknowledge(message);
+                    case "SESSION_REVOKED" -> {
+                        session.close();
+                        return endSession(message, "revoked");
+                    }
+                    default -> throw new IOException("Unexpected cluster session message");
+                }
             }
         }
         return -1;

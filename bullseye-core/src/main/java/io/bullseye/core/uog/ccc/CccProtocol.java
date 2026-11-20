@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
@@ -22,6 +23,9 @@ final class CccProtocol {
 
     private static final int VERSION = 1;
     private static final int MAX_FRAME_BYTES = 65_536;
+    private static final String TCC_CAPABILITY = "tcc.snapshot.v1";
+    private static final String TCC_SNAPSHOT_PREFIX =
+            "{\"protocolVersion\":" + VERSION + ",\"type\":\"TCC_SNAPSHOT\",\"telemetry\":";
     private static final ObjectMapper JSON = new ObjectMapper()
             .enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
@@ -45,6 +49,50 @@ final class CccProtocol {
         write(out, message);
     }
 
+    static boolean supportsTcc(ObjectNode response) throws IOException {
+        JsonNode capabilities = response.path("capabilities");
+        if (capabilities.isMissingNode()) {
+            return false;
+        }
+        if (!capabilities.isArray()) {
+            throw invalidField("capabilities");
+        }
+        boolean supportsTcc = false;
+        for (JsonNode capability : capabilities) {
+            if (!capability.isTextual()) {
+                throw invalidField("capabilities");
+            }
+            supportsTcc |= TCC_CAPABILITY.equals(capability.textValue());
+        }
+        return supportsTcc;
+    }
+
+    /** Returns the complete body, or null if it exceeds the frame size limit. */
+    static byte[] encodeTccSnapshot(String telemetryJson) throws IOException {
+        parseObject(telemetryJson);
+        ByteBuffer encoded;
+        try {
+            encoded = StandardCharsets.UTF_8.newEncoder()
+                    .encode(CharBuffer.wrap(TCC_SNAPSHOT_PREFIX + telemetryJson + '}'));
+        } catch (CharacterCodingException failure) {
+            throw new IOException("Invalid CCC UTF-8 payload");
+        }
+        if (encoded.remaining() > MAX_FRAME_BYTES) {
+            return null;
+        }
+        byte[] payload = new byte[encoded.remaining()];
+        encoded.get(payload);
+        return payload;
+    }
+
+    static void writeFrame(OutputStream out, byte[] payload) throws IOException {
+        requireFrameLength(payload.length);
+        DataOutputStream frame = new DataOutputStream(out);
+        frame.writeInt(payload.length);
+        frame.write(payload);
+        frame.flush();
+    }
+
     static ObjectNode read(InputStream in) throws IOException {
         DataInputStream frame = new DataInputStream(in);
         int length = frame.readInt();
@@ -59,15 +107,7 @@ final class CccProtocol {
             throw new IOException("Invalid CCC UTF-8 payload");
         }
 
-        JsonNode parsed;
-        try {
-            parsed = JSON.readTree(json);
-        } catch (JsonProcessingException failure) {
-            throw new IOException("Invalid CCC JSON payload");
-        }
-        if (!(parsed instanceof ObjectNode message)) {
-            throw new IOException("Expected a CCC JSON object");
-        }
+        ObjectNode message = parseObject(json);
         if (positiveInt(message, "protocolVersion") != VERSION) {
             throw new IOException("Unsupported CCC protocol version");
         }
@@ -119,12 +159,20 @@ final class CccProtocol {
     }
 
     private static void write(OutputStream out, ObjectNode message) throws IOException {
-        byte[] payload = JSON.writeValueAsBytes(message);
-        requireFrameLength(payload.length);
-        DataOutputStream frame = new DataOutputStream(out);
-        frame.writeInt(payload.length);
-        frame.write(payload);
-        frame.flush();
+        writeFrame(out, JSON.writeValueAsBytes(message));
+    }
+
+    private static ObjectNode parseObject(String json) throws IOException {
+        JsonNode parsed;
+        try {
+            parsed = JSON.readTree(json);
+        } catch (JsonProcessingException failure) {
+            throw new IOException("Invalid CCC JSON payload");
+        }
+        if (!(parsed instanceof ObjectNode object)) {
+            throw new IOException("Expected a CCC JSON object");
+        }
+        return object;
     }
 
     private static void requireFrameLength(int length) throws IOException {
