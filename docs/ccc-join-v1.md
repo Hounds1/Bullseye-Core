@@ -54,9 +54,9 @@ per process and retains it across reconnects. Every attempt gets a new UUID
   least this long before reconnecting, then requests approval again. A decision
   without this field stops retries until Core is restarted.
 - On an unexpected disconnect or transport failure, Core reconnects with
-  backoff from 1 to 30 seconds. Each successful join resets the backoff. Core
-  uses five-second timeouts for TCP connect, TLS handshake reads, and reading
-  the join response.
+  exponential backoff from 1 to 30 seconds. Joining a session without TCC
+  delivery resets the backoff. Core uses five-second timeouts for TCP connect,
+  TLS handshake reads, and reading the join response.
 
 ## Optional TCC snapshot delivery
 
@@ -100,6 +100,16 @@ record in a `TCC_ACK` frame.
 | `DUPLICATE` | Complete delivery for the already adopted record. |
 | `REJECTED` | Drop the rejected record and continue with the latest pending snapshot. |
 | `RETRYABLE` | Reconnect and retry the same record on the next eligible session. |
+
+When a session negotiates TCC delivery, a matching `ACCEPTED` or `DUPLICATE`
+resets the reconnect backoff. The accumulated delay carries across joins
+while delivery keeps failing. A matching `REJECTED` completes the record and
+preserves the current backoff.
+
+A `RETRYABLE` or `REJECTED` acknowledgement for the current record can carry
+an optional `reasonCode`. Core includes it in the log when it matches
+`[A-Z][A-Z0-9_]{0,63}`. Core ignores well-formed acknowledgements for
+completed sequences.
 
 Core keeps one in-flight snapshot and at most one newer pending snapshot in
 memory. New evaluations replace the pending snapshot. Core uses a five-second

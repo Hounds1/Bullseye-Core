@@ -2,6 +2,7 @@ package io.bullseye.core.uog.ccc;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -27,6 +28,7 @@ import java.io.PrintStream;
 import java.net.InetAddress;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.util.Objects;
 import java.util.UUID;
@@ -282,6 +284,126 @@ class CccClientTest {
                 send(second, acknowledgement(2, "ACCEPTED"));
             }
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"ACCEPTED", "DUPLICATE"})
+    void preservesBackoffAcrossFailedTelemetrySessionsUntilMatchingPositiveAck(String success)
+            throws Exception {
+        int initialRetryMillis = 200;
+        var logs = new ByteArrayOutputStream();
+        try (SSLServerSocket server = server();
+                var report = new PrintStream(logs, true, StandardCharsets.UTF_8);
+                CccClient client = new CccClient(
+                        "localhost", server.getLocalPort(), NODE_ID, new BullseyeLogger(report, report),
+                        clientTls.getSocketFactory(), 2_000, initialRetryMillis, true)) {
+            client.offerSnapshot(snapshot(1_000));
+            client.start();
+
+            byte[] original;
+            long firstFailureAt;
+            try (SSLSocket first = accept(server)) {
+                JsonNode join = readJoin(first);
+                send(first, acceptedWithTcc(join));
+                original = readFramePayload(first);
+                assertSnapshot(JSON.readTree(original), join, 1, 1_000);
+                firstFailureAt = retry(first, acknowledgement(1, "RETRYABLE")
+                        .put("reasonCode", "PERSISTENCE_UNAVAILABLE"));
+            }
+
+            long secondFailureAt;
+            try (SSLSocket second = accept(server)) {
+                assertElapsedMillis(firstFailureAt, initialRetryMillis);
+                send(second, acceptedWithTcc(readJoin(second)));
+                assertArrayEquals(original, readFramePayload(second));
+                secondFailureAt = retry(second, acknowledgement(1, "RETRYABLE")
+                        .put("reasonCode", "UNSAFE\nTEXT"));
+            }
+
+            long thirdFailureAt;
+            byte[] next;
+            try (SSLSocket third = accept(server)) {
+                assertElapsedMillis(secondFailureAt, 2 * initialRetryMillis);
+                JsonNode join = readJoin(third);
+                send(third, acceptedWithTcc(join));
+                assertArrayEquals(original, readFramePayload(third));
+
+                client.offerSnapshot(snapshot(2_000));
+                send(third, acknowledgement(1, "REJECTED").put("reasonCode", "INVALID_TELEMETRY"));
+                next = readFramePayload(third);
+                assertSnapshot(JSON.readTree(next), join, 2, 2_000);
+                send(third, acknowledgement(1, "ACCEPTED"));
+                send(third, acknowledgement(1, "RETRYABLE").put("reasonCode", "STALE_REASON"));
+                assertPong(third, 42);
+                thirdFailureAt = retry(third, acknowledgement(2, "RETRYABLE"));
+            }
+
+            long fourthFailureAt;
+            try (SSLSocket fourth = accept(server)) {
+                assertElapsedMillis(thirdFailureAt, 4 * initialRetryMillis);
+                JsonNode join = readJoin(fourth);
+                send(fourth, acceptedWithTcc(join));
+                assertArrayEquals(next, readFramePayload(fourth));
+
+                client.offerSnapshot(snapshot(3_000));
+                send(fourth, acknowledgement(2, success));
+                assertSnapshot(read(fourth), join, 3, 3_000);
+                fourthFailureAt = retry(fourth, acknowledgement(3, "RETRYABLE"));
+            }
+
+            server.setSoTimeout(5 * initialRetryMillis);
+            try (SSLSocket afterSuccess = accept(server)) {
+                assertElapsedMillis(fourthFailureAt, initialRetryMillis);
+                readJoin(afterSuccess);
+            }
+        }
+
+        String output = logs.toString(StandardCharsets.UTF_8);
+        var lines = output.lines().toList();
+        assertTrue(lines.contains("[BULLSEYE] Telemetry snapshot retry requested. sequence=1"
+                + " reason=PERSISTENCE_UNAVAILABLE"));
+        assertTrue(lines.contains("[BULLSEYE] Telemetry snapshot retry requested. sequence=1"));
+        assertTrue(lines.contains("[BULLSEYE] Telemetry snapshot rejected. sequence=1"
+                + " reason=INVALID_TELEMETRY"));
+        assertFalse(output.contains("UNSAFE"));
+        assertFalse(output.contains("STALE_REASON"));
+    }
+
+    @Test
+    void omitsTheReasonForAnUnmatchedAcknowledgement() throws Exception {
+        var logs = new ByteArrayOutputStream();
+        try (SSLServerSocket server = server();
+                var report = new PrintStream(logs, true, StandardCharsets.UTF_8);
+                CccClient client = new CccClient(
+                        "localhost", server.getLocalPort(), NODE_ID, new BullseyeLogger(report, report),
+                        clientTls.getSocketFactory(), 2_000, 200, true)) {
+            client.offerSnapshot(snapshot(1_000));
+            client.start();
+            try (SSLSocket socket = accept(server)) {
+                JsonNode join = readJoin(socket);
+                send(socket, acceptedWithTcc(join));
+                assertSnapshot(read(socket), join, 1, 1_000);
+                send(socket, acknowledgement(2, "RETRYABLE").put("reasonCode", "UNEXPECTED_REASON"));
+                assertPeerClosed(socket);
+            }
+        }
+
+        String output = logs.toString(StandardCharsets.UTF_8);
+        assertFalse(output.contains("UNEXPECTED_REASON"));
+        assertFalse(output.contains("Telemetry snapshot retry requested."));
+    }
+
+    private static long retry(SSLSocket socket, ObjectNode acknowledgement) throws IOException {
+        long sentAt = System.nanoTime();
+        send(socket, acknowledgement);
+        assertPeerClosed(socket);
+        return sentAt;
+    }
+
+    private static void assertElapsedMillis(long startedAt, int minimumMillis) {
+        long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+        assertTrue(elapsed >= minimumMillis,
+                () -> "Reconnected after " + elapsed + " ms, expected at least " + minimumMillis + " ms");
     }
 
     @Test

@@ -14,13 +14,11 @@ import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
-import java.util.regex.Pattern;
 
 public final class CccClient implements AutoCloseable {
     private static final int TIMEOUT_MILLIS = 5_000;
     private static final int INITIAL_RETRY_MILLIS = 1_000;
     private static final int MAXIMUM_RETRY_MILLIS = 30_000;
-    private static final Pattern REASON_CODE = Pattern.compile("[A-Z][A-Z0-9_]{0,63}");
 
     private final String host;
     private final int port;
@@ -166,12 +164,11 @@ public final class CccClient implements AutoCloseable {
             case "JOIN_ACCEPTED" -> {
                 CccProtocol.text(response, "sessionId");
                 int heartbeatMillis = CccProtocol.positiveInt(response, "heartbeatIntervalMs");
-                interrupted = false;
-                retryMillis = initialRetryMillis;
                 logger.status("Cluster connection authorized.");
                 if (telemetry != null && CccProtocol.supportsTcc(response)) {
                     yield maintainTelemetrySession(tls, transport, heartbeatMillis);
                 }
+                resetRetry();
                 yield maintainSession(tls, heartbeatMillis);
             }
             case "JOIN_REJECTED" -> endSession(response, "denied");
@@ -205,7 +202,11 @@ public final class CccClient implements AutoCloseable {
                 ObjectNode message = CccProtocol.read(input);
                 switch (CccProtocol.type(message)) {
                     case "PING" -> session.pong(CccProtocol.nonnegativeLong(message, "sequence"));
-                    case "TCC_ACK" -> session.acknowledge(message);
+                    case "TCC_ACK" -> {
+                        if (session.acknowledge(message)) {
+                            resetRetry();
+                        }
+                    }
                     case "SESSION_REVOKED" -> {
                         session.close();
                         return endSession(message, "revoked");
@@ -219,12 +220,17 @@ public final class CccClient implements AutoCloseable {
 
     private long endSession(ObjectNode message, String outcome) throws IOException {
         String reason = CccProtocol.text(message, "reasonCode");
-        if (!REASON_CODE.matcher(reason).matches()) {
+        if (!CccProtocol.validReasonCode(reason)) {
             throw new IOException("Invalid cluster decision reason code");
         }
         long retryAfterMillis = CccProtocol.retryAfterMillis(message);
         logger.status("Cluster connection " + outcome + ". reason=" + reason);
         return retryAfterMillis;
+    }
+
+    private void resetRetry() {
+        interrupted = false;
+        retryMillis = initialRetryMillis;
     }
 
     private static ObjectNode readFrame(Socket socket, long timeoutMillis) throws IOException {

@@ -83,7 +83,8 @@ final class TccSnapshotSender {
             }
         }
 
-        void acknowledge(ObjectNode message) throws IOException {
+        /** Returns whether the matching acknowledgement confirmed TCC delivery. */
+        boolean acknowledge(ObjectNode message) throws IOException {
             long sequence = CccProtocol.nonnegativeLong(message, "sequence");
             if (sequence == 0) {
                 throw new IOException("Invalid telemetry acknowledgement sequence");
@@ -92,7 +93,7 @@ final class TccSnapshotSender {
             synchronized (lock) {
                 requireLive();
                 if (sequence <= lastCompletedSequence) {
-                    return;
+                    return false;
                 }
                 if (!awaitingAck || inFlight == null || sequence != inFlight.sequence()) {
                     throw new IOException("Unexpected telemetry acknowledgement sequence");
@@ -104,13 +105,27 @@ final class TccSnapshotSender {
                         lastCompletedSequence = sequence;
                         lock.notifyAll();
                     }
-                    case "RETRYABLE" -> throw new IOException("Telemetry retry requested");
+                    case "RETRYABLE" -> {
+                        // Retain the same serialized record for the next session.
+                    }
                     default -> throw new IOException("Invalid telemetry acknowledgement status");
                 }
             }
-            if ("REJECTED".equals(status)) {
-                logger.status("Telemetry snapshot rejected. sequence=" + sequence);
+            if ("RETRYABLE".equals(status)) {
+                logOutcome("Telemetry snapshot retry requested.", sequence, message);
+                throw new IOException("Telemetry retry requested");
             }
+            if ("REJECTED".equals(status)) {
+                logOutcome("Telemetry snapshot rejected.", sequence, message);
+                return false;
+            }
+            return true;
+        }
+
+        private void logOutcome(String text, long sequence, ObjectNode message) {
+            String reason = message.path("reasonCode").textValue();
+            String detail = CccProtocol.validReasonCode(reason) ? " reason=" + reason : "";
+            logger.status(text + " sequence=" + sequence + detail);
         }
 
         private void requireLive() throws SocketTimeoutException {

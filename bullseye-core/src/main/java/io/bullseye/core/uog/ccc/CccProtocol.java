@@ -18,6 +18,7 @@ import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.regex.Pattern;
 
 final class CccProtocol {
 
@@ -26,6 +27,7 @@ final class CccProtocol {
     private static final String TCC_CAPABILITY = "tcc.snapshot.v1";
     private static final String TCC_SNAPSHOT_PREFIX =
             "{\"protocolVersion\":" + VERSION + ",\"type\":\"TCC_SNAPSHOT\",\"telemetry\":";
+    private static final Pattern REASON_CODE = Pattern.compile("[A-Z][A-Z0-9_]{0,63}");
     private static final ObjectMapper JSON = new ObjectMapper()
             .enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
@@ -125,6 +127,10 @@ final class CccProtocol {
             throw invalidField(field);
         }
         return value.textValue();
+    }
+
+    static boolean validReasonCode(String reason) {
+        return reason != null && REASON_CODE.matcher(reason).matches();
     }
 
     static int positiveInt(ObjectNode message, String field) throws IOException {
